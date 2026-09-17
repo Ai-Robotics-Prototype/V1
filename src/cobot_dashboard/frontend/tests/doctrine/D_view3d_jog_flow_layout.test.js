@@ -37,64 +37,63 @@ const readSrc = (rel) => readFileSync(join(FRONT_ROOT, 'src', rel), 'utf8')
 function v(msg) { return `DOCTRINE VIEW3D_JOG_FLOW VIOLATED: ${msg}` }
 
 
-test('flow(a): RealArmChrome outer honors a viewport-aware height with a 440 floor', () => {
+test('flow(a): single-window pad-cluster overlay replaces RealArmChrome', () => {
+  // 2026-09-17 SINGLE-WINDOW RESTRUCTURE: RealArmChrome and its
+  // viewport-aware panelHeight are retired. The pad cluster is a
+  // content-sized floating overlay (jog-pad-cluster-overlay)
+  // anchored bottom-center. LEFT/RIGHT columns are page-level
+  // slots. The doctrine now anchors on the ABSENCE of the retired
+  // full-width band and PRESENCE of the successor overlay.
   const src = readSrc('layouts/View3DLayout.jsx')
 
-  // Locate the RealArmChrome function body — its outer div is the first
-  // returned element. 2026-09-16 side-column directive: NORMAL height is
-  // now viewport-aware (`panelHeight || 440`) so the LEFT/RIGHT columns
-  // can spread up the edges; the 440 floor stays for short-tablet
-  // safety (tablet-XYZ-clip class), served by the fallback and the
-  // Program-tab consumer that passes no panelHeight.
-  const chromeStart = src.indexOf('function RealArmChrome(')
-  assert.notEqual(chromeStart, -1,
-    v('RealArmChrome no longer defined in View3DLayout — this pin is stale'))
+  assert.equal(src.indexOf('function RealArmChrome('), -1,
+    v('RealArmChrome function MUST be retired — it was the full-'
+      + 'width band forming the operator-flagged second window'))
+  assert.equal(src.indexOf('data-testid="jog-floating-panel"'), -1,
+    v('jog-floating-panel testid must be gone — retired with '
+      + 'RealArmChrome per 2026-09-17 single-window restructure'))
+  assert.equal(src.indexOf('data-testid="jog-overlay-wrapper"'), -1,
+    v('jog-overlay-wrapper testid must be gone — the full-width '
+      + 'wrapper (left:0 right:0) was the second-window culprit'))
 
-  const returnStart = src.indexOf('return (', chromeStart)
-  const headerStart = src.indexOf('padding: \'5px 8px\'', returnStart)
-  const outerBlock  = src.slice(returnStart, headerStart)
-
-  // NORMAL: either panelHeight (viewport-aware) with a 440 fallback,
-  // or the legacy plain 440 for consumers that don't pass panelHeight.
-  assert.match(outerBlock,
-    /height:\s*isExpanded\s*\?\s*'100%'\s*:\s*\(panelHeight\s*\|\|\s*440\)/,
-    v('RealArmChrome outer height must be `isExpanded ? "100%" '
-      + ': (panelHeight || 440)` — the viewport-aware NORMAL '
-      + 'height + 440 floor let the side-column layout spread '
-      + 'while keeping short-tablet safety.'))
-  assert.match(outerBlock, /flexShrink:\s*0/,
-    v('RealArmChrome outer MUST set flexShrink:0 so a short flex parent '
-      + 'cannot squeeze the surface below its budget (the twin viewer must '
-      + 'shrink first).'))
+  const padIdx = src.indexOf('data-testid="jog-pad-cluster-overlay"')
+  assert.notEqual(padIdx, -1,
+    v('jog-pad-cluster-overlay must exist as the content-sized '
+      + 'floating overlay for the CENTER pads'))
+  const padBlock = src.slice(padIdx, padIdx + 1500)
+  assert.match(padBlock, /position:\s*'absolute'/,
+    v('jog-pad-cluster-overlay must be absolute-positioned'))
+  assert.match(padBlock, /bottom:\s*16/,
+    v('jog-pad-cluster-overlay must anchor bottom:16'))
+  assert.match(padBlock, /pointerEvents:\s*'none'/,
+    v('jog-pad-cluster-overlay must be pointerEvents:none so orbit '
+      + 'passes through the empty margin around the pad cluster'))
 })
 
 
-test('flow(b): chrome header collapses to 0 — DISABLE/READY moved to LEFT top slot', () => {
-  // 2026-09-16 LEFT-column-cleanup operator order: DISABLE + READY
-  // moved OUT of the RealArmChrome header INTO the LEFT column top
-  // slot (JogControls.leftTopSlot). The chrome header now has no
-  // content and collapses to 0. The 44 px minHeight anchor from
-  // the previous version of this pin is superseded — the DISABLE
-  // row is now anchored by the LEFT column's `minHeight: 44` top
-  // wrapper instead. This pin ensures the header doesn't quietly
-  // regain child controls in a future edit (which would re-create
-  // the z-overlap that motivated this cleanup).
+test('flow(b): DISABLE/READY live in the LEFT column top slot (page-level)', () => {
+  // 2026-09-17 SINGLE-WINDOW UPDATE: chrome header retired
+  // entirely along with RealArmChrome. DISABLE + READY are
+  // passed to JogControls.leftTopSlot from View3DLayout, then
+  // portaled into the page-level jog-left-column-slot. This pin
+  // pins the presence of the leftTopSlot prop wiring + the two
+  // components inside it, so a future edit can't quietly reintroduce
+  // a chrome header container that would resurface the z-overlap.
   const src = readSrc('layouts/View3DLayout.jsx')
 
-  assert.match(src, /data-testid="jog-chrome-header-empty"/,
-    v('chrome header must render an empty div with the '
-      + 'jog-chrome-header-empty testid — the marker for the '
-      + 'DISABLE-moved-out-of-header contract'))
-  // Header block must NOT reference ArmEnableControl or JogReadyBadge
-  // any more (they now live inside JogControls.leftTopSlot).
-  const emptyIdx = src.indexOf('data-testid="jog-chrome-header-empty"')
-  const before = src.slice(Math.max(0, emptyIdx - 800), emptyIdx)
-  assert.doesNotMatch(before, /<ArmEnableControl\s*\/>/,
-    v('ArmEnableControl must not render inside the chrome header any '
-      + 'more — it moved to JogControls.leftTopSlot'))
-  assert.doesNotMatch(before, /<JogReadyBadge\s*\/>/,
-    v('JogReadyBadge must not render inside the chrome header any '
-      + 'more — it moved to JogControls.leftTopSlot'))
+  assert.equal(src.indexOf('data-testid="jog-chrome-header-empty"'), -1,
+    v('jog-chrome-header-empty marker retired — RealArmChrome deleted'))
+
+  // View3DLayout passes leftTopSlot with ArmEnableControl + Badge.
+  const jcIdx = src.indexOf('<JogControls')
+  assert.notEqual(jcIdx, -1, v('<JogControls> mount site not found'))
+  const jcBlock = src.slice(jcIdx, jcIdx + 1500)
+  assert.match(jcBlock, /leftTopSlot=\{/,
+    v('View3DLayout must pass leftTopSlot to JogControls'))
+  assert.match(jcBlock, /<ArmEnableControl/,
+    v('leftTopSlot must contain <ArmEnableControl />'))
+  assert.match(jcBlock, /<JogReadyBadge/,
+    v('leftTopSlot must contain <JogReadyBadge />'))
 })
 
 

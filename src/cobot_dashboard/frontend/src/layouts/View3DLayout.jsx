@@ -72,56 +72,19 @@ const FRAMING_MAX_TOP_FRAC = 0.98  // never fill entire viewport
 // the ONE canonical arm-enable surface, rendered here AND on the
 // Monitor page so toggling in either reflects live in the other via
 // the shared useStore state.
-function RealArmChrome({ mode, setMode, children, panelHeight }) {
-  const isExpanded = mode === 'EXPANDED'
-  return (
-    <div
-      data-testid="jog-floating-panel"
-      style={{
-        // 2026-09-16 immersive: transparent container, 3D scene
-        // shows through. Only buttons/controls carry chip backgrounds.
-        background: 'transparent',
-        display: 'flex', flexDirection: 'column',
-        overflow: 'visible',
-        // 2026-09-16 side-column directive: NORMAL height is now
-        // viewport-aware (View3DLayout computes it from
-        // window.innerHeight) so the LEFT/RIGHT columns have room
-        // to spread vertically along the edges. Floor stays at 440
-        // (doctrine flow(a) contract) so short tablet aspects still
-        // don't clip the CENTER pads. Legacy Program-tab consumer
-        // passes no panelHeight and lands on 440.
-        height: isExpanded ? '100%' : (panelHeight || 440),
-        width: '100%',
-        pointerEvents: 'auto',
-        flexShrink: 0,
-      }}>
-      {/* 2026-09-16 LEFT-column cleanup: DISABLE + READY moved OUT
-          of this chrome header INTO the LEFT column's top slot
-          (JogControls.leftTopSlot). Doing so kills the z-overlap
-          the operator flagged (the "Jog" heading rendering under
-          the DISABLE button in the old header). The chrome header
-          is now empty and collapses to 0 — the panel body owns
-          the full panelHeight. flow(b) doctrine pin (44 px header
-          minHeight) is superseded by this order and retired at
-          the same time. */}
-      <div style={{
-        padding: 0,
-        display: 'flex', alignItems: 'center',
-        justifyContent: 'space-between',
-        gap: 0,
-        flexShrink: 0,
-        minHeight: 0,
-        background: 'transparent',
-      }} data-testid="jog-chrome-header-empty" />
-      {/* 2026-09-16 correction: no internal scrollbar. Children lay
-          out at their natural size over the canvas — the 3D scene
-          shows THROUGH every gap between controls. */}
-      <div style={{ flex: 1, minHeight: 0, overflow: 'visible' }}>
-        {children}
-      </div>
-    </div>
-  )
-}
+// 2026-09-17 SINGLE-WINDOW RESTRUCTURE — RealArmChrome retired.
+// The chrome was a full-width transparent band (`jog-floating-panel`
+// at width:100% + pointerEvents:auto) that formed the second window
+// the operator flagged: even with an empty header + transparent
+// background, the wrapper's bounding box covered ~50% of the
+// viewport with pointer-events:auto, blocking orbit input across
+// the whole panel region. Its job is now split across three page-
+// level overlays owned directly by View3DLayout:
+//   * jog-pad-cluster-overlay — content-sized, bottom-center
+//   * jog-left-column-slot    — content-sized page-level column
+//   * jog-right-column-slot   — content-sized page-level column
+// See test_no_full_width_container_over_canvas + the pointer-events
+// walk pin for the structural contract.
 
 const chromeBtn = {
   width: 26, height: 26, padding: 0,
@@ -437,60 +400,51 @@ export default function View3DLayout() {
         />
       )}
 
-      {/* 2026-09-16 SIDE-COLUMN OWNERSHIP — page-level slot divs the
-          LEFT + RIGHT columns of JogControls portal into. They are
-          NOT children of the jog window/surface container; they are
-          direct children of the 3D View root. Positioned as absolute
-          overlays anchored to the bottom edge, sized to the panel
-          height so their contents (mode/step/speed on the left,
-          Orient + Collapse on the right) stack naturally along the
-          full edge. Both slots stay mounted whenever the jog panel
-          is open (NORMAL or EXPANDED) so JogControls can resolve
-          them via document.getElementById on mount. Under
-          MINIMIZED the JogControls tree isn't rendered, so the
-          slots don't need to exist either. zIndex above the panel
-          wrapper so the columns render on top of any residual
-          center-panel background. pointerEvents:auto so their
-          buttons are clickable. */}
+      {/* 2026-09-17 SINGLE-WINDOW RESTRUCTURE — page-level overlays.
+          Three siblings of the canvas share the 3D View root:
+            1. jog-left-column-slot  — LEFT column portal target
+            2. jog-right-column-slot — RIGHT column portal target
+            3. jog-pad-cluster-overlay — the CENTER pad cluster
+          MINIMIZED hides ONLY the pad-cluster overlay so the LEFT
+          column (DISABLE/READY + jog mode + step + speed) and the
+          RIGHT column (Orient + Collapse + fullscreen) stay visible
+          and reachable while the pads are collapsed. Every wrapper
+          uses pointerEvents:none so orbit/pan/zoom passes through
+          the empty regions between controls; interactive elements
+          (buttons, inputs) inside the JogControls re-enable auto. */}
       {!isMinimized && (
         <>
+          {/* LEFT column slot — page-level, moved UP under the view
+              presets (top:72 clears the top-left MinClearanceReadout
+              + preset row), thinned to 150 px per operator directive
+              (thin chips, distributed down). Contents portal in
+              from JogControls immersive mode. */}
           <div
             id="jog-left-column-slot"
             data-testid="jog-left-column-slot"
             style={{
               position: 'absolute',
-              // 2026-09-16 LEFT column clip fix: bump inset from 8
-              // to 16 (24 on tablet-wide screens is comfortable but
-              // 16 keeps parity with the RIGHT slot) so step-size
-              // chips and Speed slider never touch x=0. Screenshot
-              // showed 'Step', 'Speed', 'moves while held', chips
-              // clipped at the viewport left edge — root cause was
-              // insufficient inset + the middle groups being pushed
-              // top by the 'Jog' heading before space-around could
-              // spread them.
-              left: 16, bottom: 16,
-              width: 240,
-              height: isExpanded
-                ? 'calc(100% - 32px)'
-                : (panelHeight ? panelHeight - 32 : 408),
+              left: 16, top: 72, bottom: 16,
+              width: 150,
               zIndex: 12,
-              pointerEvents: 'auto',
+              pointerEvents: 'none',
               display: 'flex',
               boxSizing: 'border-box',
             }}
           />
+          {/* RIGHT column slot — page-level, mirrors the LEFT slot
+              vertically. Hosts Orient at top + Collapse/fullscreen
+              at bottom (space-between distribution inside
+              JogControls). */}
           <div
             id="jog-right-column-slot"
             data-testid="jog-right-column-slot"
             style={{
               position: 'absolute',
-              right: 16, bottom: 16,
-              width: 240,
-              height: isExpanded
-                ? 'calc(100% - 32px)'
-                : (panelHeight ? panelHeight - 32 : 408),
+              right: 16, top: 72, bottom: 16,
+              width: 200,
               zIndex: 12,
-              pointerEvents: 'auto',
+              pointerEvents: 'none',
               display: 'flex',
               justifyContent: 'flex-end',
               boxSizing: 'border-box',
@@ -499,85 +453,74 @@ export default function View3DLayout() {
         </>
       )}
 
-      {/* NORMAL / EXPANDED — floating jog-panel overlay pinned to
-          bottom-center. Wrapper is pointerEvents:none so the empty
-          margin around the panel passes clicks through to the 3D
-          canvas for orbit/zoom; the panel itself (jog-floating-panel)
-          re-enables pointer events for its own controls. */}
+      {/* PAD CLUSTER overlay — content-sized floating anchor for
+          the CENTER pads (Position, Height, Rotation + XY/Rot
+          chips). This is the ONLY thing Collapse toggles: MINIMIZED
+          drops just this overlay. LEFT + RIGHT columns stay
+          mounted so the operator can still Enable / mode-switch /
+          re-expand without hunting. Wrapper pointer-events:none;
+          the scaler inside JogControls (which wraps the actual pad
+          grid) re-enables auto so taps land on buttons and orbit
+          passes through everywhere else. */}
       {!isMinimized && (
         <div
           ref={panelRef}
-          data-testid="jog-overlay-wrapper"
+          data-testid="jog-pad-cluster-overlay"
           style={{
             position: 'absolute',
-            // 2026-09-16 correction — the jog surface sits at its
-            // ORIGINAL bottom position, full width. No floating card,
-            // no centered narrow panel. NORMAL: 440 px band at the
-            // bottom (panel height owns this). EXPANDED: full-height
-            // (panel takes 100% via the RealArmChrome height rule).
-            left: 0, right: 0,
-            top:    isExpanded ? 0 : 'auto',
-            bottom: 0,
-            display: 'flex',
-            justifyContent: 'stretch',
-            zIndex: 10,
-            // Wrapper passes clicks to the 3D canvas — panel children
-            // re-enable pointer events on their own controls only.
+            // Bottom-center, content-sized. left:50% + translate
+            // centers a variable-width cluster (Cartesian +
+            // Rotation is wider than Joint tiles).
+            left: '50%',
+            bottom: 16,
+            transform: 'translateX(-50%)',
+            zIndex: 11,
             pointerEvents: 'none',
+            display: 'flex',
+            boxSizing: 'border-box',
           }}>
-          <RealArmChrome mode={jogPanelMode} setMode={setView3dJogPanel}
-                          panelHeight={panelHeight}>
-            {/* 2026-09-14: rightSlot for the modal-gated Orient Flange
-                Down control (moved out of the twin-viewer overlay per
-                screenshot review). */}
-            <JogControls
-              maximized={isExpanded}
-              // 2026-09-16 SIDE-COLUMN OWNERSHIP + EXPAND MODE:
-              //   * `immersive` portals the LEFT + RIGHT columns
-              //     into the page-level slot divs above; the
-              //     surface container hosts only the CENTER pads.
-              //   * `expanded` scales the CENTER pad cluster up
-              //     1.6× via CSS transform (arrangement unchanged,
-              //     just bigger). Exiting restores exactly because
-              //     the transform is inert when `expanded=false`.
-              immersive
-              expanded={isExpanded}
-              // 2026-09-16 LEFT column top slot: DISABLE + READY
-              // row moves here from the chrome header so it sits
-              // at the top of the LEFT column (mirrored by Orient
-              // Flange Down at the top of the RIGHT column).
-              leftTopSlot={
-                <>
-                  <ArmEnableControl />
-                  <JogReadyBadge />
-                </>
-              }
-              rightSlot={jogApi
-                ? <OrientFlangeDownControl jogApi={jogApi} />
-                : null}
-              collapseSlot={
-                <>
-                  <button
-                    data-testid="collapse-jog-buttons"
-                    onClick={() => setView3dJogPanel('MINIMIZED')}
-                    title="Collapse Jog Buttons"
-                    style={{
-                      ...chromeBtn,
-                      width: 'auto', padding: '0 12px',
-                      fontSize: 11, fontWeight: 600,
-                      letterSpacing: '0.02em',
-                    }}>Collapse Jog Buttons</button>
-                  <button
-                    onClick={() => setView3dJogPanel(
-                      isExpanded ? 'NORMAL' : 'EXPANDED')}
-                    title={isExpanded ? 'Restore split layout' : 'Expand panel'}
-                    style={chromeBtn}>
-                    {isExpanded ? '✕' : '⛶'}
-                  </button>
-                </>
-              }
-            />
-          </RealArmChrome>
+          <JogControls
+            maximized={isExpanded}
+            // 2026-09-16 SIDE-COLUMN OWNERSHIP + EXPAND MODE:
+            //   * `immersive` portals the LEFT + RIGHT columns
+            //     into the page-level slot divs above; this
+            //     pad-cluster overlay hosts only the CENTER pads.
+            //   * `expanded` scales the CENTER cluster 1.6× via
+            //     CSS transform (arrangement unchanged).
+            immersive
+            expanded={isExpanded}
+            leftTopSlot={
+              <>
+                <ArmEnableControl />
+                <JogReadyBadge />
+              </>
+            }
+            rightSlot={jogApi
+              ? <OrientFlangeDownControl jogApi={jogApi} />
+              : null}
+            collapseSlot={
+              <>
+                <button
+                  data-testid="collapse-jog-buttons"
+                  onClick={() => setView3dJogPanel('MINIMIZED')}
+                  title="Collapse Jog Buttons"
+                  style={{
+                    ...chromeBtn,
+                    width: 'auto', padding: '0 12px',
+                    fontSize: 11, fontWeight: 600,
+                    letterSpacing: '0.02em',
+                    pointerEvents: 'auto',
+                  }}>Collapse Jog Buttons</button>
+                <button
+                  onClick={() => setView3dJogPanel(
+                    isExpanded ? 'NORMAL' : 'EXPANDED')}
+                  title={isExpanded ? 'Restore split layout' : 'Expand panel'}
+                  style={{ ...chromeBtn, pointerEvents: 'auto' }}>
+                  {isExpanded ? '✕' : '⛶'}
+                </button>
+              </>
+            }
+          />
         </div>
       )}
     </div>

@@ -958,7 +958,17 @@ export default function JogControls({
     }
   }, [immersive, maximized])
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', position: 'relative' }}>
+    // 2026-09-17 SINGLE-WINDOW RESTRUCTURE — in immersive mode the
+    // outer wrapper drops height:100% and pointer-events so the
+    // pad-cluster overlay (view3d-layout owner) sizes to content
+    // and passes clicks through everywhere except on actual
+    // buttons/inputs. Program-tab consumer (immersive=false) keeps
+    // the legacy full-height panel layout.
+    <div style={{
+      height: immersive ? 'auto' : '100%',
+      display: 'flex', flexDirection: 'column', position: 'relative',
+      pointerEvents: immersive ? 'none' : undefined,
+    }}>
       {/* 2026-09-04: the full-width State banner is retired. The
           READY / NOT-READY cue lives in <JogReadyBadge /> up in the
           RealArmChrome header, next to the enable button. Actions
@@ -1045,15 +1055,20 @@ export default function JogControls({
     <div
       data-testid="jog-surface-row"
       style={{
-        padding: containerPad,
+        padding: immersive ? 0 : containerPad,
         // 2026-09-16 operator directive: surface fully TRANSPARENT.
-        // No tint, no blur — the 3D scene shows through at 100 %
-        // between and around controls. Prior translucent gray scrim
-        // + backdrop-blur retired: canvas full-bleed behind the
-        // surface handles the "readability by contrast" case; loose
-        // labels carry LABEL_TEXT_SHADOW for their own contrast.
+        // 2026-09-17 SINGLE-WINDOW RESTRUCTURE — in immersive mode
+        // the row is content-sized (no width:100%, no flex:1) so
+        // it doesn't form a full-width band over the canvas. It
+        // hosts only the CENTER pads (LEFT and RIGHT are portaled
+        // to page-level slots). pointer-events:none so the row's
+        // padding gaps let clicks through to the canvas; the
+        // buttons and inputs inside carry their own auto.
         background: 'transparent',
-        width: '100%', flex: 1, minHeight: 0,
+        width: immersive ? 'auto' : '100%',
+        flex: immersive ? 'none' : 1,
+        minHeight: immersive ? undefined : 0,
+        pointerEvents: immersive ? 'none' : undefined,
         // 2026-09-16 tint correction — no internal scrollbar on the
         // translucent surface. Content lays out at its natural size
         // over the canvas (previous overflowY:'auto' was the source
@@ -1061,7 +1076,7 @@ export default function JogControls({
         overflowX: 'hidden', overflowY: 'visible',
         display: 'flex', flexDirection: 'row',
         alignItems: 'flex-start', justifyContent: 'space-evenly',
-        gap: rowGap,
+        gap: immersive ? 0 : rowGap,
         boxSizing: 'border-box',
       }}>
       {/* LEFT — mode, step, speed. 2026-09-16 immersive side-column
@@ -1136,17 +1151,31 @@ export default function JogControls({
         justifyContent: 'space-between',
         boxSizing: 'border-box',
         paddingLeft: 4, paddingRight: 4, paddingTop: 4, paddingBottom: 4,
+        // 2026-09-17 SINGLE-WINDOW — LEFT column outer stays
+        // pointer-events:none so the residual GAPS between the 5
+        // content groups (space-between) let orbit through to the
+        // canvas. Each of the 5 content groups (TOP slot, XYZ/Joint,
+        // Step/Continuous, step-size chips, Speed) opts back into
+        // pointer-events:auto inline below.
+        pointerEvents: immersive ? 'none' : undefined,
       }}>
+        {/* 2026-09-17 pointer-events walk — each of the 5 group
+            wrappers below opts back INTO pointer-events:auto (the
+            column outer + parent overlay are none) so canvas orbit
+            still receives events in the GAPS between groups
+            (space-between residual space). The wrapper is content-
+            sized to its buttons, so this only blocks input on the
+            actual chip surfaces. */}
         {/* TOP — caller-provided DISABLE + READY row. Program-tab
             consumer passes null; slot then renders nothing and
             other groups take its share of the space. minHeight:44
             mirrors the RIGHT column Orient block for equal top-row
             heights. */}
-        <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, minHeight: 44 }}>
+        <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, minHeight: 44, pointerEvents: immersive ? 'auto' : undefined }}>
           {leftTopSlot}
         </div>
         {/* Frame: XYZ / Joint (equal-width, stacked). */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, pointerEvents: immersive ? 'auto' : undefined }}>
           <button
             onClick={() => cartesianEnabled && setJogMode('cartesian')}
             disabled={!cartesianEnabled}
@@ -1159,7 +1188,7 @@ export default function JogControls({
         </div>
         {/* Press style: Step / Continuous (equal-width, stacked so
             they match XYZ/Joint widths). */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, pointerEvents: immersive ? 'auto' : undefined }}>
           <button
             onClick={() => setJogStyle('STEP')}
             style={{ ...chipBtnStyle(jogStyle === 'STEP'), minHeight: Math.max(36, modeMinH - 8), fontSize: modeFont - 1 }}>
@@ -1176,7 +1205,7 @@ export default function JogControls({
             "· speed controls motion" retired per 2026-09-16 order:
             the chips grey out in Continuous mode, communicating the
             same fact without extra text. */}
-        <div style={{ opacity: jogStyle === 'STEP' ? 1 : 0.4 }}>
+        <div style={{ opacity: jogStyle === 'STEP' ? 1 : 0.4, pointerEvents: immersive ? 'auto' : undefined }}>
           <div style={{ fontSize: sectionLabelFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
             Step Size
           </div>
@@ -1202,7 +1231,7 @@ export default function JogControls({
             in the space-between distribution). Speed:N% label stays;
             wire-hint line retired to slider `title` tooltip per
             2026-09-16 operator order. */}
-        <div style={{ flexShrink: 0 }} data-testid="jog-speed-group">
+        <div style={{ flexShrink: 0, pointerEvents: immersive ? 'auto' : undefined }} data-testid="jog-speed-group">
           <div style={{ fontSize: speedFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
             Speed: {speedClamped}%
           </div>
@@ -1246,12 +1275,19 @@ export default function JogControls({
       <div
         data-testid="jog-center-pads"
         style={{
-          flex: 1,
+          // 2026-09-17 SINGLE-WINDOW — in immersive mode this
+          // container sizes to its content (no flex:1, no
+          // alignSelf:stretch) so the pad cluster is a compact
+          // floating overlay, not a full-width band. Program-tab
+          // consumer keeps the legacy fill layout.
+          flex: immersive ? 'none' : 1,
           display: 'flex',
           justifyContent: 'center',
-          alignItems: 'flex-end',
-          minWidth: 0, alignSelf: 'stretch',
-          paddingBottom: expanded ? 40 : 20,
+          alignItems: immersive ? 'center' : 'flex-end',
+          minWidth: 0,
+          alignSelf: immersive ? 'auto' : 'stretch',
+          paddingBottom: immersive ? 0 : (expanded ? 40 : 20),
+          pointerEvents: immersive ? 'none' : undefined,
         }}>
         {/* 2026-09-16 EXPAND MODE — when `expanded` is true the pad
             CLUSTER scales up (1.6×) via CSS transform so the SAME
@@ -1266,6 +1302,12 @@ export default function JogControls({
             transformOrigin: 'center bottom',
             transition: 'transform 120ms ease-out',
             display: 'flex', justifyContent: 'center', alignItems: 'center',
+            // 2026-09-17 SINGLE-WINDOW — the scaler is content-sized
+            // and hosts only the actual pad buttons; re-enable
+            // pointer-events here (overlay + parents are none) so
+            // taps land on the pads while surrounding empty regions
+            // pass through to the canvas.
+            pointerEvents: immersive ? 'auto' : undefined,
           }}>
         {jogMode === 'cartesian' ? (
           <div style={{ display: 'flex', gap: padGroup, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
@@ -1413,12 +1455,17 @@ export default function JogControls({
             // pushes Orient to the top and Collapse to the bottom so
             // both are easy to reach without hunting.
             justifyContent: 'space-between',
-            alignItems: 'flex-start',
+            alignItems: 'flex-end',
             flexShrink: 0,
             paddingLeft: 4,
             minHeight: 0,
+            width: '100%',
+            // 2026-09-17 SINGLE-WINDOW — RIGHT column outer stays
+            // pointer-events:none so the middle GAP between Orient
+            // (top) and Collapse (bottom) lets orbit through.
+            pointerEvents: immersive ? 'none' : undefined,
           }}>
-          <div style={{ flexShrink: 0 }}>{rightSlot}</div>
+          <div style={{ flexShrink: 0, pointerEvents: immersive ? 'auto' : undefined }}>{rightSlot}</div>
           {collapseSlot && (
             <div
               data-testid="jog-collapse-slot"
@@ -1426,6 +1473,7 @@ export default function JogControls({
                 flexShrink: 0,
                 display: 'flex', gap: 6,
                 marginTop: 'auto',   // belt-and-braces: pins to bottom
+                pointerEvents: immersive ? 'auto' : undefined,
               }}>
               {collapseSlot}
             </div>

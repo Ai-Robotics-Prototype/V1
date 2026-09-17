@@ -82,54 +82,57 @@ def test_immersive_root_is_the_content_container():
 # ─────────────────────────────────────────────────────────────────
 
 def test_jog_overlay_wrapper_swallows_only_its_own_pointer_events():
-    """The overlay WRAPPER around the jog panel is pointerEvents:none
-    so clicks/orbit in the empty margin pass through to the 3D canvas.
-    The panel itself (jog-floating-panel) re-enables pointer events
-    for its own controls.
+    """2026-09-17 SINGLE-WINDOW RESTRUCTURE — the operator's
+    "two-window" diagnosis retired the full-width overlay wrapper
+    + RealArmChrome full-width panel. The successor is
+    `jog-pad-cluster-overlay` — a content-sized, bottom-center
+    floating overlay that hosts ONLY the CENTER pads. Wrapper
+    stays pointer-events:none; the pad cluster's scaler
+    (jog-center-cluster-scaler in JogControls) re-enables auto
+    so taps land on buttons and orbit passes through elsewhere.
     """
     src = _read(LAYOUT)
-    idx = src.find('data-testid="jog-overlay-wrapper"')
-    assert idx != -1
-    # The wrapper style block includes NORMAL/EXPANDED-conditional
-    # positioning + comments, ~1500 chars end-to-end.
+    idx = src.find('data-testid="jog-pad-cluster-overlay"')
+    assert idx != -1, (
+        'jog-pad-cluster-overlay testid must exist — it replaces '
+        'the retired jog-overlay-wrapper + jog-floating-panel '
+        'per 2026-09-17 single-window restructure')
     wrapper_block = src[idx:idx + 1600]
     assert re.search(r"pointerEvents:\s*'none'", wrapper_block), (
-        'jog-overlay-wrapper must be pointerEvents:none so it does '
-        'not block 3D orbit outside the panel body')
-    # And the actual panel inside re-enables its own pointer events.
-    panel_idx = src.find('data-testid="jog-floating-panel"')
-    assert panel_idx != -1
-    # Window big enough to cover the panel's whole style block —
-    # it carries background + border + boxShadow + pointerEvents +
-    # flex layout, which pushes past 1500 chars including comments.
-    panel_block = src[panel_idx:panel_idx + 2500]
-    assert re.search(r"pointerEvents:\s*'auto'", panel_block), (
-        'jog-floating-panel must be pointerEvents:auto so its controls '
-        'receive taps')
+        'jog-pad-cluster-overlay must be pointerEvents:none so '
+        'canvas orbit still receives events in the empty margin '
+        'around the pad cluster')
+    # Retired: jog-floating-panel + jog-overlay-wrapper testids
+    # must NOT reappear. RealArmChrome deleted at the same time.
+    assert 'data-testid="jog-floating-panel"' not in src, (
+        'jog-floating-panel testid must be retired — the full-width '
+        'panel was the operator-flagged second-window culprit')
+    assert 'data-testid="jog-overlay-wrapper"' not in src, (
+        'jog-overlay-wrapper testid must be retired — the full-width '
+        'wrapper (left:0 right:0) formed the second window')
+    assert 'function RealArmChrome(' not in src, (
+        'RealArmChrome function must be retired — split into three '
+        'page-level overlays owned directly by View3DLayout')
 
 
 def test_overlay_panel_container_is_transparent():
-    """2026-09-16 correction: the jog surface container MUST be fully
-    transparent (no bg, no border, no shadow, no radius, no blur) so
-    the 3D scene shows THROUGH the whole surface. Only the
-    buttons / controls themselves carry chip backgrounds. Prior
-    rgba(255,255,255,0.92) card was the mistake the operator called
-    out — pin so it can't come back.
+    """2026-09-17 SINGLE-WINDOW UPDATE: pad-cluster overlay carries
+    no background / border / shadow — the 3D scene shows through
+    everywhere except at the pad chips themselves. The retired
+    jog-floating-panel had the same contract; the pin now targets
+    the successor overlay.
     """
     src = _read(LAYOUT)
-    idx = src.find('data-testid="jog-floating-panel"')
+    idx = src.find('data-testid="jog-pad-cluster-overlay"')
     assert idx != -1
     block = src[idx:idx + 1500]
-    assert re.search(r"background:\s*'transparent'", block), (
-        'jog-floating-panel MUST be background:transparent so the 3D '
-        'scene shows through between controls — no white card')
-    # Reject the retired card treatments explicitly so a partial
-    # revert stands out.
-    for banned in ('borderRadius', 'boxShadow', 'rgba(255, 255, 255,'):
+    # No explicit background declared → default is transparent.
+    for banned in ('background:', 'borderRadius', 'boxShadow',
+                   'rgba(255, 255, 255,'):
         assert banned not in block, (
-            f'jog-floating-panel container must not carry `{banned}` — '
-            f'the transparent-surface directive forbids the "floating '
-            f'card" treatment')
+            f'jog-pad-cluster-overlay must not carry `{banned}` — '
+            f'the transparent-surface directive forbids any card '
+            f'treatment on the floating overlay itself')
 
 
 def test_jog_surface_row_is_fully_transparent():
@@ -183,28 +186,22 @@ def test_jog_surface_row_has_no_internal_overflow_scroll():
 
 
 def test_overlay_panel_has_no_internal_scroll():
-    """The scrollable children container inside the jog panel used
-    overflow:auto — it produced an internal scrollbar when the pad
-    body exceeded 440 px on the operator's viewport. The correction
-    changes overflow to 'visible' so content lays out at its natural
-    size over the canvas with NO scrollbar.
+    """2026-09-17 SINGLE-WINDOW RESTRUCTURE — RealArmChrome retired.
+    No scrollable child container exists anywhere in the new tree:
+    the pad-cluster overlay is content-sized, LEFT/RIGHT slots use
+    top/bottom anchors with pointer-events walk. So the
+    "overflow:auto ever reappearing" invariant is satisfied by
+    absence of any scroll-capable wrapper in the layout file.
     """
     src = _read(LAYOUT)
-    # The children wrapper sits directly before the {children} render
-    # inside RealArmChrome — grep for the specific comment-anchored
-    # style.
-    chrome_start = src.find('function RealArmChrome(')
-    body_end = src.find('function ', chrome_start + 20)
-    body = src[chrome_start:body_end]
-    assert re.search(
-        r"flex:\s*1,\s*minHeight:\s*0,\s*overflow:\s*'visible'",
-        body), (
-        'RealArmChrome children wrapper must use overflow:visible so '
-        'no internal scrollbar appears on the transparent surface')
-    # And the scroll variant must be gone.
-    assert "overflow: 'auto'" not in body, (
-        'overflow:auto is retired from RealArmChrome — it was the '
-        'source of the operator-reported internal scrollbar')
+    # No child of the 3D View root may declare overflow: 'auto' or
+    # 'scroll' — that would reintroduce the operator-flagged
+    # internal scrollbar the last iteration eliminated.
+    assert "overflow: 'auto'" not in src, (
+        'View3DLayout must not declare overflow:auto anywhere — the '
+        'legacy source of the internal scrollbar')
+    assert "overflow: 'scroll'" not in src, (
+        'View3DLayout must not declare overflow:scroll anywhere')
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -230,19 +227,24 @@ def test_estop_lives_in_a_different_grid_area_than_content():
 
 
 def test_overlay_zindex_is_scoped_below_topbar_stacking():
-    """The jog overlay wrapper uses zIndex:10 — well below any modal
-    (typical 9990+) and inside the content grid area so it can't
-    reach the E-STOP in TopBar. Pin the value stays bounded.
+    """2026-09-17 SINGLE-WINDOW UPDATE: pin the pad-cluster overlay
+    + slot divs' zIndex — bounded above the canvas (0) and well
+    below any modal (9990+) so E-STOP in TopBar (different grid
+    area entirely) is unreachable.
     """
     src = _read(LAYOUT)
-    idx = src.find('data-testid="jog-overlay-wrapper"')
-    block = src[idx:idx + 1600]
-    m = re.search(r'zIndex:\s*(\d+)', block)
-    assert m is not None, 'overlay wrapper missing zIndex declaration'
-    z = int(m.group(1))
-    assert 1 <= z <= 100, (
-        f'overlay wrapper zIndex {z} out of range — must be > 0 (above '
-        f'canvas) and well below modal / global-banner tiers (>=9990)')
+    for testid in ('jog-pad-cluster-overlay',
+                   'jog-left-column-slot',
+                   'jog-right-column-slot'):
+        idx = src.find(f'data-testid="{testid}"')
+        assert idx != -1, f'{testid} testid missing'
+        block = src[idx:idx + 1600]
+        m = re.search(r'zIndex:\s*(\d+)', block)
+        assert m is not None, f'{testid} missing zIndex declaration'
+        z = int(m.group(1))
+        assert 1 <= z <= 100, (
+            f'{testid} zIndex {z} out of range — must be > 0 (above '
+            f'canvas) and well below modal / global-banner tiers')
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -250,28 +252,25 @@ def test_overlay_zindex_is_scoped_below_topbar_stacking():
 # ─────────────────────────────────────────────────────────────────
 
 def test_minimized_collapses_to_expand_pill_only():
-    """When jogPanelMode==='MINIMIZED', the layout renders ONLY the
-    RealArmMinimizedPill (the "Expand Jog Buttons" pill) — no
-    floating chrome, no controls, so the 3D view is fully
-    unobstructed.
+    """2026-09-17 SINGLE-WINDOW UPDATE: MINIMIZED renders the
+    RealArmMinimizedPill (Expand Jog Buttons) and hides the
+    jog-pad-cluster-overlay. The LEFT + RIGHT slot divs also hide
+    under MINIMIZED (no JogControls to portal into) so the 3D view
+    is fully unobstructed except for the tiny Expand pill.
     """
     src = _read(LAYOUT)
-    # The layout conditionally renders the overlay wrapper based on
-    # !isMinimized — pin the guard so a future edit can't drop it.
+    # MINIMIZED gate for the pill.
     assert re.search(
         r'\{isMinimized\s*&&\s*<RealArmMinimizedPill',
         src), (
-        'MINIMIZED must render ONLY the RealArmMinimizedPill — no '
-        'chrome, no jog overlay wrapper')
-    # Allow any inline props between <div and the testid (a ref was
-    # added when framing switched to measured DOM); the load-bearing
-    # invariant is the !isMinimized guard AND the wrapper testid.
-    assert re.search(
-        r'\{!isMinimized\s*&&\s*\(\s*\n\s*<div\b[\s\S]{0,200}'
-        r'data-testid="jog-overlay-wrapper"',
-        src), (
-        'the jog overlay wrapper must be guarded by !isMinimized so '
-        'a collapse fully clears the panel from the canvas')
+        'MINIMIZED must render RealArmMinimizedPill')
+    # The pad-cluster overlay must be gated on !isMinimized.
+    pad_idx = src.find('data-testid="jog-pad-cluster-overlay"')
+    assert pad_idx != -1
+    prefix = src[max(0, pad_idx - 400):pad_idx]
+    assert re.search(r'\{!isMinimized\s*&&', prefix), (
+        'jog-pad-cluster-overlay must be gated on !isMinimized so '
+        'collapse fully clears the pad cluster')
 
 
 def test_expand_pill_testid_still_present():
@@ -533,20 +532,23 @@ def test_canvas_fill_carries_touch_action_none():
 
 
 def test_jog_overlay_wrapper_still_pointer_events_none_for_multi_touch():
-    """2026-09-16 tablet-gesture fix — the jog overlay wrapper MUST
-    remain pointerEvents:'none' so multi-touch gestures starting in
-    the gaps between jog buttons reach the canvas below. A partial
-    revert that sets pointerEvents:'auto' on the wrapper (even
-    briefly) would eat the second finger of a pan gesture.
+    """2026-09-17 SINGLE-WINDOW UPDATE: the successor overlays
+    (jog-pad-cluster-overlay + jog-left-column-slot +
+    jog-right-column-slot) must ALL declare pointerEvents:'none'
+    so multi-touch gestures starting in the gaps between controls
+    reach the canvas below.
     """
     src = _read(LAYOUT)
-    idx = src.find('data-testid="jog-overlay-wrapper"')
-    assert idx != -1
-    block = src[idx:idx + 1600]
-    assert re.search(r"pointerEvents:\s*'none'", block), (
-        "jog-overlay-wrapper must be pointerEvents:'none' so the "
-        "empty transparent margin doesn't swallow multi-touch bound "
-        "for the canvas below")
+    for testid in ('jog-pad-cluster-overlay',
+                   'jog-left-column-slot',
+                   'jog-right-column-slot'):
+        idx = src.find(f'data-testid="{testid}"')
+        assert idx != -1, f'{testid} testid missing'
+        block = src[idx:idx + 1600]
+        assert re.search(r"pointerEvents:\s*'none'", block), (
+            f"{testid} must be pointerEvents:'none' so the empty "
+            f"transparent regions don't swallow multi-touch bound "
+            f"for the canvas below")
 
 
 def test_speed_slider_opts_back_in_to_touch_drag():
@@ -612,13 +614,14 @@ def test_default_framing_measured_from_actual_surface_bounds():
             f'framing recompute must trigger on {trigger} — the '
             f'operator directive lists load, resize, orientation '
             f'change, and PWA standalone launch (visibilitychange)')
-    # Panel ref attached to the jog overlay wrapper (measured
-    # element).
+    # 2026-09-17 SINGLE-WINDOW UPDATE: panelRef migrated from the
+    # retired jog-overlay-wrapper to the pad-cluster overlay.
     assert re.search(
-        r'ref=\{panelRef\}\s*\n\s*data-testid="jog-overlay-wrapper"',
+        r'ref=\{panelRef\}\s*\n\s*data-testid="jog-pad-cluster-overlay"',
         src), (
-        'panelRef must attach to jog-overlay-wrapper so its top '
-        'edge drives the measured fraction')
+        'panelRef must attach to jog-pad-cluster-overlay so its top '
+        'edge drives the measured fraction (fallback when the '
+        'scaler element inside JogControls is not yet in the DOM)')
     # ArmViewer3D still receives the framing prop.
     assert re.search(
         r"<ArmViewer3D[^>]*framing=\{framing\}", src, re.DOTALL), (
@@ -929,31 +932,17 @@ def test_side_column_layout_spread_and_collapse_relocation():
     layout = _read(LAYOUT)
     jog    = _read(JOG)
 
-    # (a) RealArmChrome viewport-aware height + floor.
-    assert re.search(
-        r"function RealArmChrome\(\{\s*mode,\s*setMode,\s*children,\s*panelHeight\s*\}\)",
-        layout), (
-        'RealArmChrome must accept a panelHeight prop for the '
-        'viewport-aware NORMAL height (side-column spread needs '
-        'room)')
-    assert re.search(
-        r"height:\s*isExpanded\s*\?\s*'100%'\s*:\s*\(panelHeight\s*\|\|\s*440\)",
-        layout), (
-        'RealArmChrome height must be isExpanded ? "100%" : '
-        '(panelHeight || 440) — viewport-aware NORMAL with the '
-        '440 doctrine floor')
-    # (a) View3DLayout computes panelHeight from window.innerHeight.
-    assert re.search(
-        r"setPanelHeight\s*\(\s*Math\.min\(780,\s*Math\.max\(440",
-        layout), (
-        'View3DLayout must compute panelHeight = min(780, max(440, '
-        '~70% of window.innerHeight)) so tablet + desktop both get '
-        'room to spread while keeping the doctrine 440 floor')
-    # Resize + orientation change re-compute panelHeight.
-    assert re.search(
-        r"recomputePanelH", layout), (
-        'panelHeight must recompute on window resize + orientation '
-        'change — side-column spread must track viewport dims')
+    # (a) 2026-09-17 SINGLE-WINDOW UPDATE: RealArmChrome retired
+    # entirely. The `panelHeight` viewport-aware height it used to
+    # own is superseded — the pad-cluster overlay is content-sized
+    # and bottom-anchored, and the LEFT/RIGHT slots use direct
+    # top/bottom anchors instead of a computed height. This block
+    # of the pin is intentionally trivialised; the standing
+    # invariants (LEFT column spread + collapse relocation) are
+    # covered by (b)-(e) below.
+    assert 'function RealArmChrome(' not in layout, (
+        'RealArmChrome must be retired — the full-width panel it '
+        'produced formed the operator-flagged second window')
 
     # (b) LEFT column spread. 2026-09-16 LEFT-column-cleanup UPDATE:
     # the OUTER LEFT column is now a 3-section flex (TOP slot /
@@ -997,18 +986,11 @@ def test_side_column_layout_spread_and_collapse_relocation():
         'collapse-jog-buttons testid must survive the header→'
         'collapseSlot relocation')
 
-    # (e) Header no longer contains Collapse or the fullscreen icon.
-    header_start = layout.find("padding: '5px 8px'")
-    header_end = layout.find('</div>', header_start)
-    header_block = layout[header_start:header_end + 100]
-    # The two retired buttons: assert their inline JSX is gone from
-    # the header block.
-    assert "'Collapse Jog Buttons'" not in header_block, (
-        'Collapse Jog Buttons button retired from the header — '
-        'moved to JogControls.collapseSlot')
-    assert "isExpanded ? '✕' : '⛶'" not in header_block, (
-        'Fullscreen ⛶/✕ button retired from the header — moved '
-        'to JogControls.collapseSlot alongside Collapse')
+    # (e) 2026-09-17 SINGLE-WINDOW UPDATE: chrome header retired
+    # (RealArmChrome entirely deleted). The Collapse + fullscreen
+    # buttons live only via JogControls.collapseSlot now — the
+    # retired-from-header invariant is trivially satisfied by
+    # RealArmChrome absence, covered in (a) above.
 
 
 def test_framing_measures_center_pads_not_full_surface():
@@ -1136,21 +1118,25 @@ def test_side_columns_portal_out_to_page_level():
     # panel, not descendants).
     left_slot_idx  = layout.find('id="jog-left-column-slot"')
     right_slot_idx = layout.find('id="jog-right-column-slot"')
-    wrapper_idx    = layout.find('data-testid="jog-overlay-wrapper"')
+    # 2026-09-17 SINGLE-WINDOW UPDATE: pad-cluster overlay
+    # supersedes the retired jog-overlay-wrapper as the sibling
+    # anchor. Slots must render as siblings of the pad overlay
+    # under the 3D View root (page-level), not nested inside it.
+    pad_idx    = layout.find('data-testid="jog-pad-cluster-overlay"')
     assert left_slot_idx != -1, (
         'View3DLayout must render an id="jog-left-column-slot" div '
         'as a page-level portal target for the LEFT column')
     assert right_slot_idx != -1, (
         'View3DLayout must render an id="jog-right-column-slot" div '
         'as a page-level portal target for the RIGHT column')
-    assert wrapper_idx != -1
-    assert left_slot_idx  < wrapper_idx, (
-        'jog-left-column-slot must be rendered BEFORE the '
-        'jog-overlay-wrapper (i.e., as a sibling under the 3D View '
-        'root, not nested inside the panel container)')
-    assert right_slot_idx < wrapper_idx, (
-        'jog-right-column-slot must be rendered BEFORE the '
-        'jog-overlay-wrapper (page-level sibling, not descendant)')
+    assert pad_idx != -1
+    assert left_slot_idx  < pad_idx, (
+        'jog-left-column-slot must render BEFORE jog-pad-cluster-'
+        'overlay (page-level sibling under the 3D View root, not '
+        'nested inside the pad overlay)')
+    assert right_slot_idx < pad_idx, (
+        'jog-right-column-slot must render BEFORE jog-pad-cluster-'
+        'overlay (page-level sibling, not descendant)')
 
     # (e) View3DLayout passes immersive to JogControls. Grab a
     # window around the <JogControls open tag and assert.
@@ -1255,44 +1241,44 @@ def test_expand_dims_canvas_and_exit_restores():
 
 
 def test_page_level_slot_dims_track_panel_height():
-    """2026-09-16 slot geometry — the LEFT + RIGHT slot divs sit
-    at the bottom edge with height = panelHeight in NORMAL and
-    calc(100% - 16px) in EXPANDED so they cover the full vertical
-    span the operator can reach. Both slots have pointerEvents:
-    auto (their contents must be interactive) and stay mounted
-    whenever the jog panel is open — i.e., NOT under MINIMIZED
-    (JogControls tree not rendered → nothing to portal into).
+    """2026-09-17 SINGLE-WINDOW UPDATE: slot geometry is no longer
+    keyed off panelHeight (retired with RealArmChrome). Both slots
+    use direct top/bottom anchors (top:72 clears the view-preset
+    row, bottom:16 keeps a floor margin) and stay mounted whenever
+    the pad-cluster overlay is mounted (i.e., NOT under MINIMIZED).
+    Slot wrappers are pointerEvents:none per the new pointer-events
+    walk contract — content wrappers inside JogControls opt back in
+    per group.
     """
     layout = _read(LAYOUT)
     for side in ('left', 'right'):
         slot_id = f'id="jog-{side}-column-slot"'
         idx = layout.find(slot_id)
         assert idx != -1, f'slot {slot_id} must be present'
-        # Window wide enough to cover the style block + any inline
-        # documentation comments interleaved with the CSS keys.
         block = layout[idx:idx + 1400]
         assert re.search(r"position:\s*'absolute'", block), (
             f'{side} slot must be absolute-positioned')
-        assert re.search(r"pointerEvents:\s*'auto'", block), (
-            f'{side} slot must have pointerEvents:auto so its '
-            f'contents receive clicks')
-        # Height tracks panelHeight (with the 424 default fallback +
-        # calc for expanded).
-        assert 'panelHeight' in block, (
-            f'{side} slot height must key off panelHeight so it '
-            f'tracks the viewport-aware NORMAL height')
-        assert 'isExpanded' in block, (
-            f'{side} slot must switch height on isExpanded (full '
-            f'span in EXPANDED, panelHeight in NORMAL)')
+        assert re.search(r"pointerEvents:\s*'none'", block), (
+            f'{side} slot must have pointerEvents:none (single-window '
+            f'contract — content wrappers opt back to auto in JogControls)')
+        # top:72 anchor (below view-preset row).
+        assert re.search(r"top:\s*72", block), (
+            f'{side} slot must anchor top:72 so it starts below the '
+            f'top-of-viewport view-preset chips and MinClearanceReadout')
+        assert re.search(r"bottom:\s*16", block), (
+            f'{side} slot must anchor bottom:16 for a consistent floor '
+            f'margin above the pad-cluster overlay')
+        # panelHeight must NOT be referenced in slot geometry.
+        assert 'panelHeight' not in block, (
+            f'{side} slot must NOT reference panelHeight — the '
+            f'viewport-aware panel height was retired with RealArmChrome')
 
-    # Slots gated on !isMinimized (nothing to portal into when the
-    # panel is collapsed).
+    # Slots gated on !isMinimized.
     left_idx = layout.find('id="jog-left-column-slot"')
     prefix = layout[max(0, left_idx - 400):left_idx]
     assert re.search(r'\{!isMinimized\s*&&', prefix), (
         'slot divs MUST be gated on !isMinimized so they only exist '
-        'while the JogControls tree is mounted (otherwise the '
-        'portal targets are unreachable and React logs warnings)')
+        'while the JogControls tree is mounted')
 
 
 def test_jog_heading_and_captions_retired_from_left_column():
@@ -1405,13 +1391,12 @@ def test_disable_ready_row_moved_from_header_to_left_top_slot():
         'leftTopSlot must contain <JogReadyBadge /> (moved from '
         'the chrome header)')
 
-    # The chrome header (now empty) must NOT still render either
-    # component. The chrome-header-empty testid marks the retired
-    # container.
-    assert 'data-testid="jog-chrome-header-empty"' in layout, (
-        'chrome header must render an empty div with the '
-        'jog-chrome-header-empty testid — the marker that DISABLE '
-        'moved out and no controls remain')
+    # 2026-09-17 SINGLE-WINDOW UPDATE: chrome header retired
+    # entirely (RealArmChrome deleted). The DISABLE-moved-out
+    # invariant is trivially satisfied by RealArmChrome absence.
+    assert 'function RealArmChrome(' not in layout, (
+        'RealArmChrome retired — no chrome header exists that could '
+        'host DISABLE + READY')
 
 
 def test_left_column_pins_speed_slider_to_bottom():
@@ -1447,39 +1432,39 @@ def test_left_column_pins_speed_slider_to_bottom():
 
 
 def test_center_pads_anchor_to_bottom_of_container():
-    """2026-09-16 pad-anchoring operator directive #2: the CENTER
-    pad clusters float mid-page today; anchor them toward the BASE
-    of the viewport so the arm region gains vertical space.
+    """2026-09-17 SINGLE-WINDOW UPDATE: the pad-anchoring contract
+    now lives at the page-level overlay, not inside the JogControls
+    container. The pad-cluster overlay (jog-pad-cluster-overlay in
+    View3DLayout) anchors bottom:16 + left:50% translate for
+    bottom-center placement — the container's internal alignItems
+    contract is superseded (container is content-sized in immersive).
 
-    Implementation contract:
-      * jog-center-pads uses alignItems:'flex-end' (not 'center').
-      * jog-center-pads has a paddingBottom margin (16-40 px) so
-        the cluster sits above the RIGHT-column Collapse row.
-      * The scaler wrapper (jog-center-cluster-scaler) uses
-        transformOrigin:'center bottom' so EXPAND scaling grows
-        UP from the base — pads don't jump up when expanded.
+    The scaler still uses transformOrigin:'center bottom' so EXPAND
+    scaling grows UP from the base — pin retained.
     """
+    layout = _read(LAYOUT)
     jog = _read(JOG)
-    # Locate the container by testid, then read its inline style.
-    pads_idx = jog.find('data-testid="jog-center-pads"')
-    assert pads_idx != -1
-    pads_block = jog[pads_idx:pads_idx + 500]
-    assert re.search(r"alignItems:\s*'flex-end'", pads_block), (
-        'jog-center-pads container must use alignItems:flex-end so '
-        'the pad cluster bottom-aligns inside the full-height '
-        'container (arm region above gains vertical space)')
-    assert re.search(r"paddingBottom:", pads_block), (
-        'jog-center-pads must declare paddingBottom so the anchored '
-        'cluster keeps a comfortable margin above the Collapse row')
-    # Scaler transformOrigin: 'center bottom' so EXPAND scale grows
-    # up from the base (not center) — no visual jump on expand.
+    # Pad-cluster overlay anchors bottom + horizontally-centered.
+    overlay_idx = layout.find('data-testid="jog-pad-cluster-overlay"')
+    assert overlay_idx != -1
+    overlay_block = layout[overlay_idx:overlay_idx + 1200]
+    assert re.search(r"bottom:\s*16", overlay_block), (
+        'jog-pad-cluster-overlay must anchor bottom:16 for a '
+        'consistent floor margin above the viewport bottom')
+    assert re.search(r"left:\s*'50%'", overlay_block), (
+        "jog-pad-cluster-overlay must use left:'50%' + "
+        'translateX(-50%) for bottom-center placement of the '
+        'content-sized cluster')
+    assert re.search(r"translateX\(-50%\)", overlay_block), (
+        'jog-pad-cluster-overlay must translateX(-50%) to center '
+        'the variable-width pad cluster horizontally')
+    # Scaler still declares transformOrigin:'center bottom'.
     scaler_idx = jog.find('data-testid="jog-center-cluster-scaler"')
     assert scaler_idx != -1
     scaler_block = jog[scaler_idx:scaler_idx + 500]
     assert re.search(r"transformOrigin:\s*'center bottom'", scaler_block), (
         "scaler transformOrigin must be 'center bottom' so EXPAND "
-        'grows upward from the anchored bottom edge (pad-anchoring '
-        'contract)')
+        'grows upward from the anchored bottom edge')
 
 
 def test_left_column_distributes_evenly_with_space_between():
@@ -1609,31 +1594,237 @@ def test_step_size_speed_controls_motion_caption_retired():
 
 
 def test_slot_insets_widen_to_prevent_left_edge_clip():
-    """2026-09-16 LEFT-column-cleanup: slot inset bumped from
-    left:8 / bottom:8 / width:220 to left:16 / bottom:16 /
-    width:240 so step-size chips + Speed slider never touch x=0
-    (screenshot showed the chips clipped at the viewport left
-    edge). RIGHT slot mirrors the same widened inset.
+    """2026-09-17 SINGLE-WINDOW UPDATE: slot widths dropped from
+    240 to 150 (LEFT) / 200 (RIGHT) per the "THIN chips" directive.
+    Insets remain left/right:16 + bottom:16 (never touch x=0). The
+    original 240-min-width contract was for the 3+2 wrapped chip
+    row inside a chip-btn container; the new 5-col grid + width:100%
+    chip vocabulary fits comfortably at 150.
     """
     layout = _read(LAYOUT)
-    for side in ('left', 'right'):
+    for side, min_width in (('left', 128), ('right', 160)):
         slot_id = f'id="jog-{side}-column-slot"'
         idx = layout.find(slot_id)
         assert idx != -1
-        block = layout[idx:idx + 800]
-        # Inset MUST be >= 16 px (widened per operator screenshot).
+        block = layout[idx:idx + 1000]
         edge = 'left' if side == 'left' else 'right'
+        # Inset MUST be >= 16 px (never touch x=0).
         m = re.search(fr"{edge}:\s*(\d+)", block)
         assert m is not None and int(m.group(1)) >= 16, (
-            f'{side} slot {edge} inset must be >= 16 px (was 8) '
-            f'per 2026-09-16 clip fix')
+            f'{side} slot {edge} inset must be >= 16 px so it '
+            f'never touches x=0')
         # Bottom inset >= 16.
         mb = re.search(r"bottom:\s*(\d+)", block)
-        assert mb is not None and int(mb.group(1)) >= 16, (
-            f'{side} slot bottom inset must be >= 16 px')
-        # Width >= 240 so the chip row fits without wrapping past
-        # the visible area.
+        assert mb is not None and int(mb.group(1)) >= 16
+        # Width bounded: >= min-width per side, <= 240 (thin
+        # chips directive — no more 240-wide LEFT column).
         mw = re.search(r"width:\s*(\d+)", block)
-        assert mw is not None and int(mw.group(1)) >= 240, (
-            f'{side} slot width must be >= 240 px so the LEFT '
-            f'chip row and RIGHT Orient button never overflow')
+        assert mw is not None, f'{side} slot missing width declaration'
+        w = int(mw.group(1))
+        assert min_width <= w <= 240, (
+            f'{side} slot width {w} out of range [{min_width}, 240] '
+            f'per 2026-09-17 thin-chips directive')
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2026-09-17 SINGLE-WINDOW RESTRUCTURE — structural pins
+# ─────────────────────────────────────────────────────────────────
+
+
+def test_no_full_width_container_over_canvas():
+    """Operator diagnosis: the previous RealArmChrome + overlay
+    wrapper formed a "second window" because they spanned
+    left:0 → right:0 (full viewport width) with pointer-events
+    enabled downstream. Any absolute-positioned child of the 3D
+    View root that would form a full-width container over the
+    canvas MUST be gone from View3DLayout. Enforced structurally
+    by rejecting: (a) `left: 0` combined with `right: 0` on any
+    absolute-positioned element inside the layout file, and
+    (b) `width: '100%'` combined with `position: 'absolute'`.
+    """
+    src = _read(LAYOUT)
+    # Strip comments so retirement notes referencing left:0/right:0
+    # don't false-positive.
+    code = re.sub(r'/\*.*?\*/', '', src, flags=re.DOTALL)
+    code = re.sub(r'\{/\*.*?\*/\}', '', code, flags=re.DOTALL)
+    code = '\n'.join(
+        line for line in code.splitlines()
+        if not line.lstrip().startswith('//'))
+
+    # (a) No element declares left:0 + right:0 pair.
+    # Search for `left: 0` proximate to `right: 0` inside the same
+    # style object (within ~200 chars).
+    for m in re.finditer(r"left:\s*0\b", code):
+        window = code[m.end():m.end() + 200]
+        assert not re.search(r"right:\s*0\b", window), (
+            'no element in View3DLayout may declare BOTH left:0 and '
+            'right:0 — that produces a full-width span over the '
+            'canvas (operator-flagged two-window pattern). Successor '
+            'overlays are content-sized (bottom:16 left:50% translate) '
+            'or thin (width:150/200 with left:16 / right:16 anchors).')
+
+    # (b) No absolute-positioned element declares width:'100%'.
+    for m in re.finditer(r"position:\s*'absolute'", code):
+        window = code[m.end():m.end() + 400]
+        assert not re.search(r"width:\s*'100%'", window), (
+            'no absolute-positioned element in View3DLayout may set '
+            "width:'100%' — that reproduces the operator-flagged "
+            'full-width band. Overlays must be content-sized or '
+            'anchored via left/right insets')
+
+
+def test_collapse_toggles_only_pad_cluster():
+    """MINIMIZED hides ONLY the pad-cluster overlay. The LEFT +
+    RIGHT slot divs stay mounted at NORMAL and EXPANDED — but the
+    operator directive is that Collapse re-mounts the pad cluster
+    only, leaving the LEFT (ENABLE/DISABLE + jog mode + step +
+    speed) and RIGHT (Orient + Collapse + fullscreen) columns
+    reachable. Since the LEFT/RIGHT slots are gated on !isMinimized
+    too (per test_page_level_slot_dims), MINIMIZED clears
+    everything except the Expand pill — that's still one-collapse-
+    fits-all. The pin below asserts NEITHER slot is gated on the
+    pad overlay's presence (they don't collapse WITH the pad
+    cluster).
+    """
+    src = _read(LAYOUT)
+    # Both slot divs live inside the SAME !isMinimized fragment as
+    # the pad overlay (three siblings). Assert the pad overlay is
+    # gated separately and NOT nested inside the slot fragment.
+    pad_idx = src.find('data-testid="jog-pad-cluster-overlay"')
+    left_idx = src.find('id="jog-left-column-slot"')
+    right_idx = src.find('id="jog-right-column-slot"')
+    assert pad_idx != -1 and left_idx != -1 and right_idx != -1
+    # Neither slot must sit BETWEEN a `<JogControls` open tag and
+    # its closing `/>` — that would mean the slot is a child of
+    # the pad-cluster JogControls, which contradicts the page-level
+    # requirement. Grep the pad-cluster overlay block.
+    jc_open = src.find('<JogControls', pad_idx)
+    jc_close = src.find('/>', jc_open) if jc_open != -1 else -1
+    if jc_open != -1 and jc_close != -1:
+        assert not (jc_open < left_idx < jc_close), (
+            'LEFT slot must not nest inside the pad-cluster '
+            'JogControls (page-level slot requirement)')
+        assert not (jc_open < right_idx < jc_close), (
+            'RIGHT slot must not nest inside the pad-cluster '
+            'JogControls')
+
+
+def test_left_column_is_page_level_not_inside_pad_overlay():
+    """Structural pin: the LEFT + RIGHT slot divs must render as
+    direct children of the 3D View root (view3d-immersive-root),
+    not as descendants of the pad-cluster overlay. Source-order
+    check: both slots appear BEFORE the pad-cluster overlay under
+    the `!isMinimized &&` fragment. This is the guarantee that
+    collapse of the pad cluster does NOT affect the columns.
+    """
+    src = _read(LAYOUT)
+    left_idx  = src.find('id="jog-left-column-slot"')
+    right_idx = src.find('id="jog-right-column-slot"')
+    pad_idx   = src.find('data-testid="jog-pad-cluster-overlay"')
+    assert -1 not in (left_idx, right_idx, pad_idx)
+    assert left_idx < pad_idx, (
+        'jog-left-column-slot must render BEFORE '
+        'jog-pad-cluster-overlay (page-level sibling)')
+    assert right_idx < pad_idx, (
+        'jog-right-column-slot must render BEFORE '
+        'jog-pad-cluster-overlay (page-level sibling)')
+
+
+def test_pointer_events_walk_over_canvas():
+    """Every element over the canvas in View3DLayout that carries
+    a jog-* testid MUST declare pointerEvents:'none' at its wrapper
+    style. Interactive elements (JogControls buttons/inputs) opt
+    back into 'auto' inside the JogControls component (verified
+    separately). The wrapper contract:
+      * jog-pad-cluster-overlay: none
+      * jog-left-column-slot: none
+      * jog-right-column-slot: none
+      * view3d-expand-canvas-dim: none
+    """
+    src = _read(LAYOUT)
+    for testid in (
+        'jog-pad-cluster-overlay',
+        'jog-left-column-slot',
+        'jog-right-column-slot',
+        'view3d-expand-canvas-dim',
+    ):
+        idx = src.find(f'data-testid="{testid}"')
+        # dim overlay may be conditional — only require pointer-events
+        # none when the testid IS present.
+        if idx == -1:
+            continue
+        block = src[idx:idx + 1600]
+        assert re.search(r"pointerEvents:\s*'none'", block), (
+            f'{testid} wrapper MUST declare pointerEvents:none per '
+            f'the pointer-events walk contract (operator directive '
+            f'2026-09-17: overlays passthrough, controls opt in)')
+
+
+def test_jog_controls_immersive_outer_is_pointer_events_none():
+    """JogControls immersive mode must render its outer div with
+    pointerEvents:'none' so the pad-cluster overlay's transparent
+    region passes clicks through to the canvas. Only the scaler
+    (jog-center-cluster-scaler) opts back to auto.
+    """
+    src = _read(JOG)
+    # Locate JogControls' return outer div via the 2026-09-17
+    # single-window landmark comment placed right at the return.
+    landmark = 'SINGLE-WINDOW RESTRUCTURE — in immersive mode the'
+    idx = src.find(landmark)
+    assert idx != -1, (
+        'JogControls single-window landmark comment not found — '
+        'the outer wrapper contract cannot be verified')
+    outer_block = src[idx:idx + 800]
+    assert re.search(
+        r"pointerEvents:\s*immersive\s*\?\s*'none'", outer_block), (
+        'JogControls outer div must declare '
+        "pointerEvents: immersive ? 'none' : undefined")
+    # Scaler opts back in.
+    scaler_idx = src.find('data-testid="jog-center-cluster-scaler"')
+    scaler_block = src[scaler_idx:scaler_idx + 800]
+    assert re.search(
+        r"pointerEvents:\s*immersive\s*\?\s*'auto'", scaler_block), (
+        'jog-center-cluster-scaler must declare '
+        "pointerEvents: immersive ? 'auto' : undefined so taps on "
+        'the pad grid land on the buttons')
+
+
+def test_element_from_point_grid_over_canvas_returns_canvas():
+    """jsdom-level elementFromPoint sweep: at a grid of viewport
+    points (y = 300, 500, 700, 850 at x = 25%, 50%, 75%), the
+    document.elementFromPoint result must be the canvas (or a
+    descendant of the canvas-fill wrapper) for every point that is
+    NOT inside a page-level control cluster.
+
+    jsdom doesn't fully implement CSS layout for elementFromPoint,
+    so we settle for a static-source assertion: the ONLY element
+    that spans the majority of viewport pixels (via absolute-
+    position on view3d-immersive-root) is view3d-canvas-fill with
+    inset:0 zIndex:0. Every other overlay must NOT declare inset:0
+    with a zIndex higher than the canvas.
+    """
+    src = _read(LAYOUT)
+    # view3d-canvas-fill MUST declare inset:0 + zIndex:0 (the
+    # baseline full-viewport layer).
+    canvas_idx = src.find('data-testid="view3d-canvas-fill"')
+    assert canvas_idx != -1
+    canvas_block = src[canvas_idx:canvas_idx + 800]
+    assert re.search(r"inset:\s*0", canvas_block), (
+        'view3d-canvas-fill must set inset:0 so the canvas fills '
+        'the full viewport as the baseline layer')
+    assert re.search(r"zIndex:\s*0", canvas_block), (
+        'view3d-canvas-fill must set zIndex:0 as the baseline layer')
+
+    # No other overlay may set inset:0 with a higher zIndex UNLESS
+    # its pointerEvents is 'none' (allowed for the canvas-dim wash).
+    for m in re.finditer(r"inset:\s*0", src):
+        window = src[max(0, m.start() - 400):m.end() + 600]
+        if 'view3d-canvas-fill' in window:
+            continue
+        # Any other inset:0 element must be pointer-events:none so
+        # elementFromPoint still returns the canvas beneath it.
+        assert re.search(r"pointerEvents:\s*'none'", window), (
+            'an inset:0 element inside view3d-immersive-root MUST be '
+            'pointerEvents:none — otherwise it steals every canvas '
+            'point from elementFromPoint (operator diagnosis: this '
+            'was the second-window culprit)')
