@@ -41,52 +41,67 @@ def _strip_line_comments(src):
 
 
 def test_expand_jog_button_is_green_and_relabeled():
-    """RealArmMinimizedPill is now green (#16A34A matches Monitor
-    Run) with the "Expand Jog Buttons" label. Prior red / "REAL
-    ARM · Jog" copy is retired."""
+    """2026-09-17 STYLE-PARITY UPDATE: RealArmMinimizedPill retired
+    entirely per operator directive ("collapsed and expanded button
+    look identical — same chip shape/size/color/position, only the
+    label changes"). The single collapse chip in the RIGHT column
+    now serves both roles: label + testid + onClick target flip on
+    isMinimized. The former distinct green pill is gone.
+    """
     src = _read(LAYOUT)
-    # Test hook present.
-    assert 'data-testid="expand-jog-buttons"' in src
-    # Locate the pill body and assert the load-bearing pieces.
-    idx = src.find('function RealArmMinimizedPill(')
-    assert idx != -1
-    body = src[idx:idx + 2500]
-    assert "background: '#16A34A'" in body, \
-        'expand-jog-buttons pill must use Monitor Run green #16A34A'
-    assert 'Expand Jog Buttons' in body, \
-        'pill copy must read "Expand Jog Buttons"'
-    assert "color: '#fff'" in body
-    # Old REAL_ARM_RED background retired from the pill; the
-    # RealArmChrome borderTop still uses it as an accent, so the
-    # constant stays defined.
-    assert 'REAL_ARM_RED' in src   # constant kept
-    assert "'REAL ARM · Jog'" not in body, \
-        'stale "REAL ARM · Jog" copy must be gone from the pill'
+    assert 'function RealArmMinimizedPill(' not in src, (
+        'RealArmMinimizedPill function must be retired')
+    assert '<RealArmMinimizedPill' not in src, (
+        'RealArmMinimizedPill must not be mounted anywhere')
+    # The expand-jog-buttons testid survives as a literal string in
+    # the style-parity ternary — pinned by
+    # test_expand_pill_testid_still_present (immersive suite).
+    assert "'expand-jog-buttons'" in src, (
+        "expand-jog-buttons testid literal must appear in the "
+        'style-parity ternary branch (chip alias when isMinimized)')
+    # Both labels present as strings.
+    assert 'Expand Jog Buttons' in src
+    assert 'Collapse Jog Buttons' in src
 
 
 def test_collapse_jog_button_is_coherent_pair():
     """The Collapse control reads "Collapse Jog Buttons" — coherent
-    pair with the "Expand Jog Buttons" pill.
+    pair with the "Expand Jog Buttons" label the SAME chip shows
+    when MINIMIZED.
 
-    2026-09-16 side-column directive relocated the button from the
-    RealArmChrome header into JogControls.collapseSlot (bottom of
-    the RIGHT column, adjacent to Orient Flange Down). It's now
-    composed inline in View3DLayout with the setView3dJogPanel
-    callback the layout already owns, so the setter identifier
-    changed from setMode to setView3dJogPanel.
+    2026-09-17 tablet-field-report UPDATE: the collapse chip and
+    the expand pill are now the SAME button — style parity per
+    operator directive. The chip's `data-testid` is a ternary
+    (isMinimized ? 'expand-jog-buttons' : 'collapse-jog-buttons')
+    and the onClick target is also a ternary
+    (isMinimized ? 'NORMAL' : 'MINIMIZED'). Both testids appear as
+    string literals in the layout src; the collapse-role assertion
+    is expressed by the presence of the label string + the
+    setView3dJogPanel('MINIMIZED') branch of the ternary.
     """
     src = _read(LAYOUT)
-    assert 'data-testid="collapse-jog-buttons"' in src
-    idx = src.find('data-testid="collapse-jog-buttons"')
-    slice_ = src[max(0, idx - 200):idx + 400]
-    assert 'Collapse Jog Buttons' in slice_
-    # Post-relocation the callback name is setView3dJogPanel; the
-    # previous setMode alias was scoped to the retired header
-    # branch of RealArmChrome.
-    assert "setView3dJogPanel('MINIMIZED')" in slice_, (
-        'collapse button must set view3dJogPanel to MINIMIZED, '
-        'mirroring the expand pill (relocated 2026-09-16 from the '
-        'chrome header to JogControls.collapseSlot)')
+    # Both testid literals appear in the ternary branches.
+    assert "'collapse-jog-buttons'" in src, (
+        "collapse-jog-buttons testid literal must appear in the "
+        "layout (branch of the style-parity ternary)")
+    assert "'expand-jog-buttons'" in src, (
+        "expand-jog-buttons testid literal must appear in the "
+        "layout (branch of the style-parity ternary)")
+    # Labels for both states.
+    assert 'Collapse Jog Buttons' in src
+    assert 'Expand Jog Buttons' in src
+    # Locate the setView3dJogPanel line that gates the collapse
+    # click and assert it targets MINIMIZED in the not-yet-
+    # minimized branch. Ternary form:
+    #   setView3dJogPanel(isMinimized ? 'NORMAL' : 'MINIMIZED')
+    m = re.search(
+        r"setView3dJogPanel\(\s*\n?\s*isMinimized\s*\?\s*'NORMAL'\s*:\s*'MINIMIZED'\s*\)",
+        src)
+    assert m is not None, (
+        'collapse chip must toggle setView3dJogPanel between '
+        "'NORMAL' and 'MINIMIZED' via a ternary keyed on "
+        'isMinimized — style-parity design (single chip, label '
+        'flip only)')
 
 
 def test_debug_strip_removed_from_arm_viewer():

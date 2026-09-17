@@ -95,57 +95,14 @@ const chromeBtn = {
   display: 'flex', alignItems: 'center', justifyContent: 'center',
 }
 
-// The docked minimized pill — GREEN button labeled "Expand Jog
-// Buttons" (matches the Monitor Run button's #16A34A green, per
-// 2026-09-08 operator directive). When the jog surface is open,
-// the chrome header's collapse control reads "Collapse Jog
-// Buttons" — the pair stays coherent.
-//
-// If a jog hold is live, the button surfaces the joint + direction
-// as a subtitle so a stray tab-switch operator sees the arm is
-// under load; button copy stays "Expand Jog Buttons" so activation
-// language is consistent.
-function RealArmMinimizedPill({ setMode }) {
-  const robot = useStore((s) => s.robot) || {}
-  const active = !!robot.jog_active
-  const holdLabel = active
-    ? `J${robot.jog_index} ${robot.jog_direction > 0 ? '+' : robot.jog_direction < 0 ? '−' : ''}`
-    : ''
-  return (
-    <button
-      data-testid="expand-jog-buttons"
-      onClick={() => setMode('NORMAL')}
-      title="Open the jog pad"
-      style={{
-        position: 'absolute',
-        bottom: 12, right: 12, zIndex: 15,
-        padding: '12px 22px',
-        background: '#16A34A', color: '#fff',
-        border: 'none', borderRadius: 10,
-        fontSize: 15, fontWeight: 700,
-        cursor: 'pointer',
-        boxShadow: '0 4px 12px rgba(22,163,74,0.35)',
-        display: 'flex', alignItems: 'center', gap: 10,
-        minHeight: 44,
-      }}
-    >
-      {active && (
-        <span style={{
-          width: 8, height: 8, borderRadius: '50%',
-          background: '#FEE2E2',
-          boxShadow: '0 0 6px #FCA5A5',
-        }} />
-      )}
-      <span>Expand Jog Buttons</span>
-      {holdLabel && (
-        <span style={{
-          fontSize: 11, opacity: 0.85, fontWeight: 600,
-          fontFamily: 'var(--font-mono, monospace)',
-        }}>{holdLabel}</span>
-      )}
-    </button>
-  )
-}
+// 2026-09-17 tablet-field-report — RealArmMinimizedPill RETIRED.
+// The pill was a distinct green-bg 12px-padded chip with different
+// shape/size/color from the in-panel Collapse control, breaking
+// the "style parity between collapse states" operator directive.
+// Replaced by the SINGLE collapse/expand chip inside JogControls
+// collapseSlot (bottom-right RIGHT column). Only the LABEL flips
+// on MINIMIZED. See test_collapsed_expanded_style_parity +
+// test_collapse_scope_leaves_left_and_right_mounted.
 
 export default function View3DLayout() {
   const armRef = useRef(null)
@@ -375,9 +332,14 @@ export default function View3DLayout() {
           none keeps orbit unaffected. */}
       <MinClearanceReadout />
 
-      {/* MINIMIZED — floating "Expand Jog Buttons" pill only; 3D
-          canvas fully unobstructed. */}
-      {isMinimized && <RealArmMinimizedPill setMode={setView3dJogPanel} />}
+      {/* 2026-09-17 tablet-field-report — MinimizedPill retired.
+          MINIMIZED now hides ONLY the CENTER pad cluster; the
+          LEFT column (DISABLE/READY + jog mode + step + speed),
+          the RIGHT column (Orient Flange Down + Collapse/expand
+          button), and every other control stay mounted. The
+          Collapse chip in the RIGHT column flips its label to
+          "Expand Jog Buttons" when MINIMIZED (style parity —
+          same chromeBtn tokens both states). */}
 
       {/* 2026-09-16 EXPAND MODE canvas dim — optional per operator
           directive: "In expand mode the 3D canvas may be hidden/
@@ -400,129 +362,146 @@ export default function View3DLayout() {
         />
       )}
 
-      {/* 2026-09-17 SINGLE-WINDOW RESTRUCTURE — page-level overlays.
-          Three siblings of the canvas share the 3D View root:
-            1. jog-left-column-slot  — LEFT column portal target
-            2. jog-right-column-slot — RIGHT column portal target
-            3. jog-pad-cluster-overlay — the CENTER pad cluster
-          MINIMIZED hides ONLY the pad-cluster overlay so the LEFT
-          column (DISABLE/READY + jog mode + step + speed) and the
-          RIGHT column (Orient + Collapse + fullscreen) stay visible
-          and reachable while the pads are collapsed. Every wrapper
-          uses pointerEvents:none so orbit/pan/zoom passes through
-          the empty regions between controls; interactive elements
-          (buttons, inputs) inside the JogControls re-enable auto. */}
-      {!isMinimized && (
-        <>
-          {/* LEFT column slot — page-level, moved UP under the view
-              presets (top:72 clears the top-left MinClearanceReadout
-              + preset row), thinned to 150 px per operator directive
-              (thin chips, distributed down). Contents portal in
-              from JogControls immersive mode. */}
-          <div
-            id="jog-left-column-slot"
-            data-testid="jog-left-column-slot"
-            style={{
-              position: 'absolute',
-              left: 16, top: 72, bottom: 16,
-              width: 150,
-              zIndex: 12,
-              pointerEvents: 'none',
-              display: 'flex',
-              boxSizing: 'border-box',
-            }}
-          />
-          {/* RIGHT column slot — page-level, mirrors the LEFT slot
-              vertically. Hosts Orient at top + Collapse/fullscreen
-              at bottom (space-between distribution inside
-              JogControls). */}
-          <div
-            id="jog-right-column-slot"
-            data-testid="jog-right-column-slot"
-            style={{
-              position: 'absolute',
-              right: 16, top: 72, bottom: 16,
-              width: 200,
-              zIndex: 12,
-              pointerEvents: 'none',
-              display: 'flex',
-              justifyContent: 'flex-end',
-              boxSizing: 'border-box',
-            }}
-          />
-        </>
-      )}
+      {/* 2026-09-17 COLLAPSE SCOPE FIX — page-level overlays are
+          ALWAYS MOUNTED. The prior `!isMinimized &&` gate around
+          the LEFT + RIGHT slots + the pad-cluster overlay was the
+          collapse-scope regression: it unmounted the JogControls
+          tree entirely on MINIMIZED, which killed the portal
+          targets for the LEFT column (ENABLE/DISABLE + jog mode +
+          step + speed) and the RIGHT column (Orient Flange Down
+          + Collapse button). The operator's directive is that
+          Collapse hides ONLY the CENTER pad cluster; everything
+          else stays reachable.
 
-      {/* PAD CLUSTER overlay — content-sized floating anchor for
-          the CENTER pads (Position, Height, Rotation + XY/Rot
-          chips). This is the ONLY thing Collapse toggles: MINIMIZED
-          drops just this overlay. LEFT + RIGHT columns stay
-          mounted so the operator can still Enable / mode-switch /
-          re-expand without hunting. Wrapper pointer-events:none;
-          the scaler inside JogControls (which wraps the actual pad
-          grid) re-enables auto so taps land on buttons and orbit
-          passes through everywhere else. */}
-      {!isMinimized && (
+          The fix routes MINIMIZED through JogControls' new
+          `hidePads` prop, which nulls the CENTER container
+          without touching the LEFT/RIGHT portal render — so the
+          slot divs and their portaled content stay in the DOM. */}
+      <>
+        {/* LEFT column slot — page-level, moved UP under the view
+            presets (top:72 clears the top-left MinClearanceReadout
+            + preset row), thinned to 150 px per operator directive
+            (thin chips, distributed down). Contents portal in
+            from JogControls immersive mode. */}
         <div
-          ref={panelRef}
-          data-testid="jog-pad-cluster-overlay"
+          id="jog-left-column-slot"
+          data-testid="jog-left-column-slot"
           style={{
             position: 'absolute',
-            // Bottom-center, content-sized. left:50% + translate
-            // centers a variable-width cluster (Cartesian +
-            // Rotation is wider than Joint tiles).
-            left: '50%',
-            bottom: 16,
-            transform: 'translateX(-50%)',
-            zIndex: 11,
+            left: 16, top: 72, bottom: 16,
+            width: 150,
+            zIndex: 12,
             pointerEvents: 'none',
             display: 'flex',
             boxSizing: 'border-box',
-          }}>
-          <JogControls
-            maximized={isExpanded}
-            // 2026-09-16 SIDE-COLUMN OWNERSHIP + EXPAND MODE:
-            //   * `immersive` portals the LEFT + RIGHT columns
-            //     into the page-level slot divs above; this
-            //     pad-cluster overlay hosts only the CENTER pads.
-            //   * `expanded` scales the CENTER cluster 1.6× via
-            //     CSS transform (arrangement unchanged).
-            immersive
-            expanded={isExpanded}
-            leftTopSlot={
-              <>
-                <ArmEnableControl />
-                <JogReadyBadge />
-              </>
-            }
-            rightSlot={jogApi
-              ? <OrientFlangeDownControl jogApi={jogApi} />
-              : null}
-            collapseSlot={
-              <>
-                <button
-                  data-testid="collapse-jog-buttons"
-                  onClick={() => setView3dJogPanel('MINIMIZED')}
-                  title="Collapse Jog Buttons"
-                  style={{
-                    ...chromeBtn,
-                    width: 'auto', padding: '0 12px',
-                    fontSize: 11, fontWeight: 600,
-                    letterSpacing: '0.02em',
-                    pointerEvents: 'auto',
-                  }}>Collapse Jog Buttons</button>
-                <button
-                  onClick={() => setView3dJogPanel(
-                    isExpanded ? 'NORMAL' : 'EXPANDED')}
-                  title={isExpanded ? 'Restore split layout' : 'Expand panel'}
-                  style={{ ...chromeBtn, pointerEvents: 'auto' }}>
-                  {isExpanded ? '✕' : '⛶'}
-                </button>
-              </>
-            }
-          />
-        </div>
-      )}
+          }}
+        />
+        {/* RIGHT column slot — page-level, mirrors the LEFT slot
+            vertically. Hosts Orient at top + Collapse/fullscreen
+            at bottom (space-between distribution inside
+            JogControls). */}
+        <div
+          id="jog-right-column-slot"
+          data-testid="jog-right-column-slot"
+          style={{
+            position: 'absolute',
+            right: 16, top: 72, bottom: 16,
+            width: 200,
+            zIndex: 12,
+            pointerEvents: 'none',
+            display: 'flex',
+            justifyContent: 'flex-end',
+            boxSizing: 'border-box',
+          }}
+        />
+      </>
+
+      {/* PAD CLUSTER overlay — content-sized floating anchor.
+          ALWAYS MOUNTED so JogControls (which owns the LEFT +
+          RIGHT portals) stays in the tree. When MINIMIZED,
+          `hidePads` tells JogControls to render null for the
+          CENTER container — the overlay collapses to a 0-size
+          box and the LEFT + RIGHT slots stay populated. */}
+      <div
+        ref={panelRef}
+        data-testid="jog-pad-cluster-overlay"
+        style={{
+          position: 'absolute',
+          // Bottom-center, content-sized. left:50% + translate
+          // centers a variable-width cluster (Cartesian +
+          // Rotation is wider than Joint tiles).
+          left: '50%',
+          bottom: 16,
+          transform: 'translateX(-50%)',
+          zIndex: 11,
+          pointerEvents: 'none',
+          display: 'flex',
+          boxSizing: 'border-box',
+        }}>
+        <JogControls
+          maximized={isExpanded}
+          // 2026-09-16 SIDE-COLUMN OWNERSHIP + EXPAND MODE:
+          //   * `immersive` portals the LEFT + RIGHT columns
+          //     into the page-level slot divs above; this
+          //     pad-cluster overlay hosts only the CENTER pads.
+          //   * `expanded` scales the CENTER cluster 1.6× via
+          //     CSS transform (arrangement unchanged).
+          //   * `hidePads` (2026-09-17) nulls the CENTER
+          //     container so MINIMIZED collapses ONLY the pad
+          //     cluster while LEFT/RIGHT stay mounted.
+          immersive
+          expanded={isExpanded}
+          hidePads={isMinimized}
+          leftTopSlot={
+            <>
+              <ArmEnableControl />
+              <JogReadyBadge />
+            </>
+          }
+          rightSlot={jogApi
+            ? <OrientFlangeDownControl jogApi={jogApi} />
+            : null}
+          collapseSlot={
+            <>
+              {/* 2026-09-17 style-parity operator directive: the
+                  Collapse/Expand chip uses the SAME chromeBtn
+                  token set in BOTH states — only the label +
+                  onClick target flip. Testid `collapse-jog-buttons`
+                  is preserved (label change is not a rename). */}
+              <button
+                // 2026-09-17 dual testid: this ONE chip serves
+                // BOTH collapse (when expanded/normal) and expand
+                // (when minimized) roles. `collapse-jog-buttons`
+                // + `expand-jog-buttons` testids are preserved so
+                // existing pins (test_collapse_jog_button_is_
+                // coherent_pair, test_expand_pill_testid_still_
+                // present) keep working through the label flip.
+                data-testid={isMinimized ? 'expand-jog-buttons' : 'collapse-jog-buttons'}
+                data-collapse-role={isMinimized ? 'expand' : 'collapse'}
+                onClick={() => setView3dJogPanel(
+                  isMinimized ? 'NORMAL' : 'MINIMIZED')}
+                title={isMinimized ? 'Expand Jog Buttons' : 'Collapse Jog Buttons'}
+                style={{
+                  ...chromeBtn,
+                  width: 'auto', padding: '0 12px',
+                  fontSize: 11, fontWeight: 600,
+                  letterSpacing: '0.02em',
+                  pointerEvents: 'auto',
+                }}>
+                {isMinimized ? 'Expand Jog Buttons' : 'Collapse Jog Buttons'}
+              </button>
+              <button
+                data-testid="expand-jog-buttons-fullscreen"
+                onClick={() => setView3dJogPanel(
+                  isExpanded ? 'NORMAL' : 'EXPANDED')}
+                title={isExpanded ? 'Restore split layout' : 'Expand panel'}
+                style={{ ...chromeBtn, pointerEvents: 'auto' }}>
+                {isExpanded ? '✕' : '⛶'}
+              </button>
+            </>
+          }
+        />
+      </div>
     </div>
   )
 }

@@ -252,35 +252,35 @@ def test_overlay_zindex_is_scoped_below_topbar_stacking():
 # ─────────────────────────────────────────────────────────────────
 
 def test_minimized_collapses_to_expand_pill_only():
-    """2026-09-17 SINGLE-WINDOW UPDATE: MINIMIZED renders the
-    RealArmMinimizedPill (Expand Jog Buttons) and hides the
-    jog-pad-cluster-overlay. The LEFT + RIGHT slot divs also hide
-    under MINIMIZED (no JogControls to portal into) so the 3D view
-    is fully unobstructed except for the tiny Expand pill.
+    """2026-09-17 COLLAPSE-SCOPE UPDATE: MINIMIZED no longer
+    unmounts the LEFT/RIGHT slots or the pad-cluster overlay.
+    Only the CENTER pads render null (via JogControls hidePads
+    prop). The Collapse chip in the RIGHT column flips its label
+    to "Expand Jog Buttons" — style parity per operator directive.
+    RealArmMinimizedPill retired entirely (single-chip design).
     """
     src = _read(LAYOUT)
-    # MINIMIZED gate for the pill.
-    assert re.search(
-        r'\{isMinimized\s*&&\s*<RealArmMinimizedPill',
-        src), (
-        'MINIMIZED must render RealArmMinimizedPill')
-    # The pad-cluster overlay must be gated on !isMinimized.
-    pad_idx = src.find('data-testid="jog-pad-cluster-overlay"')
-    assert pad_idx != -1
-    prefix = src[max(0, pad_idx - 400):pad_idx]
-    assert re.search(r'\{!isMinimized\s*&&', prefix), (
-        'jog-pad-cluster-overlay must be gated on !isMinimized so '
-        'collapse fully clears the pad cluster')
+    assert 'function RealArmMinimizedPill(' not in src, (
+        'RealArmMinimizedPill retired — the collapse chip in the '
+        'RIGHT column serves both roles now (style parity)')
+    assert '<RealArmMinimizedPill' not in src, (
+        'no residual RealArmMinimizedPill mount in the layout')
+    assert 'hidePads={isMinimized}' in src, (
+        'JogControls must receive hidePads={isMinimized} — this is '
+        'how MINIMIZED collapses the pad cluster ONLY, without '
+        'unmounting the LEFT/RIGHT portal slots')
 
 
 def test_expand_pill_testid_still_present():
-    """The pill's testid pin (expand-jog-buttons) MUST survive the
-    immersive refactor — existing polish pin in test_view3d_polish
-    also asserts this, but pinning here catches a regression in
-    isolation if that file is rearranged.
+    """The expand-jog-buttons testid MUST survive the collapse-
+    scope refactor. It now lives on the label-flipping chip
+    (data-testid ternary branch when isMinimized). Both testid
+    literals appear as string constants in the layout source.
     """
     src = _read(LAYOUT)
-    assert 'data-testid="expand-jog-buttons"' in src
+    assert "'expand-jog-buttons'" in src, (
+        'expand-jog-buttons testid literal must appear in the '
+        'style-parity ternary (collapse chip alias when isMinimized)')
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -980,11 +980,12 @@ def test_side_column_layout_spread_and_collapse_relocation():
         r"collapseSlot=\{", layout), (
         'View3DLayout must pass a collapseSlot to JogControls '
         '(containing Collapse + fullscreen buttons)')
-    # The Collapse button testid is still present (relocation, not
-    # deletion) so downstream pins on the testid keep working.
-    assert 'data-testid="collapse-jog-buttons"' in layout, (
-        'collapse-jog-buttons testid must survive the header→'
-        'collapseSlot relocation')
+    # The Collapse button testid is still present (2026-09-17 UPDATE:
+    # now inside the style-parity ternary — appears as a single-
+    # quoted string literal, not a double-quoted attribute value).
+    assert "'collapse-jog-buttons'" in layout, (
+        'collapse-jog-buttons testid literal must appear in the '
+        'style-parity ternary (chip label + testid flip on isMinimized)')
 
     # (e) 2026-09-17 SINGLE-WINDOW UPDATE: chrome header retired
     # (RealArmChrome entirely deleted). The Collapse + fullscreen
@@ -1273,12 +1274,17 @@ def test_page_level_slot_dims_track_panel_height():
             f'{side} slot must NOT reference panelHeight — the '
             f'viewport-aware panel height was retired with RealArmChrome')
 
-    # Slots gated on !isMinimized.
+    # 2026-09-17 COLLAPSE-SCOPE UPDATE: slots are ALWAYS MOUNTED
+    # (no isMinimized gate) so LEFT (ENABLE/DISABLE + jog mode +
+    # step + speed) and RIGHT (Orient + Collapse) stay reachable
+    # while the pad cluster is collapsed. JogControls itself stays
+    # mounted too; MINIMIZED nulls only the CENTER via hidePads.
     left_idx = layout.find('id="jog-left-column-slot"')
-    prefix = layout[max(0, left_idx - 400):left_idx]
-    assert re.search(r'\{!isMinimized\s*&&', prefix), (
-        'slot divs MUST be gated on !isMinimized so they only exist '
-        'while the JogControls tree is mounted')
+    prefix = layout[max(0, left_idx - 600):left_idx]
+    assert not re.search(r'\{!isMinimized\s*&&\s*\(?\s*<>', prefix), (
+        'slot divs must NOT be gated on !isMinimized (2026-09-17 '
+        'collapse-scope fix — they stay mounted so operators can '
+        'still Enable and re-expand while collapsed)')
 
 
 def test_jog_heading_and_captions_retired_from_left_column():
@@ -1624,6 +1630,203 @@ def test_slot_insets_widen_to_prevent_left_edge_clip():
         assert min_width <= w <= 240, (
             f'{side} slot width {w} out of range [{min_width}, 240] '
             f'per 2026-09-17 thin-chips directive')
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2026-09-17 tablet-field-report — collapse-scope + style-parity +
+# viewport-fit pins
+# ─────────────────────────────────────────────────────────────────
+
+
+def test_collapse_scope_leaves_left_and_right_mounted():
+    """Operator directive: pressing Collapse must hide ONLY the
+    CENTER pad clusters. The LEFT column (DISABLE/READY + jog mode
+    + step + speed) and the RIGHT column (Orient + Collapse chip
+    + fullscreen) MUST remain visible and interactive when MINIMIZED.
+
+    Structural pin:
+      * jog-left-column-slot renders unconditionally (no isMinimized
+        gate) — LEFT column portal target survives collapse.
+      * jog-right-column-slot renders unconditionally — same.
+      * jog-pad-cluster-overlay renders unconditionally — the
+        JogControls tree stays mounted so its LEFT/RIGHT portals
+        keep their content; only the CENTER container renders null
+        when hidePads is true.
+      * JogControls receives hidePads={isMinimized} — the ONE seam
+        that couples collapse state to the pad cluster.
+      * JogControls signature accepts hidePads=false default.
+    """
+    layout = _read(LAYOUT)
+    jog    = _read(JOG)
+
+    # Slots + pad-cluster overlay unconditional.
+    for testid in ('jog-left-column-slot',
+                   'jog-right-column-slot',
+                   'jog-pad-cluster-overlay'):
+        idx = layout.find(f'data-testid="{testid}"')
+        assert idx != -1, f'{testid} testid missing'
+        prefix = layout[max(0, idx - 800):idx]
+        # No `{!isMinimized &&` gate immediately before the div.
+        # (There may be other isMinimized references further up
+        # for dim overlay etc — we scope the check to the last 400
+        # chars before the testid.)
+        near = layout[max(0, idx - 400):idx]
+        assert not re.search(r'\{\s*!\s*isMinimized\s*&&\s*\(?\s*<(?:>|div)', near), (
+            f'{testid} MUST NOT be gated on !isMinimized — the '
+            f'2026-09-17 collapse-scope fix keeps it mounted so the '
+            f'LEFT/RIGHT columns remain reachable while collapsed')
+
+    # JogControls receives hidePads={isMinimized}.
+    assert 'hidePads={isMinimized}' in layout, (
+        'View3DLayout MUST pass hidePads={isMinimized} to JogControls — '
+        'the ONLY authorized seam that couples MINIMIZED state to '
+        'the pad cluster (LEFT/RIGHT stay unaffected)')
+
+    # JogControls signature accepts hidePads.
+    assert 'hidePads = false' in jog, (
+        'JogControls must declare hidePads=false — collapse-scope '
+        'prop that nulls the CENTER container without unmounting '
+        'the component')
+
+    # CENTER container gated on !hidePads.
+    center_idx = jog.find('data-testid="jog-center-pads"')
+    center_prefix = jog[max(0, center_idx - 400):center_idx]
+    assert re.search(r'\{\s*!\s*hidePads\s*&&', center_prefix), (
+        'jog-center-pads container must be gated on !hidePads so '
+        'MINIMIZED renders null for the CENTER while LEFT + RIGHT '
+        'portals stay populated')
+
+
+def test_collapsed_expanded_style_parity():
+    """Operator directive: the collapse chip and the "expand"
+    variant look identical — same shape/size/color/position, only
+    the label/testid/onClick target flip. RealArmMinimizedPill
+    (the retired distinct green chip) is gone.
+
+    Implementation contract:
+      * ONE <button> element carries BOTH data-testid variants via
+        a ternary keyed on isMinimized:
+          data-testid={isMinimized ? 'expand-jog-buttons'
+                                    : 'collapse-jog-buttons'}
+      * The button uses `...chromeBtn` (shared style token set) in
+        BOTH states — no per-state background/color overrides.
+      * onClick uses a ternary target too:
+          setView3dJogPanel(isMinimized ? 'NORMAL' : 'MINIMIZED')
+      * Labels flip: 'Expand Jog Buttons' vs 'Collapse Jog Buttons'.
+    """
+    src = _read(LAYOUT)
+    # Retired chip must be gone (belt-and-braces with the polish pin).
+    assert 'function RealArmMinimizedPill(' not in src
+
+    # Dual testid ternary present.
+    assert re.search(
+        r"data-testid=\{\s*isMinimized\s*\?\s*'expand-jog-buttons'\s*:\s*'collapse-jog-buttons'\s*\}",
+        src), (
+        'collapse chip data-testid must be a ternary '
+        "(isMinimized ? 'expand-jog-buttons' : 'collapse-jog-buttons') "
+        'so both testids resolve on the SAME element (style parity)')
+
+    # onClick ternary target.
+    assert re.search(
+        r"setView3dJogPanel\(\s*\n?\s*isMinimized\s*\?\s*'NORMAL'\s*:\s*'MINIMIZED'\s*\)",
+        src), (
+        "onClick must be setView3dJogPanel(isMinimized ? 'NORMAL' : 'MINIMIZED') "
+        '— single chip toggles collapse state both ways')
+
+    # Both labels appear as string literals.
+    assert 'Expand Jog Buttons' in src
+    assert 'Collapse Jog Buttons' in src
+
+    # Style uses shared chromeBtn token — no per-state background.
+    chip_idx = src.find("data-testid={isMinimized ? 'expand-jog-buttons'")
+    assert chip_idx != -1
+    # Take a window covering the style prop.
+    chip_block = src[chip_idx:chip_idx + 800]
+    assert re.search(r'style=\{\{\s*\n\s*\.\.\.chromeBtn', chip_block), (
+        'collapse chip style must spread ...chromeBtn as the base '
+        'token set (style parity — same token in both states)')
+    # No conditional background/color/border/borderRadius keys keyed on isMinimized.
+    for banned in (r"background:\s*isMinimized",
+                   r"color:\s*isMinimized",
+                   r"border:\s*isMinimized",
+                   r"borderRadius:\s*isMinimized"):
+        assert not re.search(banned, chip_block), (
+            f'collapse chip style must NOT vary `{banned}` on '
+            f'isMinimized — style parity per operator directive')
+
+
+def test_pad_cluster_fits_viewport_at_tablet_widths():
+    """The pad cluster (Position + Height + Rotation) must fit
+    inside the CENTER available width (viewport − LEFT slot 150 −
+    RIGHT slot 200 − 32 insets) at every supported width. The Rz+
+    button on the Rotation cluster's right edge is the operator-
+    reported clip witness at portrait tablet (768w).
+
+    Compute CENTER available width at each breakpoint and assert
+    the pad-cluster width (7*padBtn + 4*padInner + 2*padGroup) fits.
+    """
+    jog = _read(JOG)
+
+    # Extract the padBtn tier declaration for non-maximized (NORMAL
+    # mode — collapse chip active, no EXPAND scale).
+    padbtn_line = re.search(
+        r"const padBtn = maximized[\s\S]{0,400}?:\s*\(([^)]+)\)",
+        jog)
+    assert padbtn_line is not None, 'padBtn tier declaration not found'
+    non_maximized_tiers = padbtn_line.group(1)
+
+    # Same for padInner + padGroup.
+    padinner_line = re.search(
+        r"const padInner = maximized[\s\S]{0,400}?:\s*\(([^)]+)\)",
+        jog)
+    padgroup_line = re.search(
+        r"const padGroup = maximized[\s\S]{0,400}?:\s*\(([^)]+)\)",
+        jog)
+    assert padinner_line and padgroup_line
+
+    def tier_at(tiers, breakpoint):
+        """breakpoint ∈ {'portrait', 'tablet', 'narrow', 'desktop'}."""
+        # Ternary chain: isTabletPortrait ? P : isTabletW ? T : isNarrowW ? N : D
+        m = re.match(
+            r"\s*isTabletPortrait\s*\?\s*(\d+)\s*:\s*"
+            r"isTabletW\s*\?\s*(\d+)\s*:\s*"
+            r"isNarrowW\s*\?\s*(\d+)\s*:\s*(\d+)",
+            tiers)
+        assert m is not None, f'tier chain shape mismatch: {tiers!r}'
+        idx = {'portrait': 1, 'tablet': 2, 'narrow': 3, 'desktop': 4}[breakpoint]
+        return int(m.group(idx))
+
+    # Available CENTER width at each viewport.
+    # 32 = 16 LEFT inset + 16 RIGHT inset. 150/200 = slot widths.
+    available = {
+        768:  768  - 32 - 150 - 200,   # 386  (portrait tablet)
+        1024: 1024 - 32 - 150 - 200,   # 642  (landscape tablet)
+        1280: 1280 - 32 - 150 - 200,   # 898  (desktop)
+    }
+    # Map viewport → breakpoint tier.
+    tier_for = {
+        768:  'portrait',   # winW ≤ 900
+        1024: 'tablet',     # winW ≤ 1280 & > 900
+        1280: 'tablet',     # winW ≤ 1280
+    }
+
+    for width_px, breakpoint in tier_for.items():
+        padBtn   = tier_at(non_maximized_tiers, breakpoint)
+        padInner = tier_at(padinner_line.group(1), breakpoint)
+        padGroup = tier_at(padgroup_line.group(1), breakpoint)
+        # Position cluster: 3×padBtn + 2×padInner (grid gaps)
+        pos_w = 3 * padBtn + 2 * padInner
+        # Height cluster: padBtn (single column)
+        h_w = padBtn
+        # Rotation cluster: same as Position
+        rot_w = pos_w
+        total = pos_w + padGroup + h_w + padGroup + rot_w
+        assert total <= available[width_px], (
+            f'pad cluster width {total}px > available {available[width_px]}px '
+            f'at viewport {width_px}w (breakpoint={breakpoint}, '
+            f'padBtn={padBtn}, padInner={padInner}, padGroup={padGroup}) — '
+            f'Rz+ button will clip off-screen (operator field report '
+            f'2026-09-17)')
 
 
 # ─────────────────────────────────────────────────────────────────

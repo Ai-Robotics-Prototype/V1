@@ -541,8 +541,23 @@ export default function JogControls({
   // heading beneath it). Program-tab consumer passes null → the
   // top slot slot renders nothing and the middle groups float up.
   leftTopSlot = null,
+  // 2026-09-17 collapse-scope operator directive: `hidePads=true`
+  // nulls the CENTER container (jog-center-pads + scaler + inner
+  // pad grid) WITHOUT unmounting JogControls itself. LEFT + RIGHT
+  // portals stay populated so the collapse chip and Orient stay
+  // reachable. Program-tab consumer (immersive=false) passes no
+  // prop and gets the legacy fill layout.
+  hidePads = false,
 }) {
   const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
+  // 2026-09-17 tablet-portrait breakpoint — the previous isTabletW
+  // (winW ≤ 1280) was tuned for landscape tablets and overflowed
+  // the Rotation cluster's Rz+ button off-screen at portrait 768.
+  // The new isTabletPortrait breakpoint uses smaller pad tokens
+  // so the (Position + Height + Rotation) cluster fits inside
+  // the CENTER available width (viewport - LEFT slot 150 - RIGHT
+  // slot 200 - 32 insets = 386 at 768w).
+  const isTabletPortrait = winW <= 900
   const isTabletW = winW <= 1280
   const isNarrowW = winW <= 1500
 
@@ -812,9 +827,14 @@ export default function JogControls({
   const jogGateOk = bannerLevel === 'ready'
 
   // Sizing tiers (unchanged from the Program-tab original).
+  // 2026-09-17 tablet-portrait sizing: at winW≤900 use ~48px pads so
+  // Position(3×48+2×4=152) + gap12 + Height(48) + gap12 + Rotation(152)
+  // = 376 fits inside the 386 available CENTER width at 768w portrait
+  // (viewport - LEFT150 - RIGHT200 - insets32 = 386). Landscape tablet
+  // and desktop tiers unchanged.
   const padBtn = maximized
-    ? (isTabletW ? 84 : isNarrowW ? 108 : 140)
-    : (isTabletW ? 72 : isNarrowW ? 84  : 96)
+    ? (isTabletPortrait ? 64 : isTabletW ? 84 : isNarrowW ? 108 : 140)
+    : (isTabletPortrait ? 48 : isTabletW ? 72 : isNarrowW ?  84 : 96)
   const zBtnWidth  = padBtn
   const jointBtnW  = padBtn
   const jointBtnH  = padBtn
@@ -829,10 +849,10 @@ export default function JogControls({
   // (between clusters); jointColGap follows the same scale for XYZ /
   // Joint parity. Container is overflowX:'hidden' + the pad row uses
   // flexWrap so nothing scrolls horizontally at any breakpoint.
-  const padInner = maximized ? (isTabletW ? 12 : isNarrowW ? 16 : 20)
-                             : (isTabletW ?  8 : isNarrowW ? 12 : 14)
-  const padGroup = maximized ? (isTabletW ? 24 : isNarrowW ? 36 : 60)
-                             : (isTabletW ? 20 : isNarrowW ? 30 : 44)
+  const padInner = maximized ? (isTabletPortrait ? 8  : isTabletW ? 12 : isNarrowW ? 16 : 20)
+                             : (isTabletPortrait ? 4  : isTabletW ?  8 : isNarrowW ? 12 : 14)
+  const padGroup = maximized ? (isTabletPortrait ? 16 : isTabletW ? 24 : isNarrowW ? 36 : 60)
+                             : (isTabletPortrait ? 12 : isTabletW ? 20 : isNarrowW ? 30 : 44)
   const jointColGap = maximized ? (isTabletW ? 20 : isNarrowW ? 28 : 40)
                                 : (isTabletW ? 14 : isNarrowW ? 20 : 28)
   const jointLblFont = maximized ? (isTabletW ? 12 : isNarrowW ? 14 : 16)
@@ -1271,7 +1291,14 @@ export default function JogControls({
           Framing (View3DLayout) targets the scaler element directly
           so surfaceTop reflects the ACTUAL pad-top position (lower
           now → larger arm region above), not the empty container
-          top. */}
+          top.
+
+          2026-09-17 collapse-scope UPDATE: when hidePads=true the
+          CENTER container renders null so MINIMIZED collapses ONLY
+          the pad cluster. LEFT + RIGHT portals stay populated —
+          the operator can still Enable / mode-switch / expand from
+          the collapsed state. */}
+      {!hidePads && (
       <div
         data-testid="jog-center-pads"
         style={{
@@ -1428,6 +1455,7 @@ export default function JogControls({
         )}
         </div>
       </div>
+      )}
 
       {/* RIGHT — auxiliary control slot. 2026-09-08 retired the
           program-execution column; 2026-09-14 reintroduced this
