@@ -569,13 +569,27 @@ export default function View3DLayout() {
           boxSizing: 'border-box',
         }}>
         <JogControls
-          maximized={isExpanded}
+          // 2026-09-17 expand-rollback COMPLETION: `maximized`
+          // was `{isExpanded}`. That was the SECOND expand-scale
+          // vector — maximized=true triggers larger padBtn /
+          // padGroup / font tokens inside JogControls (natural
+          // cluster size grows by ~1.4-1.7× on desktop expand),
+          // which is what the operator's persistent sliver
+          // screenshot was showing: the fitScale saturates at
+          // MIN_FIT_SCALE and the enlarged natural still overflows
+          // the overflow:hidden ancestor. Force `false` so expand
+          // truly leaves the pad-cluster geometry untouched. The
+          // Program-tab consumer (which passes no `maximized`)
+          // gets the same non-maximized layout.
+          maximized={false}
           // 2026-09-16 SIDE-COLUMN OWNERSHIP + EXPAND MODE:
           //   * `immersive` portals the LEFT + RIGHT columns
           //     into the page-level slot divs above; this
           //     pad-cluster overlay hosts only the CENTER pads.
-          //   * `expanded` scales the CENTER cluster 1.6× via
-          //     CSS transform (arrangement unchanged).
+          //   * `expanded` (retained for canvas-dim / label
+          //     coherence; JogControls only uses it for the
+          //     Program-tab paddingBottom which is inert in
+          //     immersive).
           //   * `hidePads` (2026-09-17) nulls the CENTER
           //     container so MINIMIZED collapses ONLY the pad
           //     cluster while LEFT/RIGHT stay mounted.

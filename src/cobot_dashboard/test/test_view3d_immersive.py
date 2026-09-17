@@ -1143,7 +1143,7 @@ def test_side_columns_portal_out_to_page_level():
     # window around the <JogControls open tag and assert.
     jc_idx = layout.find('<JogControls')
     assert jc_idx != -1
-    jc_block = layout[jc_idx:jc_idx + 800]
+    jc_block = layout[jc_idx:jc_idx + 2400]
     assert re.search(r'\bimmersive\b', jc_block), (
         'View3DLayout must pass the `immersive` prop to <JogControls> '
         'to activate the page-level portal (default false = inline '
@@ -1207,7 +1207,7 @@ def test_expand_scales_only_center_cluster():
 
     # View3DLayout wires the prop from its isExpanded state.
     jc_idx = layout.find('<JogControls')
-    jc_block = layout[jc_idx:jc_idx + 800]
+    jc_block = layout[jc_idx:jc_idx + 2400]
     assert re.search(r'expanded=\{isExpanded\}', jc_block), (
         'View3DLayout must pass expanded={isExpanded} so the CENTER '
         'scaler tracks the panel mode toggle')
@@ -1400,7 +1400,7 @@ def test_disable_ready_row_moved_from_header_to_left_top_slot():
 
     # View3DLayout passes leftTopSlot with ArmEnableControl + Badge.
     jc_idx = layout.find('<JogControls')
-    jc_block = layout[jc_idx:jc_idx + 1200]
+    jc_block = layout[jc_idx:jc_idx + 2400]
     assert 'leftTopSlot={' in jc_block, (
         'View3DLayout must pass leftTopSlot to JogControls '
         '(containing ArmEnableControl + JogReadyBadge)')
