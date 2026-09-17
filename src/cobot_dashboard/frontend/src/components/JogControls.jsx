@@ -1357,7 +1357,13 @@ export default function JogControls({
             pointerEvents: immersive ? 'auto' : undefined,
           }}>
         {jogMode === 'cartesian' ? (
-          <div style={{ display: 'flex', gap: padGroup, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
+          // 2026-09-17 root-cause fix: immersive mode drops
+          // flexWrap so the true natural width is exposed to the
+          // fit-scale measurement. Wrapping would silently reflow
+          // on a capped parent and hide a real overflow — masking
+          // regressions. Program-tab consumer keeps wrap for its
+          // own layout constraints.
+          <div style={{ display: 'flex', gap: padGroup, alignItems: 'center', flexWrap: immersive ? 'nowrap' : 'wrap', justifyContent: 'center' }}>
             <div>
               {padLabel('Position')}
               <div style={{

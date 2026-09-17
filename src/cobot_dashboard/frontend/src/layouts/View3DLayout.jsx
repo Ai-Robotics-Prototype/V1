@@ -150,14 +150,16 @@ export default function View3DLayout() {
   //   scale = max(MIN_FIT_SCALE,
   //               min(cap, availW/naturalW, availH/naturalH))
   //
-  // Cap is 1 in BOTH modes as of 2026-09-17 expand-rollback: the
-  // prior EXPAND_MAX=1.6 attempt clipped in the desktop screenshot
-  // (X-, Y+, Rz+ rendered as slivers) because scale>1 pushes the
-  // visual past the overlay's LAYOUT box, and the ancestor tree
-  // (view3d-immersive-root at overflow:hidden; jog-surface-row at
-  // overflowX:hidden) clips the overflow. Operator directive: roll
-  // BACK the scale, do NOT patch the wrapper. So cap = 1 always;
-  // expand toggle now only controls canvas-dim + collapse label.
+  // Cap is 1 in normal, EXPAND_MAX (1.6) in expand. The 2026-09-17
+  // expand-rollback attempt (cap=1 both modes) was neutered because
+  // the pad-cluster overlay had NO explicit width — CSS shrink-to-
+  // fit capped its layout box at HALF the viewport, and scale>1
+  // spilled past that capped box, so ancestor overflow:hidden
+  // clipped. With the overlay now sized via `width:'max-content'`
+  // (root-cause fix at jog-pad-cluster-overlay style), the layout
+  // box equals true content width, translateX(-50%) centers
+  // correctly, and Math.min(cap, sLeft, sRight, sHeight) bounds
+  // expand within measured space — expand-scale is safe.
   //
   // Asymmetric width: the overlay is centered on viewport-center
   // (left:50% translateX(-50%)), so the natural cluster centers on
@@ -168,7 +170,7 @@ export default function View3DLayout() {
   //   sWidth    = min(2·halfLeft/naturalW, 2·halfRight/naturalW)
   // Height: naturalH bounded by (viewport − top headroom − bottom margin):
   //   sHeight   = availableH / naturalH
-  const CAP = 1   // 2026-09-17 expand-rollback: EXPAND_MAX (1.6) retired
+  const EXPAND_MAX = 1.6
   const [fitScale, setFitScale] = useState(1)
   const [dbg, setDbg] = useState(null)   // debug chip payload
   const debugCluster = (typeof window !== 'undefined'
@@ -200,10 +202,12 @@ export default function View3DLayout() {
       const sLeft  = (halfLeft  * 2) / naturalW
       const sRight = (halfRight * 2) / naturalW
       const sHeight = availableH / naturalH
-      // 2026-09-17 expand-rollback: cap is 1 in both modes. isExpanded
-      // no longer affects the pad-cluster scale — only the canvas dim
-      // wash + the Collapse chip label swap.
-      const cap = CAP
+      // 2026-09-17 root-cause-fix restore: cap = 1 in normal,
+      // EXPAND_MAX (1.6) in expand. With the overlay's width now
+      // 'max-content' the fit-scale formula measures the TRUE
+      // natural cluster width, so Math.min(cap, sLeft, sRight,
+      // sHeight) bounds expand safely — no more visual spill.
+      const cap = isExpanded ? EXPAND_MAX : 1
       const next = Math.max(MIN_FIT_SCALE,
         Math.min(cap, sLeft, sRight, sHeight))
       setFitScale((prev) => (Math.abs(prev - next) > 0.005 ? next : prev))
@@ -245,7 +249,7 @@ export default function View3DLayout() {
       window.removeEventListener('resize', schedule)
       window.removeEventListener('orientationchange', schedule)
     }
-  }, [debugCluster])   // 2026-09-17 expand-rollback: cap no longer depends on isExpanded
+  }, [debugCluster, isExpanded])   // cap flips 1 ↔ EXPAND_MAX on expand toggle
 
   // 2026-09-16 default-framing (measured) — visibleTopFrac derived
   // from the REAL jog-surface bounds at runtime. `panelRef` points
@@ -560,28 +564,42 @@ export default function View3DLayout() {
           // Bottom-center, content-sized. left:50% + translate
           // centers a variable-width cluster (Cartesian +
           // Rotation is wider than Joint tiles).
+          //
+          // 2026-09-17 ROOT-CAUSE FIX (operator audit): without an
+          // explicit width, CSS shrink-to-fit for an absolute-
+          // positioned element uses (containing-block-width −
+          // insetLeft) = (viewport − viewport/2) = HALF the
+          // viewport as the layout box. Wider content silently
+          // wrapped or got clipped by the capped box; scaler's
+          // offsetWidth reported the WRAPPED width, not the true
+          // natural cluster width, so the fit-scale formula
+          // "believed it fit" and clipping stuck. `width:
+          // 'max-content'` makes the layout box equal the true
+          // content width so translateX(-50%) centers correctly
+          // AND scaler.offsetWidth reports naturalW = true full
+          // cluster width. maxWidth:'100vw' is a belt-and-braces
+          // upper bound.
           left: '50%',
           bottom: 16,
           transform: 'translateX(-50%)',
           zIndex: 11,
           pointerEvents: 'none',
           display: 'flex',
+          width: 'max-content',
+          maxWidth: '100vw',
           boxSizing: 'border-box',
         }}>
         <JogControls
-          // 2026-09-17 expand-rollback COMPLETION: `maximized`
-          // was `{isExpanded}`. That was the SECOND expand-scale
-          // vector — maximized=true triggers larger padBtn /
-          // padGroup / font tokens inside JogControls (natural
-          // cluster size grows by ~1.4-1.7× on desktop expand),
-          // which is what the operator's persistent sliver
-          // screenshot was showing: the fitScale saturates at
-          // MIN_FIT_SCALE and the enlarged natural still overflows
-          // the overflow:hidden ancestor. Force `false` so expand
-          // truly leaves the pad-cluster geometry untouched. The
-          // Program-tab consumer (which passes no `maximized`)
-          // gets the same non-maximized layout.
-          maximized={false}
+          // 2026-09-17 EXPAND-RESTORED (root-cause fix): `maximized`
+          // returns to {isExpanded}. The previous rollback was
+          // correct given the capped-half-viewport overlay bug —
+          // scale>1 spilled the visual past the layout box and
+          // ancestor overflow:hidden cropped it. With the overlay
+          // now sized via `width:'max-content'`, the fit-scale
+          // formula (Math.min(cap, sLeft, sRight, sHeight)) can
+          // bound expand correctly because it measures the TRUE
+          // natural width. maximized=true is safe again.
+          maximized={isExpanded}
           // 2026-09-16 SIDE-COLUMN OWNERSHIP + EXPAND MODE:
           //   * `immersive` portals the LEFT + RIGHT columns
           //     into the page-level slot divs above; this

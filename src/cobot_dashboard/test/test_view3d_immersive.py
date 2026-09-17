@@ -1192,14 +1192,16 @@ def test_expand_scales_only_center_cluster():
         scaler_block), (
         'scaler transform must be scale(fitScale) directly (no '
         'expand composition after min) per 2026-09-17 UNIFIED FIT')
-    # 2026-09-17 expand-rollback: EXPAND_MAX retired; cap = 1 always.
-    # Pin the retirement here too (belt-and-braces with the
-    # test_pad_cluster_fits_viewport_at_tablet_widths cap assertion).
-    assert 'const EXPAND_MAX' not in layout, (
-        'EXPAND_MAX constant must be RETIRED (2026-09-17 expand-'
-        'rollback — scale>1 clipped in the overflow:hidden ancestor)')
-    assert 'const CAP = 1' in layout, (
-        'cap constant must be `const CAP = 1` (both modes)')
+    # 2026-09-17 ROOT-CAUSE FIX (restore): EXPAND_MAX=1.6 back in
+    # play. The earlier expand-rollback was only needed while the
+    # overlay had no explicit width (CSS shrink-to-fit capped it
+    # at half-viewport → scale>1 spilled → clipped). Overlay now
+    # uses `width:'max-content'` so the fit-scale formula measures
+    # true naturalW and bounds expand correctly.
+    assert 'const EXPAND_MAX = 1.6' in layout, (
+        'EXPAND_MAX = 1.6 restored — with the overlay width fix, '
+        'expand-scale is bounded safely by Math.min(cap, sLeft, '
+        'sRight, sHeight)')
     assert re.search(
         r"transformOrigin:\s*'center", scaler_block), (
         "scaler transformOrigin must anchor at 'center' so pads "
@@ -1835,27 +1837,24 @@ def test_pad_cluster_fits_viewport_at_tablet_widths():
             f'ratio guarantees the cluster fits vertically')
 
     # 5. Cap declaration + ONE Math.min across cap + all four ratios.
-    # 2026-09-17 EXPAND-ROLLBACK (operator directive after desktop
-    # screenshot showed X-, Y+, Rz+ clipped as slivers): EXPAND_MAX
-    # RETIRED because scale>1 spills the visual past the overlay's
-    # LAYOUT box and the ancestor tree (view3d-immersive-root
-    # overflow:hidden + jog-surface-row overflowX:hidden) clips it.
-    # Cap = 1 in BOTH modes. Operator directive was explicit:
-    # roll back the expand implementation, do NOT patch the wrapper.
-    assert 'const EXPAND_MAX' not in layout, (
-        'EXPAND_MAX constant must be RETIRED (2026-09-17 expand-'
-        'rollback) — scale>1 clipped in the overflow:hidden ancestor')
-    assert 'const CAP = 1' in layout, (
-        'cap must be a plain constant `const CAP = 1` — both modes '
-        'use the same natural size (no >1 scaling)')
+    # 2026-09-17 ROOT-CAUSE FIX RESTORE: EXPAND_MAX=1.6 back in
+    # play; cap = isExpanded ? EXPAND_MAX : 1. The prior rollback
+    # was only necessary while the overlay had no explicit width;
+    # with width:'max-content' pinned, expand-scale is bounded
+    # safely by Math.min(cap, sLeft, sRight, sHeight).
+    assert 'const EXPAND_MAX = 1.6' in layout, (
+        'EXPAND_MAX = 1.6 must be declared (restored)')
+    assert re.search(
+        r"cap\s*=\s*isExpanded\s*\?\s*EXPAND_MAX\s*:\s*1", layout), (
+        'cap must be `isExpanded ? EXPAND_MAX : 1` — mode picks '
+        'the ceiling before Math.min bounds it')
     assert re.search(
         r"Math\.min\(\s*cap\s*,\s*sLeft\s*,\s*sRight\s*,\s*sHeight\s*\)",
         layout), (
         'fitScale MUST be Math.min(cap, sLeft, sRight, sHeight)')
 
     # 6. Recompute triggers: resize + orientationchange +
-    # visibilitychange (PWA standalone). isExpanded dep DROPPED
-    # in 2026-09-17 expand-rollback (cap constant, not mode-varying).
+    # visibilitychange (PWA standalone) + isExpanded (cap flips).
     fit_effect_idx = layout.find('UNIFIED FIT')
     assert fit_effect_idx != -1
     fit_effect_block = layout[fit_effect_idx:fit_effect_idx + 6000]
@@ -1863,6 +1862,9 @@ def test_pad_cluster_fits_viewport_at_tablet_widths():
     assert "'orientationchange'" in fit_effect_block
     assert 'visibilitychange' in fit_effect_block, (
         'must recompute on visibilitychange (PWA standalone launch)')
+    assert re.search(r'\[debugCluster,\s*isExpanded\]', layout), (
+        'useEffect deps must include isExpanded so cap flips '
+        '1 ↔ EXPAND_MAX immediately on Expand toggle')
 
 
 def test_expand_scales_only_center_cluster_not_left_column():
@@ -1911,6 +1913,60 @@ def test_expand_scales_only_center_cluster_not_left_column():
         'no CSS transform is allowed inside the LEFT column — the '
         'scaler transform is scoped to the CENTER cluster only. Any '
         'LEFT-column transform would fight the expand contract.')
+
+
+def test_pad_cluster_overlay_has_true_content_width():
+    """2026-09-17 ROOT-CAUSE FIX (operator audit): the pad-cluster
+    overlay is absolute-positioned with `left:50%; translateX(-50%)`.
+    Per CSS shrink-to-fit for absolute-positioned elements, its
+    available width without an explicit `width` is
+    (containing-block-width − insetLeft) = (viewport − viewport/2)
+    = HALF the viewport. Wider content silently wraps or gets
+    clipped by the capped box; scaler.offsetWidth then reports
+    the CAPPED width, not the true natural width, so the fit-
+    scale formula "believes it fit" and clipping stands.
+
+    Structural pin: the overlay declares `width: 'max-content'`
+    so its layout box equals true content width; translateX(-50%)
+    centers correctly on the true width; scaler.offsetWidth
+    reports the real naturalW. Belt: `maxWidth: '100vw'` bounds
+    the max-content growth so it can never exceed the viewport.
+    """
+    layout = _read(LAYOUT)
+    overlay_idx = layout.rfind('data-testid="jog-pad-cluster-overlay"')
+    assert overlay_idx != -1
+    overlay_block = layout[overlay_idx:overlay_idx + 2000]
+    assert re.search(r"width:\s*'max-content'", overlay_block), (
+        "pad-cluster overlay MUST declare width:'max-content' — "
+        "absolute-positioned elements without an explicit width "
+        "shrink-to-fit at (viewport − insetLeft), which caps the "
+        "layout box at half the viewport when insetLeft is 50% "
+        "(operator-audited root cause of the Rz+ clip / expand "
+        "sliver / fit-scale no-op)")
+    assert re.search(r"maxWidth:\s*'100vw'", overlay_block), (
+        "pad-cluster overlay should declare maxWidth:'100vw' as "
+        'belt-and-braces bound so max-content growth can never '
+        'exceed the viewport width')
+
+
+def test_immersive_cartesian_row_does_not_wrap():
+    """2026-09-17 ROOT-CAUSE FIX: the cartesian pad row inside
+    JogControls uses `flexWrap: 'wrap'` on the Program-tab
+    consumer. In immersive mode, wrap MUST be off — a wrapped row
+    hides overflow by reflowing, which would mask a real width
+    regression by silently letting the fit-scale believe it fit.
+    The immersive path REQUIRES the natural cluster width to be
+    exposed to the scaler measurement.
+    """
+    jog = _read(JOG)
+    # Locate the cartesian row; it's the first flex-wrap in the
+    # `jogMode === 'cartesian' ?` branch. Test the ternary shape.
+    assert re.search(
+        r"flexWrap:\s*immersive\s*\?\s*'nowrap'\s*:\s*'wrap'",
+        jog), (
+        "immersive cartesian row must use `flexWrap: immersive ? "
+        "'nowrap' : 'wrap'` — wrap would hide overflow from the "
+        'fit-scale measurement')
 
 
 def test_cluster_fit_debug_chip_available_behind_flag():
