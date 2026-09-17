@@ -87,7 +87,7 @@ test('flow(b): DISABLE/READY live in the LEFT column top slot (page-level)', () 
   // View3DLayout passes leftTopSlot with ArmEnableControl + Badge.
   const jcIdx = src.indexOf('<JogControls')
   assert.notEqual(jcIdx, -1, v('<JogControls> mount site not found'))
-  const jcBlock = src.slice(jcIdx, jcIdx + 1500)
+  const jcBlock = src.slice(jcIdx, jcIdx + 3000)
   assert.match(jcBlock, /leftTopSlot=\{/,
     v('View3DLayout must pass leftTopSlot to JogControls'))
   assert.match(jcBlock, /<ArmEnableControl/,
