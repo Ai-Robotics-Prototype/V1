@@ -1,10 +1,28 @@
-import { useEffect, Component } from 'react'
+import { useEffect, useState, Component } from 'react'
 import { useStore } from './store/useStore'
+import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
+import DevicePairingWizard from './components/DevicePairingWizard'
+import PairRequestModal from './components/PairRequestModal'
+import LoginModal from './components/LoginModal'
 import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
+import StaleCodegenBanner from './components/StaleCodegenBanner'
+import ControllerOfflineBanner from './components/ControllerOfflineBanner'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
+import AlarmRecoveryModal from './components/AlarmRecoveryModal'
+import JointRecoveryModal from './components/JointRecoveryModal'
+import ObstacleEscapeModal from './components/ObstacleEscapeModal'
+import SelfCollisionWarnBanner from './components/SelfCollisionWarnBanner'
+import HardStopToast from './components/HardStopToast'
+import DeployStatusBanner from './components/DeployStatusBanner'
+import StaleGuard from './components/StaleGuard'
+import StaleOverrideIndicator from './components/StaleOverrideIndicator'
+import CartSofteningToast from './components/CartSofteningToast'
+import WristWindIndicator from './components/WristWindIndicator'
+import PausedPresenter from './components/PausedPresenter'
 import ViewportDebug from './components/ViewportDebug'
+import JogDebugPanel from './components/JogDebugPanel'
 import MonitorDashboard from './pages/MonitorDashboard'
 import ProgramLayout from './layouts/ProgramLayout'
 import View3DLayout from './layouts/View3DLayout'
@@ -14,7 +32,7 @@ import AdaptivePicking from './pages/AdaptivePicking'
 import ProgramLibrary from './pages/ProgramLibrary'
 import IOPage from './pages/IOPage'
 import SafetyPage from './pages/SafetyPage'
-import QualityInspectionLayout from './layouts/QualityInspectionLayout'
+import EventLog from './pages/EventLog'
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -86,13 +104,44 @@ const gridStyle = {
 }
 
 export default function App() {
+  // Auth model pivot (add-61 §690, 2026-09-18). The dashboard NO
+  // LONGER blocks on the pairing wizard for unauthenticated
+  // clients — everyone sees the dashboard in view-only mode, and
+  // control actions trigger the LoginModal when unauth+enforced.
+  // The wizard is still reachable via `roboai-pair-required`
+  // (device-trust legacy path) but doesn't gate the app.
+  const [needsPair, setNeedsPair] = useState(false)
+  useEffect(() => {
+    const onReq = () => setNeedsPair(true)
+    window.addEventListener('roboai-pair-required', onReq)
+    return () => window.removeEventListener('roboai-pair-required', onReq)
+  }, [])
   const connectWS       = useStore((s) => s.connectWS)
   const activeTab       = useStore((s) => s.activeTab)
   const hydrateCells    = useStore((s) => s.hydrateCells)
   const hydratePrograms = useStore((s) => s.hydratePrograms)
+  const hydrateEdition  = useStore((s) => s.hydrateEdition)
+  const edition         = useStore((s) => s.edition)
+  const setTab          = useStore((s) => s.setTab)
+  const restoreOpenProgramOnMount = useStore(
+    (s) => s.restoreOpenProgramOnMount)
 
   useEffect(() => {
     connectWS()
+    // Edition hydrate on boot — the TopBar tab filter, the App
+    // layoutMap gate below, and every FeatureGate inside pages read
+    // useStore.edition, which starts at 'basic' (tablet-safe
+    // default). Hydrating first keeps a Full-only tab from
+    // flash-rendering on a Full PC during the initial paint.
+    hydrateEdition()
+    // 2026-08-05 (refresh persistence, fork registry:
+    // page_context_persistence): rehydrate the last-open program
+    // for THIS device from the server. If a draft with a
+    // staged_program exists, that (unsaved edits) wins over the
+    // disk-saved copy — same doctrine as record-through for
+    // poses. Blank state only when the device has never opened
+    // a program.
+    restoreOpenProgramOnMount()
     // Hydrate cells + programs from their respective endpoints at
     // app boot so any tab the operator lands on first — Configure,
     // 3D View, Program, Program Library — sees a populated state on
@@ -137,21 +186,74 @@ export default function App() {
     sensors:          <SensorsLayout />,
     io:               <IOPage />,
     adaptive_picking: <AdaptivePicking />,
-    quality_inspection: <QualityInspectionLayout />,
     configure:        <ConfigureLayout />,
     safety:           <SafetyPage />,
+    event_log:        <EventLog />,
   }
+
+  // Edition gate for the layout switch (2026-09-04, extended
+  // 2026-09-08). If activeTab resolves to a Full-only page but this
+  // device is on basic, fall back to Monitor so a stale persisted
+  // tab id (from a session where the device was Full and got
+  // re-locked) doesn't render a dead surface. TopBar already
+  // hides the tab; this is defence-in-depth for the persisted-
+  // activeTab class.
+  //
+  // 2026-09-08 tab-persistence race: `edition` starts at its
+  // initial default ('basic') and hydrates async via /api/edition.
+  // If we snap to Monitor on first render (before hydration
+  // completes), a Full device with a persisted full-only tab
+  // would get bounced to Monitor for one tick. Gate the snap on
+  // `editionHydrated` so the guard only fires after the server
+  // has answered.
+  const editionHydrated = useStore((s) => s.editionHydrated)
+  const _tabFeature = TAB_TO_FEATURE[activeTab] || activeTab
+  const _tabAllowed = isFeatureEnabled(_tabFeature, edition)
+  useEffect(() => {
+    if (!editionHydrated) return
+    if (!_tabAllowed && activeTab !== 'monitor') setTab('monitor')
+  }, [editionHydrated, _tabAllowed, activeTab, setTab])
 
   // Keep the two 3D-heavy tabs persistently mounted, toggled by CSS
   // display, so switching between them doesn't tear down the Canvas +
   // URDFLoader and re-parse all 7 GLBs. Other tabs unmount as before.
   const kept3D  = ['program', '3dview']
   const isKept  = kept3D.includes(activeTab)
-  const other   = !isKept ? (layoutMap[activeTab] ?? <MonitorDashboard />) : null
+  // Only apply the "not-allowed → Monitor" fallback AFTER edition
+  // hydrates. Before that, the initial default 'basic' would make a
+  // real Full device flash Monitor for one paint before hydrateEdition
+  // corrects the edition and re-renders the intended tab.
+  const _tabPassesGate = _tabAllowed || !editionHydrated
+  const other   = !isKept
+    ? (_tabPassesGate ? (layoutMap[activeTab] ?? <MonitorDashboard />) : <MonitorDashboard />)
+    : null
   const keptStyle = (tab) => ({
     display: activeTab === tab ? 'flex' : 'none',
     flex: 1, minHeight: 0, flexDirection: 'column',
   })
+
+  if (needsPair) {
+    return (
+      <DevicePairingWizard
+        onComplete={() => {
+          setNeedsPair(false)
+          // Re-connect WS + hydrate now that we have a token.
+          try { connectWS() } catch (_) { /* nop */ }
+          try { hydrateEdition() } catch (_) { /* nop */ }
+        }}
+        onSkip={() => {
+          // Dev-posture "Continue without pairing" (add-60 §689 fix
+          // for the wizard-blocked-dashboard bug — enforcement flag
+          // OFF, so the backend answers unauthenticated requests
+          // anyway; the wizard was purely a UI gate that ran ahead
+          // of enforcement). Skip dismisses the wizard for the rest
+          // of this browser session; a page reload puts it back so
+          // it stays discoverable.
+          setNeedsPair(false)
+        }}
+      />
+    )
+  }
 
   return (
     <ErrorBoundary>
@@ -170,9 +272,60 @@ export default function App() {
           <StatusBar />
         </div>
 
+        <StaleCodegenBanner />
+        <ControllerOfflineBanner />
+        {/* 2026-09-08 (revised, later same day): SystemBanners retired
+            per operator directive. Guard-state visibility moves into
+            the StatusBar footer as compact full-only text; disconnect
+            no longer surfaces its own banner. StaleCodegenBanner +
+            DeployStatusBanner still handle their own targeted cases. */}
         <ToastContainer />
         <EStopOverlay />
+        <AlarmRecoveryModal />
+        {/* 2026-08-05 (guided recovery, Lesson 165 extension) — offers
+            the press-and-hold escape move when a joint is past the
+            escape-only zone. Rendered above the surface-specific
+            layouts so it appears on the teach overlay + Monitor +
+            jog page from a single mount. */}
+        <JointRecoveryModal />
+        <SelfCollisionWarnBanner />
+        <ObstacleEscapeModal />
+        {/* 2026-08-05 (operator directive: clearance warnings OFF).
+            Global toast-emitter for self/ground hard-stop events.
+            Reads canonical robot.stop_cause_copy (translator lives
+            in dashboard_server _jog_stop_cause_operator_copy) —
+            no re-parsing of driver text, fork-registry-safe. */}
+        <HardStopToast />
+        {/* PausedPresenter renders the caution-styled paused overlay
+            and its persistent banner. Distinct pipeline from
+            AlarmRecoveryModal above (which owns the red alarm
+            treatment); alarms outrank paused via deriveRunState's
+            precedence, so a real alarm during pause hides the amber
+            and shows the red. */}
+        <PausedPresenter />
+        <DeployStatusBanner />
+        {/* StaleGuard is a BLOCKING modal — mounted last so it
+            paints above every other panel/toast/banner. Rendering
+            an empty tree when no mismatch → cost of the mount is
+            a single subscription to useStore.staleProvenance. */}
+        <StaleGuard />
+        {/* Persistent pill visible whenever the operator has used
+            the escape hatch. Surfaces the fact that the tab is
+            running without the guard's guarantee — clear by
+            clicking the pill. */}
+        <StaleOverrideIndicator />
+        {/* 2026-08-28 wrist-friendly hold: toast the moment
+            cartesian scaling engages so the operator hears
+            "slowed — J6 near its speed limit" without needing
+            the Event Log. */}
+        <CartSofteningToast />
+        {/* Persistent wrist-wind indicator when J4/J6 exceed
+            ±150°. Silent otherwise. */}
+        <WristWindIndicator />
         <ViewportDebug />
+        <JogDebugPanel />
+        <PairRequestModal />
+        <LoginModal />
       </div>
     </ErrorBoundary>
   )

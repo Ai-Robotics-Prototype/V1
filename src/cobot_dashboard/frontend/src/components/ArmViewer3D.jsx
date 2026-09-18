@@ -7,8 +7,12 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import URDFLoader from 'urdf-loader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
-import { CollisionScene3D, CollisionBanner } from './CollisionOverlay'
-import JointJogPanel from './JointJogPanel'
+import { CollisionScene3D } from './CollisionOverlay'
+// 2026-09-14 operator directive: JointJogPanel retired from the 3D
+// View. This file used to mount it in the !noRobot branch, but that
+// branch never fired (View3DLayout is the only ArmViewer3D consumer
+// and passes noRobot=true). The dead import + mount were removed to
+// avoid a silent dead reference in a build the bundler still traces.
 import IKGizmo from './IKGizmo'
 import { startHomeMove } from '../lib/homeAnim'
 import { startJointAnimation } from '../lib/jointAnim'
@@ -74,8 +78,21 @@ function _urlInt(key, alt, fallback, min, max) {
 }
 const RENDER_LAG_MS  = _urlInt('rl', 'renderLag', 200, 0, 1000)
 const SAMPLE_BUF_CAP = _urlInt('bc', 'bufCap',      8, 2,   64)
+// Exponential-smoothing time constant (ms) for the twin follower. Each
+// render tick the twin joint angles move `1 - exp(-dt/τ)` of the way
+// toward the newest received posture. τ=100 ms yields ≈63% recovery
+// per 100 ms — visually smooth AND bounded-lag: the twin can never
+// trail a stable target by more than a fraction of τ regardless of
+// how many posture updates queue while the browser stalls. Replaces
+// the fixed-lag sample-buffer + linear interpolator (which stacked
+// per-frame lag when store updates outran RAF ticks).
+const SMOOTH_TAU_MS  = _urlInt('tau', 'smoothTau', 100, 0, 1000)
+// Legacy interpolation buffer stays available via ?rl=200&smooth=0 for
+// side-by-side comparison during rollout.
+const SMOOTH_ENABLED = _urlInt('smooth', 'smoothEnable', 1, 0, 1) !== 0
 if (typeof console !== 'undefined') {
-  console.log(`[twin] RENDER_LAG_MS=${RENDER_LAG_MS} SAMPLE_BUF_CAP=${SAMPLE_BUF_CAP}`)
+  console.log(`[twin] RENDER_LAG_MS=${RENDER_LAG_MS} SAMPLE_BUF_CAP=${SAMPLE_BUF_CAP} `
+            + `SMOOTH_TAU_MS=${SMOOTH_TAU_MS} SMOOTH_ENABLED=${SMOOTH_ENABLED}`)
 }
 
 // URDF axis convention gate. The URDF variants we serve at /robot/urdf
@@ -97,6 +114,69 @@ const DEFAULT_PRESETS = {
   iso:   [2.5, 1.6, 2.5],
 }
 const DEFAULT_ORBIT_TARGET = [0, 0.7, 0]
+// 2026-09-16 immersive framing — used when URDFArm hasn't emitted a
+// bbox yet (noRobot mode with StandaloneRobot doesn't fire the URDF
+// onLoaded callback). Rough S10-140 envelope; the URDF bbox
+// overrides this via bboxRef the moment it lands.
+const ARM_BBOX_APPROX = { centerY: 0.7, maxDim: 1.4 }
+// 2026-09-16 immersive framing — vertical FOV of the R3F Canvas
+// (see the `camera={{ fov: 45 }}` prop on <Canvas> below). Kept as
+// a constant so the framing math and the Canvas prop stay in sync.
+const CAMERA_FOV_DEG = 45
+
+// 2026-09-16 immersive framing — compute a (camera position, orbit
+// target) pair that puts the arm bbox inside a `visibleTopFrac`
+// slice of the viewport, matching the preset's viewing angle. The
+// slice sits at the TOP of the screen so the arm is visible above
+// the jog-panel band without needing manual zoom.
+//
+// Math:
+//   * Bbox fits into visibleTopFrac of viewport height with 15%
+//     padding: dist = (maxDim * 1.15) / (visibleTopFrac * 2 * tan(fov/2)).
+//   * Vertical world offset shifts the target DOWN in world Y so
+//     the arm renders UP in screen space by (jogFrac / 2) of the
+//     viewport. worldYOffset = jogFrac * dist * tan(fov/2). Skipped
+//     for the TOP preset (world Y is aligned with the view axis).
+//   * Camera position = target + preset-direction * dist. Preset
+//     direction is derived from DEFAULT_PRESETS relative to the
+//     legacy target so the visual angle is preserved.
+function _framingDebugEnabled() {
+  if (typeof window === 'undefined') return false
+  try {
+    const q = new URLSearchParams(window.location.search)
+    if (q.get('framing_debug') === '1') return true
+    if (window.localStorage && window.localStorage.getItem(
+      'framing_debug') === '1') return true
+  } catch { /* localStorage may throw in strict privacy modes */ }
+  return false
+}
+
+function _framedPreset(name, bbox, visibleTopFrac) {
+  const fov = CAMERA_FOV_DEG * Math.PI / 180
+  const clampedFrac = Math.max(0.35, Math.min(1.0, visibleTopFrac))
+  const jogFrac = 1 - clampedFrac
+  const dist = (bbox.maxDim * 1.15) /
+    (clampedFrac * 2 * Math.tan(fov / 2))
+  const legacyPos = DEFAULT_PRESETS[name] || DEFAULT_PRESETS.iso
+  const dir = new THREE.Vector3(
+    legacyPos[0] - DEFAULT_ORBIT_TARGET[0],
+    legacyPos[1] - DEFAULT_ORBIT_TARGET[1],
+    legacyPos[2] - DEFAULT_ORBIT_TARGET[2],
+  ).normalize()
+  const worldYOffset = (name === 'top') ? 0
+    : jogFrac * dist * Math.tan(fov / 2)
+  const target = new THREE.Vector3(
+    DEFAULT_ORBIT_TARGET[0],
+    bbox.centerY - worldYOffset,
+    DEFAULT_ORBIT_TARGET[2],
+  )
+  const pos = new THREE.Vector3(
+    target.x + dir.x * dist,
+    target.y + dir.y * dist,
+    target.z + dir.z * dist,
+  )
+  return { pos, target }
+}
 
 const ROBOT_MATERIAL = new THREE.MeshPhongMaterial({
   color: 0xC0C8D4, specular: 0x4a4a4a, shininess: 30,
@@ -457,17 +537,31 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded, onDragActive, onD
   //                          does NOT affect visual smoothness.
   const sampleBufRef     = useRef([])
   const anchorRef        = useRef(null)
+  // Newest received posture — the exponential-smoothing follower slews
+  // `currentRef` toward this every render tick. Refreshed by the
+  // ingest useEffect on each new /ws/state message. When SMOOTH_ENABLED
+  // is on this replaces sampleBufRef/anchorRef entirely; when it is
+  // off the RAF loop falls back to the legacy fixed-lag interpolator
+  // (kept for A/B comparison during rollout).
+  const targetPoseRef    = useRef(null)   // [j1..j6] rad, latest received
+  const lastStepTsRef    = useRef(0)      // performance.now() at last step
   const rafRef           = useRef(null)
   const storePositions   = useStore((s) => s.joints?.positions)
   const lastMessageTime  = useStore((s) => s.lastMessageTime)
   const { scene, camera, gl } = useThree()
 
-  // Ingest new joint samples into the interpolation ring buffer.
-  // Fires once per /ws/state message (positions is a fresh array each
-  // JSON.parse; lastMessageTime updates in the same set() call).
+  // Ingest new joint samples. In smoothing mode we simply overwrite
+  // `targetPoseRef` with the newest posture (latest-wins by construction:
+  // no history is kept, so any queue growth in the store→ingest hop is
+  // absorbed here). Fixed-lag mode keeps its sample buffer for A/B.
   useEffect(() => {
     if (!Array.isArray(storePositions) || storePositions.length < 6) return
     if (!lastMessageTime) return
+    if (SMOOTH_ENABLED) {
+      // Copy so the follower can't observe a mid-write positions array.
+      targetPoseRef.current = storePositions.slice(0, 6)
+      return
+    }
     const buf = sampleBufRef.current
     const last = buf[buf.length - 1]
     // Dedupe: server broadcasts at 25 Hz but source joints arrive
@@ -862,6 +956,45 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded, onDragActive, onD
   useEffect(() => {
     const step = () => {
       const robot = robotRef.current
+      if (SMOOTH_ENABLED) {
+        const target = targetPoseRef.current
+        if (robot && robot.joints && Array.isArray(target)) {
+          const cur = currentRef.current
+          const tgt = targetsRef.current
+          const mask = manualMaskRef.current
+          const manualIdx = manualJointRef.current
+          const nowP = performance.now()
+          const last = lastStepTsRef.current || nowP
+          const dt = Math.max(0, Math.min(100, nowP - last))
+          lastStepTsRef.current = nowP
+          // Exponential smoothing: q_new = q_old + (target - q_old) * α
+          // where α = 1 - exp(-dt / τ). At τ=100 ms, α≈0.39 for a 50 ms
+          // frame, ≈0.63 for a 100 ms frame — the follower converges
+          // fast enough to feel responsive, slow enough to hide micro-
+          // jitter, and it's LATEST-WINS by construction because every
+          // step reads the newest targetPoseRef.
+          const alpha = SMOOTH_TAU_MS > 0
+                        ? (1 - Math.exp(-dt / SMOOTH_TAU_MS))
+                        : 1
+          for (let j = 0; j < 6; j++) {
+            if (j === manualIdx) continue
+            if (mask[j]) continue
+            const t = Number(target[j])
+            if (!Number.isFinite(t)) continue
+            const c0 = Number.isFinite(cur[j]) ? cur[j] : t
+            const v = c0 + (t - c0) * alpha
+            cur[j] = v
+            tgt[j] = v
+            const joint = robot.joints[JOINT_NAMES[j]]
+            if (joint && typeof joint.setJointValue === 'function') {
+              joint.setJointValue(v)
+            }
+          }
+        }
+        rafRef.current = requestAnimationFrame(step)
+        return
+      }
+      // ── Legacy fixed-lag interpolator (?smooth=0) ────────────
       const buf   = sampleBufRef.current
       const anchor = anchorRef.current
       if (robot && robot.joints && anchor && buf.length > 0) {
@@ -1177,6 +1310,57 @@ function BaselineStatusNotice({ status }) {
   )
 }
 
+// ──────────────────────────────────────────────────────────────────
+// TrajectoryPolylineOverlay — reads useStore.trajectoryOverlay and
+// draws the flange path as a polyline in the URDF geometry frame,
+// plus a green sphere at the start and a red one at the end. Set by
+// RecentRunsCard's [Trajectory] action; cleared when the operator
+// closes the panel or picks a different step.
+//
+// Frame handling: the trajectory endpoint FKs joints against the
+// SAME URDF the viewer loads (/robot/urdf → s10-140-full.urdf, Y-up),
+// so points arrive in the same coordinate system as the URDF root
+// group and land directly on the twin flange. No axis swap needed.
+// ──────────────────────────────────────────────────────────────────
+function TrajectoryPolylineOverlay() {
+  const overlay = useStore((s) => s.trajectoryOverlay)
+  if (!overlay || !Array.isArray(overlay.points) || overlay.points.length < 2) {
+    return null
+  }
+  const pts = overlay.points
+  const positions = new Float32Array(pts.length * 3)
+  for (let i = 0; i < pts.length; i++) {
+    positions[i * 3]     = pts[i][0]
+    positions[i * 3 + 1] = pts[i][1]
+    positions[i * 3 + 2] = pts[i][2]
+  }
+  const start = pts[0]
+  const end   = pts[pts.length - 1]
+  return (
+    <group>
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            count={pts.length}
+            array={positions}
+            itemSize={3}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color="#2563eb" linewidth={2} />
+      </line>
+      <mesh position={[start[0], start[1], start[2]]}>
+        <sphereGeometry args={[0.015, 12, 12]} />
+        <meshBasicMaterial color="#16a34a" />
+      </mesh>
+      <mesh position={[end[0], end[1], end[2]]}>
+        <sphereGeometry args={[0.015, 12, 12]} />
+        <meshBasicMaterial color="#dc2626" />
+      </mesh>
+    </group>
+  )
+}
+
 function StaticZonesToggle({ value, onChange }) {
   // Probe the live collision payload for any baseline-built obstacles
   // so we don't dangle an inert toggle when no cell has zones yet.
@@ -1241,13 +1425,17 @@ function StaticZonesToggle({ value, onChange }) {
   )
 }
 
-const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false }, ref) {
+const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false, framing, getLiveBbox }, ref) {
   const controlsRef = useRef(null)
   const [flange, setFlange] = useState(null)
-  const [urdfStatus, setUrdfStatus] = useState({ state: 'idle', detail: '' })
+  // eslint-disable-next-line no-unused-vars
+  const [_urdfStatus, setUrdfStatus] = useState({ state: 'idle', detail: '' })
   // Show baseline-built static keep-out zones by default; the
   // operator can hide them via the StaticZonesToggle.
   const [showStaticZones, setShowStaticZones] = useState(true)
+  // 2026-09-08 reach dome. Store-persisted (per device); default ON.
+  const reachDomeShown    = useStore((s) => s.reachDomeShown)
+  const setReachDomeShown = useStore((s) => s.setReachDomeShown)
   const autoFittedRef = useRef(false)
 
   // Active click-drag joint (null when not dragging). Populated by
@@ -1268,29 +1456,25 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
     if (controlsRef.current) controlsRef.current.enabled = enabled
   }
 
-  // === DIAGNOSTIC — independent fetch of one per-link GLB so a
-  // network/cert problem appears in orange immediately, before the
-  // URDF loader even runs. Remove after the model is confirmed live.
-  const [diagMsg, setDiagMsg] = useState('GLB: testing…')
+  // 2026-09-08 operator directive: on-screen GLB-fetch diagnostic
+  // strip retired ("delete the element, don't hide it"). The
+  // console.log logging stays so devtools grep still surfaces the
+  // fetch outcome — nothing renders behind the jog button now.
   useEffect(() => {
     const testUrl = '/robot/links/link0_base_light.glb'
     fetch(testUrl)
       .then((r) => {
         const ctype = r.headers.get('content-type') || '(no content-type)'
         const clen  = r.headers.get('content-length') || '?'
-        const info = `GLB fetch: ${r.status} ${r.statusText} (${ctype}, ${clen} B)`
         // eslint-disable-next-line no-console
-        console.log('[DIAG]', info)
-        setDiagMsg(info)
+        console.log('[DIAG]',
+          `GLB fetch: ${r.status} ${r.statusText} (${ctype}, ${clen} B)`)
       })
       .catch((err) => {
-        const info = `GLB fetch ERROR: ${err?.message || err}`
         // eslint-disable-next-line no-console
-        console.error('[DIAG]', info)
-        setDiagMsg(info)
+        console.error('[DIAG]', `GLB fetch ERROR: ${err?.message || err}`)
       })
   }, [])
-  // === END DIAGNOSTIC ===
 
   // Prior versions read `useStore((s) => s.joints?.positions)` here to
   // feed a top-right joint-readout overlay. That overlay was removed
@@ -1302,16 +1486,73 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   // subscribes internally (line ~414) so live telemetry keeps flowing
   // to the FK loop.
 
+  // 2026-09-16 immersive framing — remember the last preset the
+  // operator picked so resize / jog-panel-mode changes can re-apply
+  // it. Falls back to 'iso' if nothing has been chosen yet.
+  const currentPresetRef = useRef('iso')
+  // Latest bbox from URDFArm (Program tab) — noRobot mode (View3D
+  // page with StandaloneRobot) falls back to ARM_BBOX_APPROX.
+  const armBboxRef = useRef(null)
+
   const applyPreset = (name) => {
-    const pos = DEFAULT_PRESETS[name] ?? DEFAULT_PRESETS.iso
     const c = controlsRef.current
     if (!c) return
-    c.object.position.set(pos[0], pos[1], pos[2])
-    c.target.set(DEFAULT_ORBIT_TARGET[0], DEFAULT_ORBIT_TARGET[1], DEFAULT_ORBIT_TARGET[2])
+    currentPresetRef.current = name
+    // 2026-09-16 LIVE-BBOX FIX — bbox precedence (best signal first):
+    //   1. getLiveBbox()   — Box3 from setFromObject on the actual
+    //                        robot group at the CURRENT joint pose.
+    //                        View3D immersive layout wires this
+    //                        via StandaloneRobot.jogApi.getBBox().
+    //   2. armBboxRef.current — bbox emitted by URDFArm's onLoaded
+    //                        callback (Program tab, one-shot).
+    //   3. ARM_BBOX_APPROX — static S10-140 envelope. Only if both
+    //                        of the above are absent (mount race
+    //                        before jogApi is ready).
+    // The prior code stopped at (2) which meant View3D never got a
+    // real bbox — it always fell to the static envelope and
+    // overflowed on tall/extended poses.
+    let bbox = ARM_BBOX_APPROX
+    const liveBox3 = (typeof getLiveBbox === 'function') ? getLiveBbox() : null
+    if (liveBox3) {
+      const size = liveBox3.getSize(new THREE.Vector3())
+      const center = liveBox3.getCenter(new THREE.Vector3())
+      const maxDim = Math.max(size.x, size.y, size.z)
+      if (Number.isFinite(maxDim) && maxDim > 0.01) {
+        bbox = { centerY: center.y, maxDim }
+      }
+    } else if (armBboxRef.current) {
+      bbox = armBboxRef.current
+    }
+    // Framing target region: caller-supplied visibleTopFrac (in the
+    // range 0.30..0.98) shrinks the effective viewport height the
+    // bbox is fitted into, so the arm sits above the jog surface.
+    // Default 1.0 = legacy full-viewport framing (Program tab).
+    const visibleTopFrac = framing?.visibleTopFrac ?? 1.0
+    const { pos, target } = _framedPreset(name, bbox, visibleTopFrac)
+    c.object.position.set(pos.x, pos.y, pos.z)
+    c.target.set(target.x, target.y, target.z)
     c.update()
+    // 2026-09-16 debug flag — set URL query ?framing_debug=1 (or
+    // localStorage 'framing_debug' = '1') to log one line per
+    // reframe with the actual bbox + surface fraction used. Lets
+    // the operator confirm on the real tablet that the LIVE bbox
+    // was used (not the static ARM_BBOX_APPROX).
+    if (_framingDebugEnabled()) {
+      // eslint-disable-next-line no-console
+      console.info('[framing]', {
+        preset: name,
+        source: liveBox3 ? 'live' : (armBboxRef.current ? 'urdf' : 'approx'),
+        maxDim: bbox.maxDim, centerY: bbox.centerY,
+        visibleTopFrac,
+      })
+    }
   }
   useImperativeHandle(ref, () => ({
     setCameraPreset(name) { applyPreset(name) },
+    // 2026-09-16 immersive framing — re-apply the current preset
+    // with fresh framing (used by View3DLayout on window resize
+    // and jog-panel-mode change).
+    reframe() { applyPreset(currentPresetRef.current) },
     // Expose OrbitControls enable/disable so a sibling in the same
     // Canvas (an IKGizmo mounted from View3DLayout's JSX children) can
     // freeze the orbit while dragging the gizmo.
@@ -1319,23 +1560,18 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   }))
 
   // One-shot auto-fit on first load. After that the operator's
-  // manual orbit + presets win.
+  // manual orbit + presets win. 2026-09-16 immersive framing —
+  // routes through applyPreset('iso') so the URDF bbox is used AND
+  // the top-region visibleTopFrac shift is applied consistently.
   const handleUrdfLoaded = (_robot, bbox) => {
     if (autoFittedRef.current) return
-    const c = controlsRef.current
-    if (!c) return
     const sz     = bbox.getSize(new THREE.Vector3())
     const center = bbox.getCenter(new THREE.Vector3())
     const maxDim = Math.max(sz.x, sz.y, sz.z)
     if (!Number.isFinite(maxDim) || maxDim < 0.01) return
     autoFittedRef.current = true
-    c.object.position.set(
-      center.x + maxDim * 1.5,
-      center.y + maxDim * 0.5,
-      center.z + maxDim * 1.5,
-    )
-    c.target.copy(center)
-    c.update()
+    armBboxRef.current = { centerY: center.y, maxDim }
+    applyPreset(currentPresetRef.current)
     // eslint-disable-next-line no-console
     console.info('[URDF] camera auto-fit', {
       size:   { x: sz.x, y: sz.y, z: sz.z },
@@ -1343,12 +1579,45 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
     })
   }
 
+  // 2026-09-16 immersive framing — apply the default frame once
+  // the OrbitControls ref is available (noRobot mode with
+  // StandaloneRobot never triggers handleUrdfLoaded, so this is
+  // the only initial-frame path in the View3D layout). Also
+  // re-frames when the `framing` prop OR the `getLiveBbox` prop
+  // changes — the latter becomes non-null once StandaloneRobot's
+  // jogApi lands, which is the point at which we can measure the
+  // ACTUAL current pose bbox instead of the static envelope.
+  useEffect(() => {
+    // Double-RAF so React has committed AND the browser has painted
+    // before we measure — refresh-time hydration + font load can
+    // leave getBoundingClientRect returning stale zero-top values
+    // on the first RAF.
+    let raf2 = null
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (controlsRef.current) applyPreset(currentPresetRef.current)
+      })
+    })
+    return () => {
+      cancelAnimationFrame(raf1)
+      if (raf2) cancelAnimationFrame(raf2)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [framing?.visibleTopFrac, getLiveBbox])
+
   const currentProgram = useStore((s) => s.currentProgram)
   const gripperCfg     = currentProgram?.config?.gripper || {}
   const gripperType    = gripperCfg.gripper_type || gripperCfg.type || null
-  const gripperGlbUrl  = gripperType === 'custom' && gripperCfg.gripper_model_id
-    ? (gripperCfg.gripper_glb_url || `/grippers/glb/${gripperCfg.gripper_model_id}.glb`)
-    : null
+  // 2026-09-08 Custom EOAT item 5: parent the tool-library GLB to
+  // the flange (J6) via the CustomGripperModel component below.
+  // Precedence: config.tool_id (new EOAT path) wins over
+  // legacy gripper_model_id / gripper_glb_url (pre-EOAT panels).
+  const _toolId        = currentProgram?.config?.tool_id || null
+  const gripperGlbUrl  = _toolId
+    ? `/api/tools/${encodeURIComponent(_toolId)}/mesh`
+    : (gripperType === 'custom' && gripperCfg.gripper_model_id
+        ? (gripperCfg.gripper_glb_url || `/grippers/glb/${gripperCfg.gripper_model_id}.glb`)
+        : null)
   const gripperName    = gripperCfg.gripper_name || gripperCfg.name || ''
 
   return (
@@ -1365,6 +1634,17 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           target={DEFAULT_ORBIT_TARGET}
           minDistance={0.5}
           maxDistance={20}
+          // 2026-09-16 tablet-gesture fix — pin the touch mapping
+          // explicitly so a drei-version bump can't silently regress
+          // to DOLLY_ROTATE (or worse, NONE). ONE finger = rotate,
+          // TWO fingers = pinch-zoom + pan simultaneously (DOLLY_PAN
+          // is the two-finger gesture operators reported broken on
+          // tablet). Desktop mouse behavior is unaffected (mouse
+          // uses mouseButtons config, not touches).
+          touches={{
+            ONE: THREE.TOUCH.ROTATE,
+            TWO: THREE.TOUCH.DOLLY_PAN,
+          }}
         />
         <gridHelper args={[4, 20, '#cccccc', '#e5e5e5']} />
         {!noRobot && (
@@ -1379,7 +1659,8 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           />
         )}
         <CustomGripperModel url={gripperGlbUrl} flange={flange} />
-        <CollisionScene3D showStatic={showStaticZones} />
+        <CollisionScene3D showStatic={showStaticZones} showReachDome={reachDomeShown} />
+        <TrajectoryPolylineOverlay />
         {/* IK gizmo for the URDFArm path (Program tab). Only mounts
             while Cartesian mode is on; unmount disposes the
             TransformControls cleanly. */}
@@ -1419,17 +1700,19 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
         </div>
       )}
 
-      {/* Collision banner — centered at top */}
-      <div style={{
-        position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
-        zIndex: 12, pointerEvents: 'none',
-      }}>
-        <CollisionBanner />
-      </div>
+      {/* 2026-09-16 operator directive: the top-center CLEAR ·
+          N in-reach pill (CollisionBanner) was retired from the 3D
+          View. The underlying reach / clearance store slice
+          (collision.*, guard_*) still feeds MinClearanceReadout
+          (View3DLayout top-left chip when the arm is within 2x warn
+          distance of any zone) and the CollisionScene3D reach-dome +
+          object-box render (inside <Canvas>). The pill's dead
+          component + statusToBanner helper have been deleted from
+          CollisionOverlay.jsx — no orphan exports. */}
 
       {/* Drag-manipulation status — shows only while the operator is
-          click-dragging a joint. Below the collision banner so both
-          can coexist. */}
+          click-dragging a joint. Was 'below the collision banner';
+          now the ONLY top-center overlay when active. */}
       {dragInfo && (
         <div style={{
           position: 'absolute', top: 36, left: '50%',
@@ -1468,71 +1751,67 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           this file (the FK loop uses them); just don't render
           the floating readout chip in the top-right anymore. */}
 
-      {/* Status pill, bottom-right — currently shown ALWAYS so the two
-          tabs (Program vs 3D View) can be compared side-by-side while
-          we chase the "no robot on 3D View" report. Re-gate on
-          ?debug=1 after the tabs are confirmed matching. */}
-      <div style={{
-        position: 'absolute', bottom: 8, right: 8, padding: '6px 10px',
-        borderRadius: 6, fontSize: 11, lineHeight: 1.35,
-        fontFamily: 'var(--font-mono, monospace)', zIndex: 10,
-        maxWidth: 360,
-        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-        background: urdfStatus.state === 'error'
-          ? 'rgba(220,38,38,0.95)'
-          : urdfStatus.state === 'loaded'
-            ? 'rgba(22,163,74,0.92)'
-            : 'rgba(15,23,42,0.85)',
-        color: '#fff',
-      }}>
-        <div style={{ fontWeight: 700, marginBottom: 2 }}>URDF: {urdfStatus.state}</div>
-        <div style={{ opacity: 0.92, wordBreak: 'break-all' }}>{urdfStatus.detail || '—'}</div>
-        <div style={{
-          fontSize: 11, color: '#ff9900', marginTop: 4, wordBreak: 'break-all',
-        }}>{diagMsg}</div>
-      </div>
+      {/* 2026-09-08 operator directive: URDF + GLB-fetch status
+          pill retired ("nothing may render behind the button").
+          `urdfStatus.state` still tracks locally for future
+          conditional rendering; error surfacing during dev can
+          use the console. */}
 
-      {/* FK jog pane, right-docked. Only mounts when URDFArm is active
-          (noRobot=false) — the View3D tab uses StandaloneRobot and has
-          no jogApi, so the panel is intentionally hidden there. */}
-      {!noRobot && (
-        <JointJogPanel
-          jogApi={jogApi}
-          cartesianMode={cartMode}
-          onCartesianModeChange={setCartMode}
-          gizmoMode={gizmoMode}
-          onGizmoModeChange={setGizmoMode}
-          onHome={() => {
-            // Smooth coordinated 2-second return to all-zeros (see
-            // lib/homeAnim.js). Interrupt with any slider / IK write.
-            jogApi?.home?.()
-          }}
-          onAtLimit={(atLimit) => setIkAtLimit(!!atLimit)}
-        />
-      )}
+      {/* 2026-09-14 operator directive: right-docked FK jog pane
+          retired from the 3D View. This block used to mount
+          JointJogPanel behind `!noRobot`, but the only ArmViewer3D
+          consumer (View3DLayout) always passes noRobot=true, so the
+          branch never fired. The 3D View now hosts the modal-gated
+          OrientFlangeDownControl instead. */}
 
-      {/* Camera presets, top-left */}
+      {/* Camera presets + reach-dome toggle, top-left */}
       <div style={{
-        position: 'absolute', top: 8, left: 8, display: 'flex', gap: 4, zIndex: 10,
+        position: 'absolute', top: 8, left: 8, display: 'flex',
+        gap: 8, alignItems: 'center', zIndex: 10,
       }}>
-        {[
-          { label: 'Front', key: 'front' },
-          { label: 'Side',  key: 'side'  },
-          { label: 'Top',   key: 'top'   },
-          { label: 'Iso',   key: 'iso'   },
-        ].map((p) => (
-          <button
-            key={p.key}
-            onClick={() => applyPreset(p.key)}
-            style={{
-              padding: '4px 10px', fontSize: 10, fontWeight: 600,
-              background: 'rgba(255,255,255,0.92)', color: '#374151',
-              border: '1px solid #d1d5db', borderRadius: 4, cursor: 'pointer',
-            }}
-          >
-            {p.label}
-          </button>
-        ))}
+        <div style={{ display: 'flex', gap: 4 }}>
+          {[
+            { label: 'Front', key: 'front' },
+            { label: 'Side',  key: 'side'  },
+            { label: 'Top',   key: 'top'   },
+            { label: 'Iso',   key: 'iso'   },
+          ].map((p) => (
+            <button
+              key={p.key}
+              onClick={() => applyPreset(p.key)}
+              style={{
+                padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                background: 'rgba(255,255,255,0.92)', color: '#374151',
+                border: '1px solid #d1d5db', borderRadius: 4, cursor: 'pointer',
+              }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        {/* 2026-09-08 reach-extents toggle. Default ON; persists per
+            device via useStore.reachDomeShown. Small checkbox next
+            to the corner view-switcher so operators can see how
+            much of the workcell the arm can reach at a glance,
+            without the dome cluttering the view when they don't
+            want it. */}
+        <label
+          data-testid="reach-dome-toggle"
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            padding: '4px 10px', fontSize: 10, fontWeight: 600,
+            background: 'rgba(255,255,255,0.92)', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 4,
+            cursor: 'pointer', userSelect: 'none',
+          }}>
+          <input
+            type="checkbox"
+            checked={!!reachDomeShown}
+            onChange={(e) => setReachDomeShown(e.target.checked)}
+            style={{ margin: 0, cursor: 'pointer' }}
+          />
+          Show reach extents
+        </label>
       </div>
     </div>
   )

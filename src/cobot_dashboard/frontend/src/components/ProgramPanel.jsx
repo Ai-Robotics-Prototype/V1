@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback } from 'react'
 import { useStore } from '../store/useStore'
+import { stepIndexForLine } from '../lib/runState'
 
 const STEP_COLORS = {
   move:    'var(--accent)',
@@ -321,7 +322,22 @@ export default function ProgramPanel() {
   const reorderSteps     = useStore((s) => s.reorderSteps)
 
   const steps        = program.steps ?? []
-  const doneCount    = steps.filter((s) => s.status === 'done').length
+  // Same executing-step derivation as ProgramEditor (2026-07-30
+  // audit #P2-2 — the old `status === 'done'` filter was always 0
+  // because nothing ever wrote step.status).
+  const _programLine = useStore((s) => s.robot?.program?.line)
+  const _programStep = useStore((s) => s.task?.program_step)
+  const _executingIdx = (() => {
+    if (Number.isInteger(_programLine) && _programLine > 0) {
+      const idx = stepIndexForLine(program, _programLine)
+      if (idx >= 0) return idx
+    }
+    if (Number.isInteger(_programStep)) return _programStep
+    return -1
+  })()
+  const doneCount = _executingIdx >= 0
+    ? Math.max(0, Math.min(steps.length, _executingIdx))
+    : 0
   const totalCount   = steps.length
 
   const [showForm, setShowForm]   = useState(false)

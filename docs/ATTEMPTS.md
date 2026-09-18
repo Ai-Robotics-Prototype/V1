@@ -1,0 +1,249 @@
+# ATTEMPTS.md — approaches tried, verdicts, and pointers
+> Grep-on-demand (NOT in the always-loaded distillate tier). One line per
+> attempt, chronological by ledger slug. Cite with `add-NN §S` or
+> `era-01 L####` for grep back into the ledger.
+>
+> **Format:** `<slug> <§section-or-line> — <one-line attempt> — VERDICT: <one-word>`
+>
+> **Verdict vocabulary:** SHIPPED, REVERTED, ABANDONED, DEFERRED, EXONERATED,
+> FAILED, PASS, INFLIGHT, ADOPTED, REJECTED, DIRECTED, DIAGNOSED, PROVEN,
+> DOCUMENTED, PARKED, FIXED, CONVICTED, PLANNED, MEASURED, LAUNCHED,
+> RESOLVED, AUDITED, DECLARED, SPEC'D, CONFIRMED, NAMED.
+>
+> **Adding an entry:** append under the correct addendum slug in slug-order.
+> The row-count sanity target is ≥ 100; anything much lower means an
+> addendum's sweep is incomplete. Skipped-addendum audit list at the
+> bottom.
+
+## Entries (pre-v46 era + v46 splits)
+
+era-01 L1663 — Ubuntu upgrade via `do-release-upgrade` over SSH — VERDICT: FAILED
+era-01 L1999 — JetPack 6 / Ubuntu 22.04 upgrade — VERDICT: DEFERRED
+era-01 L2103 — First colcon build (ament_cmake missing) — VERDICT: FAILED
+era-01 L2116 — Second colcon build (invalid email in package.xml) — VERDICT: FAILED
+era-01 L2124 — Third colcon build (invalid condition in occupancy_map) — VERDICT: FAILED
+era-01 L3109 — Jetson flash attempts (VirtualBox USB driver orphan) — VERDICT: FIXED
+era-01 L3158 — package.xml emails rosdep rejected — VERDICT: FIXED
+era-01 L4016 — Pre-fix failure mode documented — VERDICT: DOCUMENTED
+era-01 L4139 — Other flash methods tried that did NOT work — VERDICT: DOCUMENTED
+era-01 L5591 — Root-cause analysis of 7 failed flash approaches — VERDICT: DOCUMENTED
+era-01 L5944 — Features adopted from Standard Bots interface — VERDICT: ADOPTED
+era-01 L6464 — Per-link URDF meshes (attempted) + `links.json` — VERDICT: ATTEMPTED
+era-01 L6670 — Static 3D model (not articulated; STEP split failed) — VERDICT: ABANDONED
+
+## v46 addendum splits (chronological)
+
+add-05 L42 — PBD API key working after account funded — VERDICT: SHIPPED
+add-05 L43 — Correction-diff capture — VERDICT: SHIPPED
+add-05 L44 — Data flywheel plan — VERDICT: DOCUMENTED
+add-05 L45 — PBD pallet-grid extraction (schema + prompt) — VERDICT: DEFERRED
+add-05 L46 — Interactive clarifications (structured questions) — VERDICT: DEFERRED
+add-05 L47 — Detect step part dropdown — VERDICT: SHIPPED
+add-05 L48 — Render-error debugging with error boundaries — VERDICT: SHIPPED
+add-05 L49 — Contoured keep-out zones (alpha-shape concave) — VERDICT: SHIPPED
+add-05 L50 — GitHub main sync to current — VERDICT: SHIPPED
+add-05 L51 — DH-accurate URDF from CAD — VERDICT: SHIPPED
+add-05 L52 — Photoneo MotionCam ARM64 confirmed — VERDICT: CONFIRMED
+add-07 L36 — Tablet polygon budget 30k triangles at export — VERDICT: ABANDONED
+add-16 L281 — Jog protocol wire-captured (Robot/jog/stopJog) — VERDICT: SHIPPED
+add-16 L282 — Driver write path with gated jog/power — VERDICT: SHIPPED
+add-16 L283 — First commanded motion 6-joint agreement — VERDICT: SHIPPED
+add-16 L284 — Dashboard jog UI evolution (step/continuous) — VERDICT: SHIPPED
+add-16 L285 — Silent-lockout catalog (state banners, guards) — VERDICT: SHIPPED
+add-16 L286 — Continuous jog jitter (three root causes fixed) — VERDICT: SHIPPED
+add-16 L287 — E-stop recovery procedure rehearsed — VERDICT: SHIPPED
+add-16 L288 — Power path enable/disable/alarm-clear — VERDICT: SHIPPED
+add-16 L289 — Joint-limit lockout + recovery modal — VERDICT: SHIPPED
+add-16 L290 — Singularity-aware speed governor (specced) — VERDICT: DEFERRED
+add-16 L291 — Collision guard system (self/ground/env) — VERDICT: SHIPPED
+add-16 L292 — Driver-down candle-pose staleness — VERDICT: SHIPPED
+add-16 L294 — OEM parity program declared — VERDICT: DECLARED
+add-21 L351 — Wait verb concluded (integer ms required) — VERDICT: SHIPPED
+add-21 L352 — Derived-pose resolver built — VERDICT: SHIPPED
+add-21 L353 — Test wizard first execution on real arm — VERDICT: SHIPPED
+add-21 L354 — J5 wrist re-solve diagnosed (movL IK) — VERDICT: SHIPPED
+add-21 L355 — Home drift normalized 96.67° — VERDICT: SHIPPED
+add-21 L357 — Controller-crash forensics via boot logs — VERDICT: PROVEN
+add-21 L358 — Driver init-grace hardening (grace + probe + backoff) — VERDICT: SHIPPED
+add-21 L360 — Speed cap raised to 0.65 — VERDICT: SHIPPED
+add-21 L361 — Collision body-test (foam block discipline) — VERDICT: ADOPTED
+add-21 L362 — Payload as per-program property — VERDICT: SHIPPED
+add-21 L363 — I/O manual actuation (gate, bridge toggles) — VERDICT: SHIPPED
+add-21 L365 — Solenoid circuit (relay required) — VERDICT: DEFERRED
+add-21 L367 — Tablet jog jitter + teach sticky-bar — VERDICT: DIRECTED
+add-21 L368 — Stability batch A–J (prompts issued) — VERDICT: DIRECTED
+add-23 L387 — Effector-aware composer (Engage/Disengage vacuum) — VERDICT: SHIPPED
+add-23 L388 — 9012 alarm postmortem (shutdown residue) — VERDICT: EXONERATED
+add-23 L389 — Zombie boot #2 (transport down) — VERDICT: EXONERATED
+add-23 L390 — Wedge 2h41m state-3 (verification loop + auto-retry) — VERDICT: SHIPPED
+add-23 L391 — Eye-in-hand mount measurements + AprilTag — VERDICT: MEASURED
+add-23 L392 — Pause/resume + paused-state + retrace home — VERDICT: DIRECTED
+add-23 L393 — Pre-move network prep — VERDICT: PLANNED
+add-23 L394 — Bring-up at new shop (physical layer wins) — VERDICT: SHIPPED
+add-23 L395 — Router saga (factory reset, self-provision) — VERDICT: RESOLVED
+add-23 L396 — Joint-angle display + match selector — VERDICT: DIRECTED
+add-23 L397 — Named positions (linking, sync, cross-device) — VERDICT: SHIPPED
+add-23 L398 — Two-pair anchor bug (prompt authored) — VERDICT: DIAGNOSED
+add-23 L399 — Accept-binding disease (recompose server-side) — VERDICT: SHIPPED
+add-23 L400 — Program library delete 404 — VERDICT: DIAGNOSED
+add-23 L401 — J4 solved via flight recorder (seeded IK) — VERDICT: SHIPPED
+add-23 L402 — Vision reset (renderer + matcher gate) — VERDICT: SHIPPED
+add-23 L403 — Fixed-cam vision-guided picking prompts — VERDICT: DIRECTED
+add-23 L404 — Cloud recognition pilot (RunPod, domain-randomized) — VERDICT: LAUNCHED
+add-24 L408 — J4 recurrence (stale-service staleness layer) — VERDICT: SHIPPED
+add-24 L409 — 7.6° reframe (endpoint arithmetic) — VERDICT: EXONERATED
+add-24 L410 — Video + J2 revelation (path hump) — VERDICT: DIAGNOSED
+add-24 L411 — Trajectory-level analysis prompt — VERDICT: DIRECTED
+add-24 L412 — Motion profiles (Straight vs Fast) — VERDICT: DIRECTED
+add-24 L413 — Speed ceiling to 100% — VERDICT: DIRECTED
+add-24 L414 — Joint values + match selector — VERDICT: DIRECTED
+add-24 L415 — PBD multiplicity (three-bowl count) — VERDICT: DIRECTED
+add-24 L416 — Editable review + corrections ledger — VERDICT: DIRECTED
+add-24 L417 — Learning-store truth documented — VERDICT: DOCUMENTED
+add-24 L418 — Hiring plan (two engineers) — VERDICT: PLANNED
+add-24 L419 — Drag button config checklist + cell-scoped zones — VERDICT: DIRECTED
+add-24 L420 — ROI math + factory-UI shopping list — VERDICT: DOCUMENTED
+add-27 L450 — Pallet teach flow (six iterations, completed) — VERDICT: SHIPPED
+add-27 L451 — Drag mode works (Auto was blocker) — VERDICT: SHIPPED
+add-27 L452 — Teachability positive-list law — VERDICT: SHIPPED
+add-27 L453 — Program doctrine (D1–D10) — VERDICT: DOCUMENTED
+add-27 L454 — Validator consolidation (17 checks, one door) — VERDICT: SHIPPED
+add-27 L455 — Sync convergence (never confidently behind) — VERDICT: SHIPPED
+add-27 L456 — Self-collision stand-down + jog cutout fixes — VERDICT: DIRECTED
+add-27 L457 — AUTO-DEPLOY ON COMMIT (root-cause fix) — VERDICT: SHIPPED
+add-27 L458 — Confirm-capture fork unification — VERDICT: DIRECTED
+add-29 L467 — Resident-mismatch banner root-cause diagnosis — VERDICT: EXONERATED
+add-29 L468 — Load rollback (currentProgram follows push) — VERDICT: SHIPPED
+add-29 L469 — Five-hour ghost state unmasked — VERDICT: PROVEN
+add-29 L470 — Forensics: three kills, one line (movJCoorRel arity) — VERDICT: PROVEN
+add-29 L471 — Pending-pose quarantine + arity validation — VERDICT: SHIPPED
+add-29 L472 — Link-down honesty + D15 blend check — VERDICT: SHIPPED
+add-29 L473 — Operator toast copy (title/detail/technical) — VERDICT: SHIPPED
+add-29 L474 — Pallet-frame fork kill (backend-only validation) — VERDICT: SHIPPED
+add-29 L475 — Fork registry + `fork_lint` gate — VERDICT: SHIPPED
+add-29 L476 — RECORD-THROUGH teach state (server-owned drafts) — VERDICT: SHIPPED
+add-29 L478 — PBD determinism (pure composer, no detect) — VERDICT: SHIPPED
+add-29 L479 — Unit lie (meters vs mm check) — VERDICT: SHIPPED
+add-29 L480 — J6 clamp silent-firing convicted — VERDICT: CONVICTED
+add-30 L483 — J6 clamp trap (escape-direction rule) — VERDICT: DIRECTED
+add-30 L484 — Pallet-pitch validator doctrine (corners=frame) — VERDICT: DIRECTED
+add-30 L485 — Teach-session lock (four incidents → device-identity fix) — VERDICT: DIRECTED
+add-30 L486 — PBD determinism (composer pure function, home unify) — VERDICT: DIRECTED
+add-30 L487 — Run-refused modal copy fork — VERDICT: DIRECTED
+add-30 L488 — Disk-full cascade (root-cause audit) — VERDICT: PROVEN
+add-30 L489 — Atomic recovery (507-on-ENOSPC + refresh + watchdog) — VERDICT: SHIPPED
+add-30 L490 — Code review (device-identity-per-tab root of all locks) — VERDICT: AUDITED
+add-31 L495 — Enable-button blast-radius verification — VERDICT: SHIPPED
+add-31 L496 — Deploy was lying (hashing wrong file) — VERDICT: FIXED
+add-31 L497 — Stale-bundle browser cache — VERDICT: SHIPPED (2026-08-24, sha edbfee0..: vite outDir + `_STATIC_DIR` unified to `frontend/dist`; `index.html` served with `Cache-Control: no-cache, no-store, must-revalidate`; startup assertion `_assert_frontend_coherent()` refuses to boot if index.html is missing or its referenced `/assets/index-*.js` chunk isn't on disk — fail-loud replaces silent-broken-shell)
+add-31 L498 — Jog jitter (WiFi exonerated, lock contention convicted) — VERDICT: FIXED
+add-31 L499 — Palletize subroutine (real cycle with I/O) — VERDICT: SHIPPED
+add-31 L500 — Performance-drop reckoning + verification gate — VERDICT: ADOPTED
+add-31 L501 — Network IP-wander (WiFi DHCP vs robot static) — VERDICT: DIAGNOSED
+add-31 L502 — Cell Box I/O architecture (EtherNet/IP valve island) — VERDICT: SPEC'D
+
+## Post-v46 addenda
+
+add-34 L519 — F1 scope: jog bridge via seam — VERDICT: SHIPPED
+add-34 L520 — F1.0 hybrid coexistence (CRI + WS) — VERDICT: PASS
+add-34 L521 — F1.1 bridge physics + state machine — VERDICT: SHIPPED
+add-34 L522 — F1.2 mock scenarios (stuck-CANCELING race found) — VERDICT: FIXED
+add-35 L524 — Bring-up gauntlet (four failures) — VERDICT: RESOLVED
+add-35 L525 — Rung 1 + Rung 2 (first human jog 12/12) — VERDICT: PASS
+add-35 L526 — Hold defect parked with diagnostic pre-written — VERDICT: PARKED
+add-36 §528 — Hold defect root-caused (watchdog flap + stale bundle) — VERDICT: NAMED
+add-36 §528 — Regression `test_jog_hold_heartbeat` 5/5 — VERDICT: PASS
+add-36 §528 — In-vitro dashboard hold (27 events, 100ms cadence) — VERDICT: EXONERATED
+add-36 §528 — Bridge SM simulation (27 goals, +81° over 3s) — VERDICT: EXONERATED
+add-36 §528 — Watchdog 1.0→3.0s + hysteresis + flip counters + `CAMERAS_DISABLED=1` — VERDICT: SHIPPED
+add-36 §529 — Safety-edge margin retune (measured latency, 5° cap) — VERDICT: DIRECTED
+add-36 §530 — Recovery modal lifecycle (hold-persistent, Done-gated) — VERDICT: DIRECTED
+add-36 §531 — Palletizing defects scoped (slot-1 regression, double-descend) — VERDICT: DIAGNOSED
+add-36 §532 — Ledger restructure (split into distillates + archive) — VERDICT: SHIPPED
+add-37 §534 — LESSONS extraction methodology audit (heading vs list format) — VERDICT: DOCUMENTED
+add-37 §534 — docs/ATTEMPTS.md + build_full_ledger.sh + ledger_lint.py — VERDICT: SHIPPED
+add-37 §535 — Dashboard drop-in JOG_BACKEND=ros2 + CAMERAS_DISABLED=1 — VERDICT: SHIPPED
+add-37 §535 — Frontend rebuild + served-bundle hash verify (`index-CPjpRuaL`) — VERDICT: SHIPPED
+add-37 §535 — jog_bridge null-tolerance (int(x or 0) × 6 sites) — VERDICT: SHIPPED
+add-37 §536 — Stop roboai-estun to clear jog_bridge two-backend safety refusal — VERDICT: RESOLVED
+add-37 §537 — cri_teardown after SIGSEGV + relaunch — VERDICT: RESOLVED
+add-37 §537 — CRI motion relaunch with use_mock:=false (real hardware) — VERDICT: FIXED
+add-37 §538 — Teach-promote refusal forensics (pending_poses, not ownership) — VERDICT: DIAGNOSED
+add-37 §538 — §490 device-identity fix status audit (localStorage + ghost amnesty + heartbeat) — VERDICT: CONFIRMED
+
+session-2026-08-24 — Dashboard fanout publisher `/dashboard/jog_session_events` moved to eager `__init__` (was lazy-created on first fanout, losing DDS discovery race under RELIABLE+VOLATILE, so first press after any restart silently dropped) — VERDICT: SHIPPED (sha 830fc4a..HEAD; closes another instance of the [[cobot-dds-lazy-publisher-hazard]] class, matching the pattern the `/estun/program` publisher already used per its eager-init rationale at dashboard_server.py:1365)
+
+add-38 §539 — vite outDir + `_STATIC_DIR` unified to `frontend/dist`, `index.html` served with `Cache-Control: no-cache, no-store, must-revalidate`, and startup assertion `_assert_frontend_coherent()` refuses to boot on missing/mismatched chunk — VERDICT: SHIPPED (sha 830fc4a; also flipped L497 DIRECTED→SHIPPED above)
+add-38 §539 — `_on_joint_states` normalizes msg.name/position to canonical `[Joint1..Joint6]` before writing STATE (JSB was publishing insertion-order `[Joint2, Joint3, Joint1, …]`; yaml's own head comment predicts this fallback) — VERDICT: SHIPPED (sha b1729b4; server-side workaround, root-cause spawner-param investigation queued for F3)
+add-38 §540 — `_apply_cri_proxy_authority(r)` extracted from `_on_joint_states` and called from all three of `_on_joint_states`/`_on_estun_status`/`_on_estun_mode` so last-writer-wins races can't flip authority under `JOG_BACKEND=ros2` — VERDICT: SHIPPED (sha f100fc7)
+add-38 §540 — `/etc/systemd/system/roboai-estun.service.d/f1_monitor_only.{conf,env}` drop-in forcing `ESTUN_MONITOR_ONLY=true`, `ESTUN_ALLOW_JOG=0` — VERDICT: SHIPPED (dropin lives on disk on the Jetson; not tracked in git; retire when F3 formalizes)
+add-38 §545 — Reference tier built (HARDWARE.md 3.2K→17.5K, OPERATIONS.md NEW 15K, FACTS.md NEW 9.4K, INDEX.md +REFERENCE section, CLAUDE.md session-start 5→8 files + new doctrine) — VERDICT: SHIPPED (sha edbfee0)
+add-38 §543 — jog_bridge `_do_send_goal` populates `p0.velocities = p1.velocities = signed_vel` on target joint so consecutive JTC goals stitch as constant-velocity segments (empty velocities → vel=0 boundary → 10 Hz brake-restart on preempt → audible hunting on real gearbox) — VERDICT: PARTIAL SHIPPED (CodroidROS2 sha 80d65dd; throughput reduced hunting but residual oscillation still present at 10%×1500 ms, full-rate trace captured at ~/cri_eval_ws/f1_2_scenarios/evidence/2026-08-24_hunt_trace/ for next-session analysis; rungs 3-6 blocked)
+add-39 §548 — Read `controller_state.reference.velocities` as ground-truth reference velocity — VERDICT: REJECTED (it's a constant echo of the field the bridge stuffed into `p0/p1.velocities`, not a derivative; first-pass verdict script reported "smooth reference" incorrectly. Truth lives in `d/dt reference.positions`.)
+add-39 §549 — Phase-1 hunt-trace analysis of `~/cri_eval_ws/f1_2_scenarios/evidence/2026-08-24_hunt_trace/hunt_10pct_1500ms/` (876 controller_state @146 Hz + 1491 joint_states @248 Hz over 6 s; motion window 3.264→6.010 s) using `d/dt reference.positions`: reference position rate reverses sign 20× during a monotonic hold (peak +105 °/s, peak −315 °/s vs commanded +18 °/s), flat 59 % / jumping 41 %, ~12.7 Hz cadence matches 100-ms preempts; realized 9.6 %; `JTC.output == JTC.reference` (fix must land upstream of JTC) — VERDICT: DIAGNOSED (goal-seam confirmed; velocity-populate fix reduced but did not remove the position discontinuities at preempt boundaries)
+add-39 §553 — jog_bridge `_build_goal` anchors target-joint `p0.position` on the extrapolated JTC reference cursor `(_prev_emit_p0_target_pos + _prev_emit_signed_vel × min(elapsed, _prev_emit_duration_s))` instead of on live fb_pos; cursor invalidated on joint switch, direction flip, and any IDLE reset; safety guard `|cursor − fb| > Config.cursor_max_deviation_rad` → fall back to fb + increment `sm.cursor_guard_fallbacks`; fb-past-effective-range in commanded direction promoted to early safety refusal (60/60 tests pass) — VERDICT: SHIPPED (CodroidROS2 sha 113e3f3; verified on real arm 2026-08-24 16:07 CDT J6+ 10% × 1.5 s: +28.87° over 1.5 s, 106.9 % realized, 14 goals dispatched with 0 rejects; but 5° guard threshold introduced a new residual — see §554)
+add-39 §554 — `Config.cursor_max_deviation_rad` bumped 0.0873 → 0.15 rad (5° → 8.6°) after 5° threshold collided with the ~4.7-5.0° steady-state tracking error under 200 ms horizon × 18 °/s command, producing a -1272 °/s single-sample step-back at t=21.728 s in the 2026-08-24 v3 confirming trace when guard flip-flopped cycle-to-cycle — VERDICT: SHIPPED (CodroidROS2 sha f6d4d53; verified 2026-08-24 16:26 CDT on v4 bag: peak d/dt ref − reads +0.00 °/s exact, 0 sign reversals across 402 samples, 0 samples < −25 °/s, realized 79.5 %, sign changes 28→0 vs goal-seam baseline)
+add-39 §555 — populate `.accelerations = [0.0]*N` on the JointTrajectoryPoint p0/p1 in `jog_bridge_node._do_send_goal` to stop JTC's cubic-spline solver from synthesizing forward-only overshoots at each 100-ms goal boundary (peak +76.49 °/s single-sample transient observed in v4 bag; all forward, gearbox absorbs without reversal) — VERDICT: DEFERRED (Path B P3 polish per operator direction 2026-08-24; not blocking rungs 3-6; revisit if soak surface accumulation)
+add-39 §556 — bridge-uptime degradation observed on same jog_bridge process (~35 min uptime): inject 2 fresh moved +28.87° (106 % realized), injects 3-4 on same process moved +3.6° (13 %) then +0° (0 %); SM logged clean `_dispatch(send_goal)` at each event but only ONE goal reached JTC per session (reference moved for the horizon then held); fresh restart cured it instantly; wire echo confirmed events crossed on all attempts; suspected ActionClient handle leak / DDS state issue — VERDICT: DIAGNOSED (separate F3 hardening class; workaround for F1 is fresh restart before each formal test; do NOT let bridge accumulate uptime before rungs)
+add-39 §557 — dashboard binds `:8080` to a single interface (currently wired eno1 `.2.246`); Wi-Fi `.1.246:8080` cannot serve simultaneously so operators on Wi-Fi hit the same-`/24`-fight class (§124 CRITICAL) when the wired path is intermittent — DEFERRED (F3 fix: bind to `0.0.0.0` so both NICs serve; documented in HARDWARE.md Subnet map on 2026-08-25 as the STABLE-path preference is now wired `.2.50 → .2.246`)
+add-40 §558 — goal-replacement `jog_bridge` primitive (bridge SM sequences preempted `FollowJointTrajectory` goals @ 100 ms cadence): tripped J2 drive on velocity spike after rung 3 restart. Even with the addendum-39 reference-cursor anchor + 8.6° guard shipping, the underlying preempt-seam architecture kept producing single-cycle velocity discontinuities that the drives eventually rejected. Wrong primitive for continuous jog on this hardware — VERDICT: RETIRED (jog moved to moveit_servo → jog_servo_adapter path; do not revisit)
+add-40 §559 — moveit_servo → JTC (`splines`) termination: mock trace showed a 35 Hz mechanical ring in reference. JTC cubic-spline resampling wobbles an already-smooth Servo stream. Same class as §543 arriving via a different upstream — VERDICT: REVERTED (replaced by moveit_servo → JointGroupPositionController passthrough in `d6bb65e`)
+add-40 §560 — bump `joint_limits.yaml` `max_acceleration` 2.0/2.5 → 20.0 for all six joints (Phase E mock values were sized for Pilz planning, not runtime jog; Servo's JointJog integrator was clamping realized velocity to 1–2 %) — VERDICT: SHIPPED (`f0e2930`; Pilz planning scaling factors still provide planning-time safety headroom)
+add-40 §561 — bump `cri_tcp_setup.yaml` `max_step_rad` 0.002 → 0.005 (was riding Servo's 0.108° per-cycle deltas as the last throttle; new value ≈ 71 °/s slew ceiling — well above any operator command; `jointCollisionSensitivity=80` remains the physical safety net) — VERDICT: SHIPPED (`f0e2930`)
+add-40 §562 — `use_smoothing: false` in `servo.yaml`: NO-OP under moveit_servo Humble 2.14.1 (parameter does not exist). Smoothing is controlled solely by presence/absence of `smoothing_filter_plugin_name`. Setting `use_smoothing:false` while `smoothing_filter_plugin_name` is populated leaves Butterworth active — VERDICT: DOCUMENTED (workaround: near-transparent Butterworth coefficient at 0.001, or drop the plugin_name entirely and accept moveit_servo's boot refusal)
+add-40 §562 — raising velocity cap / `max_step_rad` / `joint_limits.max_acceleration` alone: did NOT fix the creep, then caused the trip. Root cause was per-cycle acceleration at the firmware, not any single cap in the ROS2 chain — VERDICT: DIAGNOSED (motivates the §562 accel-ramp adapter; see LESSONS L271)
+add-40 §562 — `jog_servo_adapter` accel-ramp integrator bypassing moveit_servo (18 rad/s² per-cycle cap; `cur_cmd_vel` ramps toward `target_vel`; `cur_cmd_pos` integrated per tick; published as `Float64MultiArray` on `/joint_group_position_controller/commands`): mock verdict CLEAN — VERDICT: SHIPPED (`f0e2930`; real-arm first-motion smooth, then §563 guard-snap tripped 2015)
+add-40 §562 — moveit_servo `AccelerationLimitedPlugin` (`online_signal_smoothing::AccelerationLimitedPlugin` in `moveit_core` 2.15): built-in fix for the per-cycle acceleration constraint that §562's adapter solves out-of-tree. Not yet evaluated for Humble 2.14.1 backport availability; grep-check next session before considering replacement — VERDICT: PLANNED (adapter is authoritative until then)
+add-40 §563 — divergence-guard snap re-sync (single-tick `cur_cmd_pos := fb; cur_cmd_vel := 0` when `|cmd − fb| > 5°`): the guard itself produced a Δv/cycle above CC10-A's ~25 rad/s² ceiling → tripped alarm 2015 on the phantom stale-tab event (§565). Replaced with a sticky two-phase settling state (Phase 1 vel-decel at `max_accel`; Phase 2 pos-slew at bounded `sync_slew_rate`; new events rejected during settle). Max Δref/tick through the entire recovery equals the normal steady-state jog Δref — VERDICT: FIXED (`cb022d3`; mock guard-test PASS, settle ≈ 990 ms for 5° divergence)
+add-40 §565 — phantom jog session from stale browser tab on `192.168.1.111` (fired ~33 s post launch, before operator's inject; `hold_id=5jvotrcpge speed_pct=22.0`; source: `JogControls.jsx:91` `Math.random().toString(36).slice(2, 12)`). Dashboard restart cleared; 30 s idle monitor confirmed zero uncommanded events — VERDICT: FIXED (operationally; server-side debounce of queued-hold-on-WS-reconnect deferred to F3)
+add-40 §566 — post-2015 wire-only recovery (`System/ClearError` → `Robot/switchOn` → re-issue `CRI/StartDataPush` + `CRI/StartControl`): cleared errors[] and `state → 2` but NOT `recoveryState`. Physical controller power-cycle was the only path that cleared `recoveryState=1 → 0`. Post-power-cycle sequence verified in-session — VERDICT: DOCUMENTED (only path for `recoveryState=1`; F3 investigate why wire recovery is insufficient)
+add-41 §569 — idle re-seed in `jog_servo_adapter`: while `hold_id is None` AND at rest, track fb per-tick bounded by `sync_slew_rate × dt`; add encoder-LSB deadband (5e-5 rad) so `RobotStatus.isMoving` stays 0 during genuine idle. Eliminates stale-idle-pose snap on next hold-start (root of the 2015 trip on 2026-08-25) — VERDICT: SHIPPED (`c86ca60` + `e46887c`)
+add-41 §569 — name-map rebuild in `jog_servo_adapter`: `_js_name_to_idx` regenerates whenever `msg.name` differs from cached tuple; logs a WARN on order change (JSB spawner-param fallback flips joint order mid-run, LESSONS L260) — VERDICT: SHIPPED (`c86ca60`)
+add-41 §569 — startup saturation invariant in `jog_servo_adapter`: WARN (not refuse) if `vel_cap_frac × max_joint_vel > 0.8 × plugin_max_slew_rate`. Current config violates (1.571 > 1.000) → plateau above ~79.6 % speed_pct; not a safety hazard but a per-jog-% honesty flag — VERDICT: SHIPPED (`c86ca60`)
+add-41 §570 — real-arm small bite (J6+ 5 % × 0.5 s) + Rung 3 (J6+ 3 s @ 10 %) on `af24198` baseline: cmd Δ = actual Δ to 0.000° tracking, zero errors, guard silent. Rung 3 peak |cmd-fb| = +4.47° (right at the old 5° threshold edge) foreshadowed §571 — VERDICT: PASS (evidence at `2026-08-26_F1_close/small_bite/` and `.../rung3/`)
+add-41 §571 — flicker mechanism hypothesis 1 (guard-readopt loop): ruled out. Adapter log shows 0 `REFRESH-adopted-as-START` events and 15 `PHANTOM-REJECT` events cleanly rejecting refreshes after each halt. Phantom defense (`9241be5`) already provides sticky-halted-hold_id behavior — VERDICT: EXONERATED (no code change; existing defense sufficient)
+add-41 §571 — flicker mechanism hypothesis 2 (saturation): ruled out. Live plugin boot line `max_step_rad=0.0050` (matches disk `cri_tcp_setup.yaml`); slew ceiling 1.25 rad/s vs 22 % wire commanding 0.69 rad/s — VERDICT: EXONERATED (config verified end-to-end)
+add-41 §571 — flicker mechanism hypothesis 3 (dueling consumers): ruled out. `pgrep jog_bridge` empty; dashboard :8080 clients = `192.168.2.50` only; `/dashboard/jog_session_events` publishers = `dashboard_server` only — VERDICT: EXONERATED
+add-41 §572 — divergence_threshold_rad 0.087 (5°) → 0.175 (10°): mechanism CONFIRMED as arm response latency (~250 ms) × commanded velocity. At 22 % wire (0.69 rad/s) cmd advances 7-8° in the arm's response window and tripped the old 5° threshold; new 10° accommodates any speed up to plugin ceiling. Runaway detection unchanged — VERDICT: SHIPPED (`af24198`; retest at 5 % × 0.5 s shows guard silent, |cmd-fb| SS = 0.000°)
+add-41 §573 — DDS start-drop race in `f14_inject.py`: 500 ms publisher-creation-to-emit gap occasionally loses the START event to DDS discovery (refreshes/stop arrive fine at subscriber). Workaround `/tmp/hardened_inject.py` uses `pub.get_subscription_count() > 0` wait-loop before first emit — VERDICT: DIAGNOSED + WORKAROUND (promote wait-loop into `f14_inject.py` as F3 hardening)
+add-41 §574 — rungs 4-6 + deadman A/B + 60 s soak: intended F1 close-out but flicker diagnosis + retest consumed the session — VERDICT: DEFERRED (next session on `af24198`)
+add-42 §577 — 2015 trip at 24 % wire: two hypotheses tested. (a) bursty adapter delivery: bag showed 92 msgs/motion within <1 ms of prior after 10-60 ms stalls; peak Δv adjacent-msg = 9.6 rad/s (2400 rad/s² equivalent). CONFIRMED. (b) clamp_step engage/release boundary: commanded velocity 0.754 rad/s at 24 %, far below 1.25 rad/s ceiling; plugin's clamp was never engaged. RULED OUT — VERDICT: DIAGNOSED (mechanism = burst delivery + no RT-side accel invariant)
+add-42 §578 — RT-side per-cycle acceleration clamp in `CriUdpSystem::clamp_accel_step`: track `prev_step`; clamp `this_step` to `prev_step ± max_accel_step_rad`; xacro param default 0.00032 (= 20 rad/s² × dt²); state field `pos_cmd_prev_sent_` seeded from feedback. 10-case standalone unit test PASS. Closes L271 as an RT-side invariant — VERDICT: SHIPPED (`c66c8f0`; hardware verification gated on power-cycle recovery)
+add-42 §579 — jog_servo_adapter `max_accel_rad_s2` interim 18 → 12: belt-and-suspenders while plugin clamp is unverified on hardware. 12 × 1.4-jitter = 16.8 rad/s²/cycle under CC10-A's 25. Revisit upward after retest — VERDICT: SHIPPED (`c66c8f0`)
+add-42 §580 — post-2015 recovery attempt: `System/ClearError + Robot/switchOn` cleared `state → 2` but `recoveryState=1` PERSISTS — VERDICT: DOCUMENTED (only path is physical power-cycle; extends addendum-40 §566)
+add-43 §583 — RT-side clamp engagement counter in `CriUdpSystem::clamp_accel_step`: counts per-joint engagements; write() logs a WARN at ~1 Hz when the counter advances. Standalone unit test extends from 10 → 14 cases (adds counter tests + nullptr safety), all PASS — VERDICT: SHIPPED (`8944a4c`; observability for the operator's "clamp counter per session" acceptance criterion)
+add-43 §584 — adapter runtime velocity ceiling: param `plugin_max_slew_rate_rad_s` (read from `cri_tcp_setup.yaml` via `cri_config.load_cri_config()` — same source as plugin), derived cap at 0.8 × plugin_max_slew_rate enforced per tick. Prevents cmd from ever racing ahead of fb into divergence at high speed_pct. Banner surfaces both values at boot — VERDICT: SHIPPED (`8944a4c`)
+add-43 §585 — guard-readopt blacklist: `_halted_hold_ids` list (ring-cap 256); any halt path appends `hold_id` before clearing; event dispatcher rejects blacklisted hold_ids with `READOPT-REJECT` and bumps `stats.readopt_rejects`. Keepalives of the press that caused a halt can never restart motion — VERDICT: SHIPPED (`8944a4c`; closes the class permanently)
+add-43 §587 — CRI :9001 verb enumeration (Option A, no arm motion): 20 candidate verbs. None returned `db:null` success. Two response patterns for unrecognized: explicit `err:404/unkown request` (Jog/*, Manual/Jog) vs. ambiguous echo `{id,ty}` with no db field (Robot/Jog*, Robot/JointJog, CRI/Jog*, Robot/MoveJoint, Robot/StepJoint, Robot/ManualJog) — VERDICT: DIAGNOSED (no native jog verb exposed; UDP-setpoint path via cod_cri_hardware is the only jog primitive on this controller)
+add-44 §591 — post-power-cycle real-arm small bite J6+ 5% × 0.5s on `8944a4c`: cmd Δ = actual Δ = +1.97°, |cmd-fb| SS = 0.000°, guard silent, no alarm — motion PERFECT. But `accel_clamp` fired 196 times during the ~1 s session. Bag inter-msg dt p99=18.5 ms, max=28.1 ms, 34 msgs <1 ms — jitter class remains upstream — VERDICT: PASS on motion, FAIL on the "clamp counter must be 0" acceptance criterion. Session STOPPED per operator directive.
+add-44 §594 — the RT-side plugin clamp (add-42 §578) is correct and effective; adapter velocity ceiling (add-43 §584) is honored; guard-readopt blacklist (add-43 §585) is silent under clean operation. divergence_halts = 0. Python-timer jitter class is NOT closed — the plugin's RT-clamp absorbs it every time — VERDICT: DIAGNOSED (backstop works; upstream is not RT-clean)
+add-44 §595 — escalation to WS-fallback jog path via `:9000`: bypasses Python timer entirely; used by the factory UI on `:9198` for its own jog primitives. Next: grep :9198 browser UI bundle for jog verbs; enumerate `:9000` jog/*, manual/* verbs; compare with the CRI-UDP-setpoint path on RT-cleanliness / testability / ROS2 integration — VERDICT: OPEN (report only next session; no arm motion until choice class resolved)
+add-45 §596 — post-JOG-10 real-arm retest at 22% (2 presses, dir +/−). Both DIVERGED before arm moved — measured ~500 ms J6 dead time before ANY fb motion. Cmd advanced 13.4° during dead time → guard fired at 10.03° → settling streamed multi-joint pos slew → non-jog J3 saw −0.82° swing → jointCollisionSensitivity=80 tripped 2009. Fingerprint bag `press_trace_bag4`, hids `5m0sbn6z1d`/`69lacogs6d`. VERDICT: RETIRED (streamed-jog cmd cannot lead fb by more than the divergence budget; class architecturally unfixable in software)
+add-45 §597 — streamed jog retired at CodroidROS2 launch level: `use_servo` default true → false; `jog_servo_adapter` package + `CriUdpSystem` RT accel clamp stay in-tree (clamp still needed for F2 program-execution edge cases). ALLOW_MOCK+use_servo assertion untouched. Adapter code with JOG-10 (a)+(d)+(b'-off) remains buildable — VERDICT: SHIPPED (`4671c97`; re-arming requires `use_servo:=true`, no code churn)
+add-45 §598 — WS-jog reinstated: `f1_monitor_only.env` `ESTUN_MONITOR_ONLY=false, ALLOW_JOG=1, ALLOW_MOVE=0, ALLOW_CARTESIAN=0`; `campaign-f1.conf` `JOG_BACKEND=ws`. `daemon-reload + enable + start roboai-estun + restart roboai-dashboard`. 3-part check PASS: jog_bridge=0 instances, `/estun/mode.allow_jog=true`, dashboard MainPID env `JOG_BACKEND=ws` — VERDICT: SHIPPED (drop-ins are systemd, not versioned; noted in OPERATIONS §7)
+add-45 §599 — motion arbiter (JOG-11): jog and program-run mutually exclusive at dashboard server. `_arbiter_probe_program_running` (state∈{2,3}), `_arbiter_probe_jog_active` (\|_active_holds\|>0); refusal returns 409 with reason_code + operator_copy. Release/stop bodies ALWAYS pass. Doctrine test 12/12 PASS — VERDICT: SHIPPED (`e02aad3`; NON-NEGOTIABLE per operator directive)
+add-45 §600 — add-16 §286 three-fix verification: F1 React identity churn REPLACED by stronger `setPointerCapture`+`onPointerLeave` model; F2 HTTP backlog + clock-skew regression fixes ALL retained (`AbortController`, `server_seq` dominant clock, `holdTicker coalesce_ms=40`); F3 GIL starvation retains `run_in_executor` + STRENGTHENED to `holdTicker.js` in a web worker + keepalive on a **native thread** at 100 ms (not asyncio, drift 50–300 ms) — VERDICT: VERIFIED STILL PRESENT
+add-45 §601 — 9012 forensics: dashboard controller-side proxy had NO disconnect/timeout at 10:37 (rules out whole-controller instant drop); browser-side WS 1001 disconnects are non-diagnostic; controller `:9198` SPA bundles log-fetch endpoints (unreachable from Jetson HTTP); WS `:9000` has no error-history verb; `0x2058` subcode undecoded (no drive-manual table in repos) — VERDICT: LOW-CONFIDENCE drive-fault-cascade hypothesis, needs browser :9198 log page + drive manual to tighten
+add-45 §603 — 0x2058 decode second-pass: operator noted public ProNet A.xx tables don't apply (S10-140 uses integrated joints with a different encoding) and directed grep of on-hand S-Series Gen2 hardware / software / CN SGS manuals. Full-disk search on the Jetson (find / -iname "*.pdf"): 12 matplotlib icons + 1 libreoffice error PDF, no manuals. Chinese-script grep (欠压 / 伺服错误): only in own conversation history. Downloads folder: ledger exports, no manuals. estun_driver's 2000-code docstring carries no subcode notes. `2058` hit in `estun_posture_20260709_125017.jsonl` is a coincidental substring inside a publish/RobotStatus JSON payload — not the error subcode. VERDICT: DECODE BLOCKED (no manual on Jetson to grep against); §601 confidence remains LOW; owed action moves to operator to supply the manual OR provide a decode from an off-Jetson source
+add-46 §603 — F1.3 slider-truth doctrine test (5 invariants: bit-identical hold-branch, no speed_pct in increment, integer-rounded label + step={1}, no speed_pct in release/stop, cartesian same 1:1). Under WS-jog display=wire is already true at the code level; the addendum-40 §565 divergence was a stale-tab persistence artifact of the retired ros2 path. No code change needed — the pin locks the invariant against future refactors — VERDICT: SHIPPED (`2a02cb4`; 17 cases in dashboard test/ green now: 12 JOG-11 arbiter + 5 wire-truth)
+add-46 §605 — F2.5 palletize defects diagnostics: BOTH CLOSED at code level. 7 named pins pass (`test_slot_along_row_axis_steps_pitch_row`, `test_slot_along_col_axis_steps_pitch_col`, `test_pick_block_replay_repeats_pick_contact_reference`, `test_refuse_pallet_when_dims_missing`, `test_refuse_pallet_when_loop_count_exceeds_capacity`, `test_pick_sequence_single_descend_before_vacuum_on`, `test_no_pick_approach_lift_in_cycle`). The 27 failing tests are the pre-existing `holepartpalletize` IK-fixture atomicity class — DESIGN, not live defects. Real-arm end-to-end verification of pallets belongs to F2.7 — VERDICT: DIAGNOSED (owed only real-arm confirmation)
+add-46 §606 — F2.6 executor architecture (new package `s10_140_executor` in CodroidROS2). Three gates + node skeleton + 24 unit tests, all PASS. Validators (L222 — pre-submit joint-limit + delta-reachable + tcp workspace-bounds + composite dispatch). Settle (L220 — ring-buffered rolling window, 2 LSB tolerance, 500 ms window, 15 s timeout, three terminal states). Silent-refusal (feedback-delta verification distinguishing arm-didn't-move from arm-missed). Executor node wires them + publishes `program_state ∈ {2, 3}` for the dashboard arbiter to mirror — VERDICT: SHIPPED (`bba8cea`; F2.7 TODO surface explicit in the code: real WS four-tuple probe, MoveGroupInterface plan, JTC action client, I/O ack wait, pause/resume/stop wiring)
+add-46 §608 — F1 formally CLOSED (code-layer): architecture flip (add-45) + arbiter (add-45 §599) + slider truth pin (add-46 §603) + add-16 verification (add-45 §600). F1.1 (WS-jog acceptance) + F1.2 (arbiter live-fire) are code-complete; operator-cued live-fire tests wait on physical power-cycle. F2 STARTED on `bba8cea` executor baseline with F2.5 diagnosis + F2.6 skeleton done; F2.7 (first taught program end-to-end on real arm) is the next milestone — VERDICT: F1 CLOSED at code layer, F2 STARTED
+add-47 §609 — F1.1 formal sweep on the real arm (6 joints, mid + full slider, J6→J1 order). 24 hold sessions logged in `/tmp/wire_mon.log` + bag `/tmp/f11_bag`. Release→last-frame latencies 4–56 ms across all sessions, no `/estun/rejected` frames, no phantom starts. Operator verdict: pendant-grade feel on all six joints — VERDICT: PASS
+add-47 §610 — F1.1 tab-kill deadman: J6 mid-range low-speed hold, browser tab killed mid-hold. WS-disconnect handler translates `WebSocketDisconnect(1001, '')` into an explicit release payload; driver logs `Robot/stopJog sent (cause=release_cmd)` — NOT `cause=freshness_deadman`. End-to-end operator-refresh → wire stopJog measured at **~50 ms**. Phantom check: 96 START/RELEASE pairs total, no new events after tab-kill. Blacklist + JOG-3 + JOG-11 chain working together — VERDICT: PASS
+add-47 §611 — F1.2 arbiter direction 1 live-fire: operator holds J6 at 84%, test POSTs `/api/estun/program/run` while jog active. Dashboard `_arbiter_refuse_run_if_jogging()` fires at handler entry, returns HTTP 409 in **10.5 ms** with `reason_code=jog_active`, `jog.hold_ids=["bspqyrptsu"]` matching wire_mon's captured `hold_id=bspqyrpt`. Real `_active_holds` state, not injected. Direction 2 (jog-during-running-program → 409) folded into F2.7 first-taught-program milestone to cover the state-propagation path (from `/estun/program_status` through the dashboard's mirror) that could lie under a bad implementation, without a synthetic ALLOW_MOVE lift for a spurious wait-only program — VERDICT: DIRECTION 1 PASS, DIRECTION 2 PASS-PENDING-F2.7
+add-47 §612 — Twin phantom-feedback class ended (third and final incident). Root cause: dashboard's `_on_joint_states` looked up canonical `Joint1..Joint6` (CRI-JSB convention) but roboai-estun publishes `joint_1..joint_6` (lowercase); the case-mismatched lookup wrote all-zeros to `STATE.joints.positions` every frame, racing `_on_estun_status`'s real writer. Structural fix (`09f3158`): bind consumption to JOG_BACKEND (each mode has ONE authoritative source, other is IGNORED-and-counted) + all-zeros quarantine safety net (impossible telemetry under state=2 is rejected). Doctrine test 13/13. Dashboard suite total: 30/30 (12 arbiter + 5 wire-truth + 13 phantom-feedback) — VERDICT: CLASS ENDED
+add-47 §614 — F1.5 step 1 recon (off-arm, during F1.2 setup): code is ~90% built already. Dashboard `/cmd/jog_cartesian` + frontend `jogHoldCartesian` + `_HoldSession('cartesian')` keepalive + driver `mode_s=='cartesian'` branch with `allow_cartesian_jog` gate + `robot_jog_mode=2` wire construction — ALL PRESENT. Add-16 L281 captured `mode:2, index:1..N, speed:frac, coorType:0, coorId:0` for User frame; tool-frame `coorType/coorId` values still uncaptured (LOW-priority backlog). Actual remaining F1.5 work: operator F12 confirmation of axis-letter → 1..6 mapping, `ESTUN_ALLOW_CARTESIAN=1` flip, verify `manualCartOverSpeed 250 mm/s` cap interpretation, real-arm acceptance test — VERDICT: RECON DONE, REAL WORK POST-F1-CLOSE
+add-47 §613 — **F1 CLOSED**: streamed jog retirement + WS-jog reinstatement + motion arbiter shipped + add-16 verification + slider truth pin + real-arm sweep PASS + tab-kill deadman PASS + arbiter direction 1 PASS + twin phantom-feedback CLASS ENDED. Direction 2 folds into F2.7. F1 done — VERDICT: CLOSED
+
+## Skipped-addendum audit list (initial sweep did not tabulate)
+
+The first pass tabulated the substantive addenda densely and skipped the
+following for brevity. Not "empty" — pending an inline sweep pass:
+
+`add-01, add-02, add-03, add-04, add-06, add-08a, add-08b, add-09,`
+`add-10, add-11, add-12, add-13, add-14, add-15, add-17, add-18, add-19,`
+`add-20, add-22, add-25, add-26, add-28, add-32, add-33`
+
+Any session that touches these addenda for other reasons is invited to
+append any missing attempts in-place.
