@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4466
+        line: 4512
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -746,7 +746,7 @@ capabilities:
           auth middleware helpers, and per-WS-handler auth guards).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4601
+        line: 4647
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Drift history: 4156 → 4267 → 4322 → 4349 →
@@ -1494,6 +1494,36 @@ capabilities:
         path_exempt:
           - '**/dashboard_server.py'
           - '**/test_*.py'
+      # No second frontend pair client — pairing state is owned by
+      # lib/pairedDevice.js. Ad-hoc getToken from localStorage
+      # elsewhere is a fork of the token seam and also breaks the
+      # future Capacitor storage migration path.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "roboai-pair-token"
+        path_exempt:
+          - '**/pairedDevice.js'
+          - '**/PairRequestModal.jsx'
+          - '**/*.test.js'
+          - '**/*.pinned.test.js'
+      # No second wizard surface calling /api/pair/start or
+      # /api/pair/confirm. Discovery + pair-flow live in
+      # DevicePairingWizard.jsx; the CLI + tests reach the same
+      # endpoints through Python.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "/api/pair/(start|confirm)"
+        path_exempt:
+          - '**/DevicePairingWizard.jsx'
+          - '**/pairedDevice.js'
+          - '**/*.test.js'
+      # No second Avahi advertisement — the systemd service file is
+      # the single site.
+      - path_glob: /etc/avahi/services/**/*.service
+        patterns:
+          - "_neurobots\\._tcp"
+        path_exempt:
+          - '**/neurobots.service'
     known_debt: []
 
 # reviewer either:

@@ -238,6 +238,35 @@ class PairingStore:
         for sid in dead:
             self._pending.pop(sid, None)
 
+    def list_pending(self) -> List[dict]:
+        """Snapshot pending pairing sessions for the paired-dashboard
+        modal to render. Called from the broadcast loop; NEVER returned
+        over an unauthenticated endpoint under enforced mode — the code
+        must ONLY be visible on the paired robot display."""
+        with self._lock:
+            self._sweep_expired_pending_locked()
+            now = _now()
+            return [
+                {
+                    'session_id':   sid,
+                    'device_name':  s['device_name'],
+                    'code':         s['code'],
+                    'remote_ip':    s['remote_ip'],
+                    'remaining_s':  max(
+                        0, int(CODE_TTL_S - (now - s['created_ts']))),
+                }
+                for sid, s in sorted(
+                    self._pending.items(),
+                    key=lambda kv: kv[1]['created_ts'])
+            ]
+
+    def deny(self, session_id: str) -> bool:
+        """Cancel a pending session from the robot-side dashboard.
+        Returns True if it existed and got dropped."""
+        with self._lock:
+            existed = self._pending.pop(session_id, None) is not None
+        return existed
+
     # ----- token validation + revocation -----------------------------
 
     def validate_token(self, raw_token: str) -> Optional[str]:

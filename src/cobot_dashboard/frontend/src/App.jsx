@@ -1,6 +1,9 @@
-import { useEffect, Component } from 'react'
+import { useEffect, useState, Component } from 'react'
 import { useStore } from './store/useStore'
 import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
+import DevicePairingWizard, { isLocalOrigin } from './components/DevicePairingWizard'
+import PairRequestModal from './components/PairRequestModal'
+import { isPaired as isPairedFn } from './lib/pairedDevice'
 import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
 import StaleCodegenBanner from './components/StaleCodegenBanner'
@@ -101,6 +104,20 @@ const gridStyle = {
 }
 
 export default function App() {
+  // ── Device pairing gate (2026-09-18 add-58 §687) ──
+  // The wizard renders full-screen when the app has no pairing token
+  // AND is not on localhost (the Jetson display + deploy tool at
+  // 127.0.0.1 grandfather through the backend and skip pairing). A
+  // 401 anywhere in the app clears the token via `pairedDevice.js`
+  // and dispatches `roboai-pair-required` — we listen and re-enter
+  // the wizard rather than surfacing a raw 401 screen.
+  const [needsPair, setNeedsPair] = useState(() =>
+    !isPairedFn() && !isLocalOrigin())
+  useEffect(() => {
+    const onReq = () => setNeedsPair(true)
+    window.addEventListener('roboai-pair-required', onReq)
+    return () => window.removeEventListener('roboai-pair-required', onReq)
+  }, [])
   const connectWS       = useStore((s) => s.connectWS)
   const activeTab       = useStore((s) => s.activeTab)
   const hydrateCells    = useStore((s) => s.hydrateCells)
@@ -217,6 +234,19 @@ export default function App() {
     flex: 1, minHeight: 0, flexDirection: 'column',
   })
 
+  if (needsPair) {
+    return (
+      <DevicePairingWizard
+        onComplete={() => {
+          setNeedsPair(false)
+          // Re-connect WS + hydrate now that we have a token.
+          try { connectWS() } catch (_) { /* nop */ }
+          try { hydrateEdition() } catch (_) { /* nop */ }
+        }}
+      />
+    )
+  }
+
   return (
     <ErrorBoundary>
       <div style={gridStyle}>
@@ -286,6 +316,7 @@ export default function App() {
         <WristWindIndicator />
         <ViewportDebug />
         <JogDebugPanel />
+        <PairRequestModal />
       </div>
     </ErrorBoundary>
   )

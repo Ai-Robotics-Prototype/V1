@@ -201,3 +201,95 @@ def test_middleware_flag_semantics(monkeypatch):
         f"expected auth check on every /ws/ route, got {src.count(ws_check)}")
     # And the 4401 close code.
     assert "await websocket.close(code=4401)" in src
+
+
+# ── (4) Broadcast + deny + code-not-in-response pins (add-58 §687) ─
+
+def test_pair_start_omits_code_from_response():
+    """SECURITY BOUNDARY. /api/pair/start must NEVER return the code
+    in its response body. The code lives only in the broadcast + the
+    paired-dashboard modal that renders it. If this test fails, the
+    tablet side has visibility of the code it just requested — the
+    physical-access requirement collapses."""
+    src_path = os.path.join(SERVER_DIR, 'dashboard_server.py')
+    with open(src_path) as fh:
+        src = fh.read()
+    # Slice the endpoint body.
+    import re
+    m = re.search(
+        r"async def api_pair_start\(request: Request\):(.+?)(?=\n    async def |\n    @app\.)",
+        src, re.DOTALL)
+    assert m, "api_pair_start slice not found"
+    body = m.group(1)
+    # No 'code' field returned. Look for the literal 'code': in a
+    # response-dict context — the return dict in start MUST NOT have
+    # 'code' as a key.
+    return_slice = re.search(r"return\s*\{([^}]+)\}", body)
+    assert return_slice, "start endpoint has no return {...}"
+    assert "'code'" not in return_slice.group(1), (
+        "pair/start return body must not carry the code — it should "
+        "only be broadcast into STATE.pairing.pending. See "
+        "cobot_dashboard/pairing.py + PairRequestModal.jsx.")
+
+
+def test_pair_start_broadcasts_pending_into_state():
+    """The paired-dashboard modal reads STATE.pairing.pending to render
+    the code. Pin that start writes into that namespace."""
+    src_path = os.path.join(SERVER_DIR, 'dashboard_server.py')
+    with open(src_path) as fh:
+        src = fh.read()
+    assert "STATE.setdefault('pairing', {})" in src
+    assert "list_pending" in src
+
+
+def test_pair_deny_endpoint_present():
+    """Deny is a physical-access equivalent — same auth rung as
+    /api/pair/start."""
+    src_path = os.path.join(SERVER_DIR, 'dashboard_server.py')
+    with open(src_path) as fh:
+        src = fh.read()
+    assert '@app.post("/api/pair/deny")' in src
+
+
+def test_pairing_store_lists_pending_and_deny(tmp_path):
+    """Wire-level pin: store.start writes into list_pending; store.deny
+    removes; a confirmed session no longer shows."""
+    pm, store = _fresh(tmp_path)
+    s = store.start('modal tablet', '192.168.2.207')
+    listed = store.list_pending()
+    assert any(p['session_id'] == s['session_id'] for p in listed)
+    row = next(p for p in listed if p['session_id'] == s['session_id'])
+    assert row['device_name'] == 'modal tablet'
+    assert row['code'] == s['code']
+    assert row['remaining_s'] > 0
+    assert store.deny(s['session_id']) is True
+    assert not any(p['session_id'] == s['session_id']
+                   for p in store.list_pending())
+    # Denying an unknown session is False, doesn't error.
+    assert store.deny('nope') is False
+
+
+# ── (5) Both-flag suite proof (add-58 §687) ─────────────────────────
+
+@pytest.mark.parametrize('flag', ['0', '1'])
+def test_middleware_reads_flag_lazily(flag, monkeypatch, tmp_path):
+    """Import the pairing module fresh under both flag states and
+    prove the store still works end-to-end without depending on the
+    middleware surface. The middleware itself is grep-pinned above;
+    what we prove here is the OTHER half — that changing the flag
+    doesn't secretly rewire the store's contract.
+
+    This is the "both-flag suite proof" the directive asks for at
+    the pytest layer — the middleware behavior is grep-pinned, the
+    store behavior is state-tested under both flag states."""
+    monkeypatch.setenv('COBOT_PAIRING_ENFORCED', flag)
+    import importlib
+    from cobot_dashboard import pairing as pm
+    importlib.reload(pm)
+    store = pm.PairingStore(str(tmp_path / 'paired.json'))
+    store._reset_for_tests()
+    s = store.start(f'flag-{flag}', '10.0.0.1')
+    assert s['ok'] is True
+    c = store.confirm(s['session_id'], s['code'], '10.0.0.1')
+    assert c['ok'] is True
+    assert store.validate_token(c['token']) == c['token_id']

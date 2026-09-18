@@ -2,21 +2,35 @@
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
-## 2026-09-18 session close (backend-only, arm untouched)
+## 2026-09-18 session close (backend + customer half, arm untouched)
 
-- **Device pairing backend landed** default-off (add-57 §686).
-  Identity + PairingStore + auth middleware + 10 WS-handler guards
-  + 5 pair endpoints + revoke-drops-live-WS + fork-registry entry
-  #27 + 9 backend pins. Suites: 22/22 green (13 fork_registry + 9
-  pairing). `COBOT_PAIRING_ENFORCED=0` this session — the ladder is
-  built but inert. Frontend wizard, Avahi advertisement, device-mgmt
-  UI, CA-cert pipeline: scoped to follow-on sessions.
-- **Arm untouched.** Session was code-only, no launch touched, no
-  motion issued. Arm state at session open carries forward.
-- **Next-session opener (pairing track):** frontend wizard slice 1
-  — three pages, `/api/pair/*` client, localStorage token, 401
-  re-pair loop, tests. Then Avahi `_neurobots._tcp` unit. Then
-  operator-flips-flag ritual.
+- **Pairing backend + customer half both landed same day.**
+  Add-57 §686 (sha d2c904f, earlier this session) shipped the
+  backend. Add-58 §687 (this commit) shipped the wizard + modal +
+  device-mgmt UI + real CA + Avahi + operator CLI + WS peer-set
+  cleanup. `COBOT_PAIRING_ENFORCED=0` this session — the operator
+  gate is: walk the wizard on the real tablet with the flag OFF,
+  THEN decide when to flip enforcement per the rollout in
+  add-57 §686. Suites: 35/35 targeted pass; full dashboard suite
+  60 failed / 717 passed (baseline 59/703 → 0 non-pairing
+  regressions, +14 my new passes after the census-pin migration
+  to inline confirm-revoke).
+- **Arm untouched** across the whole day. Both add-57 and add-58
+  were code-only. Arm state at session open carries forward.
+- **Robot advertisement live:** `avahi-browse -rt _neurobots._tcp`
+  resolves to `teddy-desktop.local:8080` with TXT records
+  `serial=NR-5CF998 model=S10-140 name=teddy-desktop api_version=1`
+  on 4 interfaces (eno1, wlP1p1s0 v4+v6, docker0).
+- **Real CA live:** `/opt/cobot/certs/ca.pem` = self-signed 20 y
+  root, CN `NeuRobots Root CA NR-5CF998`, returned by
+  `/api/pair/confirm` in `ca_cert_pem`.
+- **Next-session opener (pairing track):** operator walkthrough
+  on the real tablet at `https://192.168.2.246:8080` (flag still
+  off) → confirm wizard → confirm PairRequestModal renders on the
+  desktop dashboard → confirm token stored + dashboard loads →
+  confirm Settings → I/O → Paired devices shows the row + Revoke
+  works. THEN the operator decides when to flip
+  `COBOT_PAIRING_ENFORCED=1` per the rollout checklist.
 
 ## Where we are
 

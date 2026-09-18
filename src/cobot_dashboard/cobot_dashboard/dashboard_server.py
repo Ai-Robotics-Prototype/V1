@@ -212,6 +212,37 @@ def _ws_close_by_token(token_id):
         except Exception:
             pass
 
+
+def _ws_sweep_dead_peers():
+    """Prune WebSockets that have closed from the token → peer-set
+    tracker. Called periodically from the broadcast loop so a client
+    that connects, disconnects, then reconnects (same token) doesn't
+    grow the peer set unbounded between revokes.
+
+    A ws is considered dead if `application_state != CONNECTED` OR
+    `client_state != CONNECTED` — Starlette exposes both. Fallback:
+    treat any ws without a state accessor as alive (defensive)."""
+    try:
+        from starlette.websockets import WebSocketState
+    except Exception:
+        return
+    with _ws_token_lock:
+        for tid, peers in list(_ws_by_token_id.items()):
+            alive = set()
+            for ws in peers:
+                app_state    = getattr(ws, 'application_state', None)
+                client_state = getattr(ws, 'client_state',      None)
+                if app_state is None and client_state is None:
+                    alive.add(ws)
+                    continue
+                if (app_state == WebSocketState.CONNECTED
+                        or client_state == WebSocketState.CONNECTED):
+                    alive.add(ws)
+            if alive:
+                _ws_by_token_id[tid] = alive
+            else:
+                _ws_by_token_id.pop(tid, None)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -3523,9 +3554,22 @@ if FASTAPI_AVAILABLE:
         next_motioncam = time.time()
         next_motioncam_reco = time.time()
         _last_mesh_t = 0.0
+        # WS-token peer-set sweep cadence (2026-09-18 add-58 §687).
+        # Prunes dead WebSocket references from _ws_by_token_id every
+        # 60 s so per-token peer sets don't grow unbounded across
+        # reconnects. Cheap: dict-of-set iteration with per-ws state
+        # check, no I/O.
+        _last_ws_sweep = time.time()
+        _WS_SWEEP_S = 60.0
 
         while True:
             now = time.time()
+            if now - _last_ws_sweep >= _WS_SWEEP_S:
+                try:
+                    _ws_sweep_dead_peers()
+                except Exception:
+                    pass
+                _last_ws_sweep = now
 
             if now >= next_mesh:
                 with _mesh_lock:
@@ -3569,7 +3613,16 @@ if FASTAPI_AVAILABLE:
                 # and the keepalive native thread gets scheduled.
                 loop = asyncio.get_running_loop()
                 def _snapshot_and_serialize():
+                    # Refresh pairing.pending BEFORE the deepcopy so the
+                    # broadcast reflects TTL-swept sessions (a code that
+                    # expired but had no confirm/deny stays in STATE
+                    # otherwise). list_pending() sweeps + returns.
+                    try:
+                        _pending_now = _pairing_mod.get_store().list_pending()
+                    except Exception:
+                        _pending_now = []
                     with _state_lock:
+                        STATE.setdefault('pairing', {})['pending'] = _pending_now
                         payload = copy.deepcopy(STATE)
                     _state_seq_counter[0] += 1
                     payload["t"]   = now * 1000
@@ -5600,22 +5653,21 @@ if FASTAPI_AVAILABLE:
         if not result.get('ok'):
             status = 429 if result.get('kind') == 'locked_out' else 400
             return JSONResponse(result, status_code=status)
-        # The DASHBOARD (already-paired display) reads the pending code
-        # off /api/pair/pending — the pending list is broadcast into
-        # STATE so the modal renders on every open session. That
-        # broadcast is a follow-on session (frontend work); for now the
-        # code is returned to the tablet AND surfaced via a debug list
-        # so a next-session frontend can wire the modal.
+        # SECURITY BOUNDARY (2026-09-18, add-58 §687). The code is NEVER
+        # returned in the pair/start response. It is broadcast into
+        # STATE.pairing.pending and rendered exclusively on the
+        # paired robot's display via PairRequestModal. The tablet
+        # operator reads it off the display and types it into the
+        # wizard. If this endpoint ever leaks the code again, the
+        # doctrine test test_pair_start_omits_code fails.
+        with _state_lock:
+            pairing_ns = STATE.setdefault('pairing', {})
+            pairing_ns['pending'] = _pairing_mod.get_store().list_pending()
         return {
             'ok':           True,
             'session_id':   result['session_id'],
             'expires_in_s': result['expires_in_s'],
             'device_name':  result['device_name'],
-            # Include the code in the response for the operator-in-the-
-            # loop path (operator reads code off the dashboard display).
-            # A future frontend hides this from the tablet response and
-            # ONLY shows it on the paired-dashboard modal.
-            'code':         result['code'],
         }
 
     @app.post("/api/pair/confirm")
@@ -5632,11 +5684,17 @@ if FASTAPI_AVAILABLE:
         if not result.get('ok'):
             status = 429 if result.get('kind') == 'locked_out' else 401
             return JSONResponse(result, status_code=status)
-        # Include robot identity + CA cert (best-effort). CA missing
-        # is not fatal for the PWA path — https can still work via
-        # the deployed cert; the file is provided for the future
-        # Capacitor shell to install natively.
+        # Refresh the broadcast pending list — a successful confirm
+        # drops the session, so the paired-dashboard modal dismisses.
+        with _state_lock:
+            pairing_ns = STATE.setdefault('pairing', {})
+            pairing_ns['pending'] = _pairing_mod.get_store().list_pending()
         identity = _identity_mod.load_or_mint()
+        # Read the CA cert. Provisioned by scripts/provision_ca.sh at
+        # first boot. If the file is absent (upgrade path or manual
+        # HTTPS setup) return empty and let the wizard warn the
+        # operator; the wizard still stores the token in that case
+        # because HTTPS is already working via the existing cert.
         ca_pem = ''
         try:
             ca_path = '/opt/cobot/certs/ca.pem'
@@ -5653,6 +5711,34 @@ if FASTAPI_AVAILABLE:
             'ca_cert_pem':  ca_pem,
             'robot':        identity,
         }
+
+    @app.post("/api/pair/deny")
+    async def api_pair_deny(request: Request):
+        """Cancel a pending pairing session from the robot-side
+        dashboard. Unauthenticated (same rung as /api/pair/start) —
+        the ability to click Deny is a physical-access equivalent."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        session_id = (body or {}).get('session_id') or ''
+        existed = _pairing_mod.get_store().deny(session_id)
+        with _state_lock:
+            pairing_ns = STATE.setdefault('pairing', {})
+            pairing_ns['pending'] = _pairing_mod.get_store().list_pending()
+        if not existed:
+            return JSONResponse(
+                {'ok': False, 'kind': 'not_found'}, status_code=404)
+        return {'ok': True, 'session_id': session_id}
+
+    @app.get("/api/pair/pending")
+    async def api_pair_pending():
+        """Snapshot of pending pairing sessions. Used by the modal as
+        a polling fallback when WS state is slow to arrive. Returns
+        the code — this endpoint is guarded by the same auth rung as
+        /api/state under enforcement, so only paired displays see it.
+        NEVER moved to the unauth allow-list."""
+        return {'pending': _pairing_mod.get_store().list_pending()}
 
     @app.get("/api/paired_devices")
     async def api_paired_devices_list():
