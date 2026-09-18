@@ -117,7 +117,7 @@ function Field({ label, hint, children }) {
 export const UNREACHABLE_COPY =
   "This address didn't respond from your device — it may be on a different network than this tablet."
 
-function DiscoverPage({ onFound }) {
+function DiscoverPage({ onFound, skipEnabled, onSkip }) {
   const [address, setAddress] = useState('')
   const [probing, setProbing] = useState(false)
   const [err, setErr]         = useState('')
@@ -275,11 +275,23 @@ function DiscoverPage({ onFound }) {
       {err && <div style={{ color: NEURO_COLORS.bad, marginBottom: 12, fontSize: 13 }}>
         {err}
       </div>}
-      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        {skipEnabled && (
+          <Btn kind="ghost" onClick={onSkip}>
+            Continue without pairing
+          </Btn>
+        )}
+        <div style={{ flex: 1 }} />
         <Btn onClick={tryAddress} disabled={probing}>
           {probing ? 'Checking…' : 'Next'}
         </Btn>
       </div>
+      {skipEnabled && (
+        <div style={{ fontSize: 12, color: NEURO_COLORS.muted, marginTop: 10 }}>
+          Pairing is optional right now (developer mode). You can pair from
+          the I/O tab later.
+        </div>
+      )}
     </Panel>
   )
 }
@@ -320,6 +332,38 @@ function PairPage({ target, deviceName, onDeviceName, onDone, onBack }) {
       }
       setSessionId(j.session_id)
       setRemaining(j.expires_in_s || 90)
+      // Bootstrap-deadlock fix (add-60 §689). When the robot's device
+      // store is empty at start time the response carries
+      // `first_device: true`; skip the code page entirely and confirm
+      // with an empty code — the backend accepts on physical-network-
+      // presence trust. No paired dashboard exists yet to render a
+      // code on, so demanding one is impossible by construction.
+      if (j.first_device) {
+        setStatus('first-device')
+        const cres = await fetch(`https://${target.host}/api/pair/confirm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: j.session_id, code: '' }),
+        })
+        const cj = await cres.json()
+        if (!cres.ok || !cj.ok) {
+          // Race: another device paired between start + confirm.
+          // Fall back to the code path so the operator can read
+          // whatever code the freshly-paired dashboard now shows.
+          setStatus('waiting')
+          setTimeout(() => codeInputs[0].current && codeInputs[0].current.focus(), 100)
+          setErr('Another device just paired — enter the code from that screen.')
+          return
+        }
+        storePairing({
+          token:       cj.token,
+          token_id:    cj.token_id,
+          robot:       cj.robot,
+          ca_cert_pem: cj.ca_cert_pem || '',
+        })
+        onDone(cj)
+        return
+      }
       setStatus('waiting')
       // focus first digit
       setTimeout(() => codeInputs[0].current && codeInputs[0].current.focus(), 100)
@@ -419,7 +463,17 @@ function PairPage({ target, deviceName, onDeviceName, onDone, onBack }) {
           }} />
       </Field>
 
-      {status !== 'waiting' && status !== 'confirming' && (
+      {status === 'first-device' && (
+        <div style={{
+          padding: 16, background: NEURO_COLORS.bg,
+          border: `1px solid ${NEURO_COLORS.ok}`, borderRadius: 10,
+          marginBottom: 12, fontSize: 14, color: NEURO_COLORS.text,
+        }}>
+          You&rsquo;re the first device — connecting…
+        </div>
+      )}
+
+      {status !== 'waiting' && status !== 'confirming' && status !== 'first-device' && (
         <>
           <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
             <Btn kind="ghost" onClick={onBack}>Back</Btn>
@@ -440,7 +494,7 @@ function PairPage({ target, deviceName, onDeviceName, onDone, onBack }) {
             marginBottom: 12,
           }}>
             <div style={{ fontSize: 14, marginBottom: 6 }}>
-              Enter the code shown on the robot's screen
+              Enter the code shown on an already-connected NeuRobots screen.
             </div>
             <div style={{ fontSize: 12, color: NEURO_COLORS.muted }}>
               Expires in {remaining}s. If it disappears, click Start pairing again.
@@ -534,11 +588,21 @@ function DonePage({ result, onEnter }) {
 
 // ── Wizard orchestrator ────────────────────────────────────────────
 
-export default function DevicePairingWizard({ onComplete, initialPage }) {
+export default function DevicePairingWizard({ onComplete, onSkip, initialPage }) {
   const [page, setPage]           = useState(initialPage || 'find')  // find|pair|done
   const [target, setTarget]       = useState(null)                   // {host, id}
   const [deviceName, setDeviceName] = useState('')
   const [result, setResult]       = useState(null)
+  // Enforcement posture — probe /api/paired_devices without a token
+  // at mount. 200 = dev posture (COBOT_PAIRING_ENFORCED=0, wizard is
+  // OPTIONAL — offer a Skip button). 401 = enforced (wizard is
+  // MANDATORY — no Skip). undefined until the probe resolves; while
+  // undefined the wizard renders as usual (no false-negative skip).
+  //
+  // Bootstrap-deadlock fix (add-60 §689): the wizard blocked the
+  // dashboard whenever no token was present, even under the flag-OFF
+  // dev posture. The gate ran ahead of enforcement — pure UI bug.
+  const [devPosture, setDevPosture] = useState(undefined)
 
   // Auto-suggest a device name from the UA (short, friendly).
   useEffect(() => {
@@ -554,10 +618,35 @@ export default function DevicePairingWizard({ onComplete, initialPage }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  useEffect(() => {
+    // Probe /api/paired_devices with an explicit no-Authorization
+    // request. If the middleware refuses (401), enforcement is ON
+    // and we hide the skip path. If it answers (200), dev posture —
+    // the wizard is optional, offer skip. Anything else (network
+    // error, 5xx) leaves devPosture undefined and the wizard renders
+    // without a skip button.
+    let alive = true
+    ;(async () => {
+      try {
+        const res = await fetch('/api/paired_devices', {
+          headers: { 'X-Skip-Pair-Probe': '1' },  // ergonomic hint only
+        })
+        if (!alive) return
+        if (res.status === 401) { setDevPosture(false); return }
+        if (res.ok)             { setDevPosture(true);  return }
+      } catch (_) { /* nop */ }
+    })()
+    return () => { alive = false }
+  }, [])
+
   if (page === 'find')
     return (
       <Screen>
-        <DiscoverPage onFound={(t) => { setTarget(t); setPage('pair') }} />
+        <DiscoverPage
+          onFound={(t) => { setTarget(t); setPage('pair') }}
+          skipEnabled={devPosture === true}
+          onSkip={onSkip}
+        />
       </Screen>
     )
   if (page === 'pair' && target)

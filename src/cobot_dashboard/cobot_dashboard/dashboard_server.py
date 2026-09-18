@@ -5688,6 +5688,11 @@ if FASTAPI_AVAILABLE:
             'session_id':   result['session_id'],
             'expires_in_s': result['expires_in_s'],
             'device_name':  result['device_name'],
+            # first_device is TRUE only when the device store was empty
+            # at start time. The wizard reads this and skips the code
+            # page — the first device pairs on physical-network-presence
+            # trust alone. Add-60 §689 bootstrap-deadlock fix.
+            'first_device': bool(result.get('first_device', False)),
         }
 
     @app.post("/api/pair/confirm")
@@ -5730,6 +5735,7 @@ if FASTAPI_AVAILABLE:
             'device_name':  result['device_name'],
             'ca_cert_pem':  ca_pem,
             'robot':        identity,
+            'first_device': bool(result.get('first_device', False)),
         }
 
     @app.post("/api/pair/deny")

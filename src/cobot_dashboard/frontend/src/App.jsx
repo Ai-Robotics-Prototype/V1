@@ -243,6 +243,16 @@ export default function App() {
           try { connectWS() } catch (_) { /* nop */ }
           try { hydrateEdition() } catch (_) { /* nop */ }
         }}
+        onSkip={() => {
+          // Dev-posture "Continue without pairing" (add-60 §689 fix
+          // for the wizard-blocked-dashboard bug — enforcement flag
+          // OFF, so the backend answers unauthenticated requests
+          // anyway; the wizard was purely a UI gate that ran ahead
+          // of enforcement). Skip dismisses the wizard for the rest
+          // of this browser session; a page reload puts it back so
+          // it stays discoverable.
+          setNeedsPair(false)
+        }}
       />
     )
   }

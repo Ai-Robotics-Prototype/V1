@@ -54,6 +54,46 @@ def _get(host: str, path: str, insecure: bool = True) -> dict:
         return json.loads(r.read().decode('utf-8'))
 
 
+def _reset_store() -> int:
+    """Factory-reset the paired-devices store.
+
+    Delete /opt/cobot/paired_devices.json (requires root — this CLI
+    is expected to run under sudo when using --reset-store) then
+    restart roboai-dashboard so the in-memory PairingStore singleton
+    reloads from an empty file.
+
+    After reset, the next /api/pair/start returns first_device:true
+    and the next /api/pair/confirm accepts a codeless request —
+    that's the bootstrap-deadlock recovery path.
+    """
+    import subprocess
+    path = os.environ.get('COBOT_PAIRED_DEVICES_PATH',
+                          '/opt/cobot/paired_devices.json')
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+            print(f'removed {path}')
+        except PermissionError:
+            print(f'permission denied removing {path} — re-run under sudo',
+                  file=sys.stderr)
+            return 3
+    else:
+        print(f'{path} did not exist (already empty)')
+    try:
+        subprocess.run(
+            ['systemctl', 'restart', 'roboai-dashboard'],
+            check=True, timeout=30)
+        print('restarted roboai-dashboard')
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f'restart failed ({e}); run manually: '
+              'sudo systemctl restart roboai-dashboard',
+              file=sys.stderr)
+        return 4
+    print('paired-devices store is now empty; next confirm is '
+          'first-device grace (codeless).')
+    return 0
+
+
 def _extract_code(host: str, session_id: str) -> str:
     """Poll /api/pair/pending until this session's code shows up
     (localhost-only surface)."""
@@ -72,8 +112,9 @@ def _extract_code(host: str, session_id: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--name', required=True,
-                    help='Device name to register.')
+    ap.add_argument('--name',
+                    help='Device name to register. Required unless '
+                         '--reset-store is passed.')
     ap.add_argument('--host', default='127.0.0.1:8080',
                     help='Dashboard host (default: 127.0.0.1:8080). '
                          'Localhost is required — the pair code is '
@@ -83,7 +124,22 @@ def main() -> int:
     ap.add_argument('--insecure', action='store_true', default=True,
                     help='Skip TLS verification (default: on, for the '
                          'self-signed dashboard cert).')
+    ap.add_argument('--reset-store', action='store_true',
+                    help='Factory-reset the paired-devices store. '
+                         'Deletes /opt/cobot/paired_devices.json '
+                         '(requires sudo) then restarts the '
+                         'dashboard so the in-memory copy is dropped. '
+                         'The next /api/pair/confirm on the fresh '
+                         'store is accepted codeless (first-device '
+                         'grace, add-60 §689).')
     args = ap.parse_args()
+
+    if args.reset_store:
+        return _reset_store()
+    if not args.name:
+        print('cobot-pair-cli: --name is required (unless --reset-store)',
+              file=sys.stderr)
+        return 2
 
     host = args.host
     if not host.startswith(('127.0.0.1', 'localhost', '::1', '[::1]')):

@@ -24,6 +24,18 @@
 - **Real CA live:** `/opt/cobot/certs/ca.pem` = self-signed 20 y
   root, CN `NeuRobots Root CA NR-5CF998`, returned by
   `/api/pair/confirm` in `ca_cert_pem`.
+- **Second field bug caught + fixed same session (add-60 §689):**
+  bootstrap deadlock — with zero paired devices, every browser
+  was gated into the wizard AND the wizard demanded a code
+  shown on an already-paired display that didn't exist. Fix:
+  (a) first-device grace — empty device store accepts codeless
+  confirms, once ANY device is paired the branch is dead;
+  (b) wizard offers, doesn't block — probes /api/paired_devices
+  on mount, offers "Continue without pairing" under dev posture
+  (COBOT_PAIRING_ENFORCED=0), keeps gate under enforced;
+  (c) code-page copy → "an already-connected NeuRobots screen";
+  (d) `sudo python3 tools/cobot-pair-cli.py --reset-store`
+  factory-resets the paired store.
 - **Field bug caught + fixed same session (add-59 §688):**
   operator's tablet was on WiFi (192.168.1.x); Jetson wired leg
   192.168.2.246 unroutable from there. Wizard now enumerates every

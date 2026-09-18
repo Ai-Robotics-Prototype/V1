@@ -100,8 +100,19 @@ def test_pair_start_then_confirm_mints_token(tmp_path):
     assert on_disk[confirmed['token_id']]['token_hash'] != confirmed['token']
 
 
+def _seed_first_device(store):
+    """Add-60 §689: first-device grace accepts codeless confirms on
+    an empty store, so tests that exercise the wrong-code refusal
+    ladder must first seed the store. Uses a distinct remote_ip so
+    the seeding IP's failure counter is untouched."""
+    s = store.start('seed-device', '10.10.10.10')
+    c = store.confirm(s['session_id'], s['code'], '10.10.10.10')
+    assert c['ok'] is True
+
+
 def test_pair_bad_code_is_single_shot(tmp_path):
     pm, store = _fresh(tmp_path)
+    _seed_first_device(store)  # store now non-empty; grace path closed
     started = store.start('bad-code tablet', '192.168.2.202')
     r = store.confirm(started['session_id'], '000000', '192.168.2.202')
     assert r == {'ok': False, 'kind': 'bad_code'} or (
@@ -115,6 +126,7 @@ def test_pair_bad_code_is_single_shot(tmp_path):
 
 def test_three_fails_locks_out(tmp_path):
     pm, store = _fresh(tmp_path)
+    _seed_first_device(store)  # store now non-empty; grace path closed
     ip = '192.168.2.203'
     for _ in range(3):
         s = store.start('locky', ip)
@@ -270,6 +282,68 @@ def test_pairing_store_lists_pending_and_deny(tmp_path):
 
 
 # ── (5) Both-flag suite proof (add-58 §687) ─────────────────────────
+
+# ── (7) First-device grace (add-60 §689 bootstrap-deadlock fix) ────
+
+def test_first_device_flag_true_when_store_empty(tmp_path):
+    pm, store = _fresh(tmp_path)
+    s = store.start('empty-store tablet', '10.1.2.3')
+    assert s['ok'] is True
+    assert s['first_device'] is True
+
+
+def test_first_device_flag_false_after_first_pair(tmp_path):
+    pm, store = _fresh(tmp_path)
+    s1 = store.start('first', '10.1.2.3')
+    c1 = store.confirm(s1['session_id'], s1['code'], '10.1.2.3')
+    assert c1['ok'] is True
+    assert c1['first_device'] is True
+    s2 = store.start('second', '10.1.2.4')
+    assert s2['ok'] is True
+    assert s2['first_device'] is False
+
+
+def test_empty_store_accepts_codeless_confirm(tmp_path):
+    """Bootstrap-deadlock fix: a fresh robot with an empty device
+    store accepts /api/pair/confirm without a code. Physical LAN
+    presence + empty store = out-of-box trust."""
+    pm, store = _fresh(tmp_path)
+    s = store.start('first-boot tablet', '10.1.2.3')
+    # Codeless (empty string) confirm succeeds when store is empty.
+    c = store.confirm(s['session_id'], '', '10.1.2.3')
+    assert c['ok'] is True
+    assert c['first_device'] is True
+    assert isinstance(c['token'], str) and len(c['token']) >= 32
+
+
+def test_non_empty_store_refuses_codeless_confirm(tmp_path):
+    """Once ANY device is paired, codeless confirms MUST fail."""
+    pm, store = _fresh(tmp_path)
+    s1 = store.start('first', '10.1.2.3')
+    store.confirm(s1['session_id'], s1['code'], '10.1.2.3')
+    # Store non-empty from here on.
+    s2 = store.start('attacker', '10.1.2.99')
+    c2 = store.confirm(s2['session_id'], '', '10.1.2.99')
+    assert c2['ok'] is False
+    assert c2['kind'] == 'bad_code'
+    # Correct code still works.
+    s3 = store.start('legit-second', '10.1.2.4')
+    c3 = store.confirm(s3['session_id'], s3['code'], '10.1.2.4')
+    assert c3['ok'] is True
+    assert c3['first_device'] is False
+
+
+def test_first_device_grace_survives_middleware_grep():
+    """dashboard_server surfaces first_device on both /api/pair/start
+    and /api/pair/confirm response bodies."""
+    src_path = os.path.join(SERVER_DIR, 'dashboard_server.py')
+    with open(src_path) as fh:
+        src = fh.read()
+    # Both responses carry the flag.
+    assert src.count("'first_device':") >= 2, (
+        'both /api/pair/start and /api/pair/confirm responses must '
+        'expose first_device so the wizard can render the correct copy')
+
 
 # ── (6) Reachability (add-59 §688 field bug) ────────────────────────
 

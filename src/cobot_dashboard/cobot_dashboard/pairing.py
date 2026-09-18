@@ -164,12 +164,20 @@ class PairingStore:
             self._sweep_expired_pending_locked()
             session_id = _mint_session_id()
             code       = _mint_code()
+            # first_device is TRUE only when the on-disk device store
+            # is empty at start time. The bootstrap-deadlock fix
+            # (add-60 §689): the very first device to pair a fresh
+            # robot has no already-paired dashboard to read a code
+            # off, so it's granted physical-network-presence trust.
+            # Any subsequent device requires the code as usual.
+            first_device = (len(self._devices) == 0)
             self._pending[session_id] = {
-                'code':        code,
-                'device_name': device_name,
-                'remote_ip':   remote_ip,
-                'created_ts':  _now(),
-                'attempts':    0,
+                'code':         code,
+                'device_name':  device_name,
+                'remote_ip':    remote_ip,
+                'created_ts':   _now(),
+                'attempts':     0,
+                'first_device': first_device,
             }
         return {
             'ok':           True,
@@ -177,6 +185,7 @@ class PairingStore:
             'code':         code,
             'expires_in_s': CODE_TTL_S,
             'device_name':  device_name,
+            'first_device': first_device,
         }
 
     def confirm(self, session_id: str, code: str,
@@ -206,10 +215,25 @@ class PairingStore:
             # own expiry is handled by the age check above.
             self._sweep_expired_pending_locked()
             sess['attempts'] += 1
-            if not hmac.compare_digest(code, sess['code']):
-                self._pending.pop(session_id, None)
-                self._record_failure(remote_ip)
-                return {'ok': False, 'kind': 'bad_code'}
+            # First-device grace (add-60 §689): the very first device
+            # to pair a fresh robot is accepted WITHOUT code validation.
+            # The trust anchor is physical LAN presence + an empty
+            # device store. Once ANY device is paired, this branch is
+            # dead — every subsequent confirm requires the code.
+            #
+            # Threat model: an attacker on the LAN in the window between
+            # first-boot and first-legitimate-pair could snag first-
+            # device grace. Mitigation is procedural — the installer
+            # pairs immediately during install, and the CLI is available
+            # from localhost for out-of-box scripting. Once the operator's
+            # own device is paired, the door closes for that robot for
+            # its lifetime (short of a paired_devices.json reset).
+            is_first_device = (len(self._devices) == 0)
+            if not is_first_device:
+                if not hmac.compare_digest(code or '', sess['code']):
+                    self._pending.pop(session_id, None)
+                    self._record_failure(remote_ip)
+                    return {'ok': False, 'kind': 'bad_code'}
             self._pending.pop(session_id, None)
             self._clear_failures(remote_ip)
             token       = _mint_token()
@@ -225,10 +249,11 @@ class PairingStore:
             }
             self._write()
         return {
-            'ok':          True,
-            'token':       token,
-            'token_id':    token_id,
-            'device_name': device_name,
+            'ok':           True,
+            'token':        token,
+            'token_id':     token_id,
+            'device_name':  device_name,
+            'first_device': is_first_device,
         }
 
     def _sweep_expired_pending_locked(self) -> None:
