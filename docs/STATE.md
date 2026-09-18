@@ -24,6 +24,18 @@
 - **Real CA live:** `/opt/cobot/certs/ca.pem` = self-signed 20 y
   root, CN `NeuRobots Root CA NR-5CF998`, returned by
   `/api/pair/confirm` in `ca_cert_pem`.
+- **AUTH MODEL PIVOT landed (add-61 §690, sha TBD).** Dashboard open
+  in VIEW-ONLY mode for everyone; CONTROL requires login. New:
+  user_store.py (scrypt, /opt/cobot/users.json, 5-fail-per-5-min IP
+  lockout); /api/login mints via PairingStore.mint_user_session
+  kind='user' (interceptor seam unchanged); /api/logout revokes;
+  /api/whoami for UserChip; first-boot mints admin with a RANDOM
+  24-char password to /opt/cobot/admin_bootstrap.txt mode 0600
+  (never fixed default). Flag `COBOT_AUTH_ENFORCED` default off.
+  Frontend: no wizard wall — dashboard always renders. LoginModal
+  fires on `roboai-login-required` event (interceptor reads 401
+  `kind`). E-STOP `/cmd/estop` in unauth exception list. Pairing
+  infrastructure retained as device-trust layer.
 - **Second field bug caught + fixed same session (add-60 §689):**
   bootstrap deadlock — with zero paired devices, every browser
   was gated into the wizard AND the wizard demanded a code

@@ -1,9 +1,9 @@
 import { useEffect, useState, Component } from 'react'
 import { useStore } from './store/useStore'
 import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
-import DevicePairingWizard, { isLocalOrigin } from './components/DevicePairingWizard'
+import DevicePairingWizard from './components/DevicePairingWizard'
 import PairRequestModal from './components/PairRequestModal'
-import { isPaired as isPairedFn } from './lib/pairedDevice'
+import LoginModal from './components/LoginModal'
 import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
 import StaleCodegenBanner from './components/StaleCodegenBanner'
@@ -104,15 +104,13 @@ const gridStyle = {
 }
 
 export default function App() {
-  // ── Device pairing gate (2026-09-18 add-58 §687) ──
-  // The wizard renders full-screen when the app has no pairing token
-  // AND is not on localhost (the Jetson display + deploy tool at
-  // 127.0.0.1 grandfather through the backend and skip pairing). A
-  // 401 anywhere in the app clears the token via `pairedDevice.js`
-  // and dispatches `roboai-pair-required` — we listen and re-enter
-  // the wizard rather than surfacing a raw 401 screen.
-  const [needsPair, setNeedsPair] = useState(() =>
-    !isPairedFn() && !isLocalOrigin())
+  // Auth model pivot (add-61 §690, 2026-09-18). The dashboard NO
+  // LONGER blocks on the pairing wizard for unauthenticated
+  // clients — everyone sees the dashboard in view-only mode, and
+  // control actions trigger the LoginModal when unauth+enforced.
+  // The wizard is still reachable via `roboai-pair-required`
+  // (device-trust legacy path) but doesn't gate the app.
+  const [needsPair, setNeedsPair] = useState(false)
   useEffect(() => {
     const onReq = () => setNeedsPair(true)
     window.addEventListener('roboai-pair-required', onReq)
@@ -327,6 +325,7 @@ export default function App() {
         <ViewportDebug />
         <JogDebugPanel />
         <PairRequestModal />
+        <LoginModal />
       </div>
     </ErrorBoundary>
   )

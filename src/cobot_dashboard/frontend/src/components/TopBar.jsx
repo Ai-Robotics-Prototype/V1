@@ -1,6 +1,7 @@
 import { useStore } from '../store/useStore'
 import Brand from './Brand'
 import { isFeatureEnabled, TAB_TO_FEATURE } from '../lib/edition'
+import UserChip from './UserChip'
 
 const TABS = [
   { id: 'monitor',          label: 'Monitor' },
@@ -122,8 +123,13 @@ export default function TopBar() {
         })}
       </nav>
 
-      {/* Right: WS status + E-STOP */}
+      {/* Right: user chip + WS status + E-STOP */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+        {/* Auth-model pivot (add-61 §690): user chip shows the
+            signed-in username + sign-out, or a "Sign in"
+            affordance under enforced+unauth, or nothing under
+            dev posture with no session. */}
+        <UserChip />
         {/* WS indicator — fixed width so the centred tabs never shift
             when the status text or latency digit-count changes. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--text-secondary)' }}>

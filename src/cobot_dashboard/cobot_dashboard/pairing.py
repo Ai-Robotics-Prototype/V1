@@ -307,6 +307,68 @@ class PairingStore:
                     return tid
         return None
 
+    def resolve_token(self, raw_token: str) -> Optional[dict]:
+        """Like validate_token but returns the full row so the caller
+        can inspect `kind` + `username` for user sessions.
+        Returns None if invalid; else {'token_id', 'kind', 'username',
+        'role', 'device_name'}. Updates last_seen as a side effect."""
+        if not raw_token:
+            return None
+        h = _hash_token(raw_token)
+        with self._lock:
+            for tid, meta in self._devices.items():
+                if hmac.compare_digest(h, meta.get('token_hash', '')):
+                    meta['last_seen'] = time.strftime(
+                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                    return {
+                        'token_id':    tid,
+                        'kind':        meta.get('kind', 'device'),
+                        'username':    meta.get('username'),
+                        'role':        meta.get('role'),
+                        'device_name': meta.get('device_name', ''),
+                    }
+        return None
+
+    def mint_user_session(self, username: str, role: str) -> dict:
+        """Mint a login token (kind='user') and store it hashed
+        alongside device-pair tokens. Add-61 §690: login and pair
+        share the same token surface; the front-end interceptor
+        can't tell them apart. `username` and `role` are what the
+        /api/whoami endpoint reads back."""
+        with self._lock:
+            token    = _mint_token()
+            token_id = _mint_token_id()
+            now_iso  = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                     time.gmtime())
+            self._devices[token_id] = {
+                'token_hash':  _hash_token(token),
+                'device_name': f'{username} (login)',
+                'kind':        'user',
+                'username':    username,
+                'role':        role,
+                'created':     now_iso,
+                'last_seen':   now_iso,
+            }
+            self._write()
+        return {'ok': True, 'token': token, 'token_id': token_id,
+                'kind': 'user', 'username': username, 'role': role}
+
+    def revoke_by_token(self, raw_token: str) -> bool:
+        """Revoke by raw token (used by /api/logout so the user
+        doesn't need to know their token_id)."""
+        if not raw_token:
+            return False
+        h = _hash_token(raw_token)
+        with self._lock:
+            tid = None
+            for cand, meta in self._devices.items():
+                if hmac.compare_digest(h, meta.get('token_hash', '')):
+                    tid = cand
+                    break
+        if tid is None:
+            return False
+        return self.revoke(tid)
+
     def list_devices(self) -> List[dict]:
         """List devices for the mgmt UI (no hashes leaked)."""
         with self._lock:

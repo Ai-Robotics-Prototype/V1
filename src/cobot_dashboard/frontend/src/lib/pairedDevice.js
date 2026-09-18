@@ -46,7 +46,10 @@ export function storePairing({ token, token_id, robot, ca_cert_pem }) {
   if (token)    s.setItem(KEY_TOKEN, token)
   if (token_id) s.setItem(KEY_TOKEN_ID, token_id)
   if (robot)    s.setItem(KEY_ROBOT, JSON.stringify(robot))
-  if (typeof ca_cert_pem === 'string') s.setItem(KEY_CA_PEM, ca_cert_pem)
+  // Only write the CA when it's non-empty. Login responses (add-61
+  // §690) don't carry a CA — preserving whatever pairing landed.
+  if (typeof ca_cert_pem === 'string' && ca_cert_pem.length > 0)
+    s.setItem(KEY_CA_PEM, ca_cert_pem)
 }
 
 export function clearPairing() {
@@ -90,17 +93,33 @@ export function installAuthInterceptors() {
       init.headers = h
     }
     const p = origFetch(input, init)
-    p.then((res) => {
-      if (res && res.status === 401 && !isPairEndpoint) {
-        // Token missing / expired / revoked. Broadcast the re-pair
-        // signal; App.jsx listens and renders the wizard. Never let
-        // this surface as a raw 401 to the operator.
-        try {
+    p.then(async (res) => {
+      if (!res || res.status !== 401) return
+      if (isPairEndpoint) return
+      // Auth model pivot (add-61 §690): read the JSON reason kind
+      // and dispatch accordingly. `login_required` = LoginModal
+      // opens; `pairing_required` (legacy) = wizard re-pair path.
+      // Never surface a raw 401 to the operator.
+      let kind = 'login_required'
+      try {
+        // Clone so consumer .json()/.text() still works.
+        const j = await res.clone().json()
+        if (j && j.kind) kind = j.kind
+      } catch (_) { /* nop */ }
+      try {
+        if (kind === 'pairing_required') {
           clearPairing()
           window.dispatchEvent(new CustomEvent('roboai-pair-required',
             { detail: { url } }))
-        } catch (_) { /* nop */ }
-      }
+        } else {
+          // Clear the token — it's either missing, revoked, or a
+          // stale pairing token that the CONTROL middleware
+          // refuses. The user re-signs-in via the modal.
+          clearPairing()
+          window.dispatchEvent(new CustomEvent('roboai-login-required',
+            { detail: { url } }))
+        }
+      } catch (_) { /* nop */ }
     }).catch(() => {})
     return p
   }

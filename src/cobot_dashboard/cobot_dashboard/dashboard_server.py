@@ -122,10 +122,31 @@ except ImportError:
 # ladder is implemented but inert until an operator flips the flag).
 from cobot_dashboard import identity as _identity_mod
 from cobot_dashboard import pairing as _pairing_mod
+from cobot_dashboard import user_store as _user_mod
 
 PAIRING_ENFORCED = (
     os.environ.get('COBOT_PAIRING_ENFORCED', '0').strip().lower()
     in ('1', 'true', 'yes', 'on'))
+
+# Auth model pivot (add-61 §690, 2026-09-18). VIEW = open, CONTROL =
+# login-required when this flag is set. Default off so nothing breaks
+# during rollout — same posture as PAIRING_ENFORCED. The two flags
+# are independent (both can be on; both off is dev-open); the login
+# model is the primary path going forward and pairing becomes the
+# device-trust layer for later.
+AUTH_ENFORCED = (
+    os.environ.get('COBOT_AUTH_ENFORCED', '0').strip().lower()
+    in ('1', 'true', 'yes', 'on'))
+
+# CONTROL paths that stay unauth even under enforcement. Pair flow +
+# login itself + e-stop + health + identity + deploy status +
+# provenance. E-STOP IS SAFETY-CRITICAL: it MUST remain reachable
+# from every VIEW-only client so anyone watching can stop the arm.
+_UNAUTH_CONTROL_PATHS = (
+    '/api/login',
+    '/api/pair/',         # pairing flow is a bootstrap surrogate
+    '/cmd/estop',         # safety invariant: NEVER behind login
+)
 
 # Paths that MUST stay unauthenticated even under enforcement, so an
 # unpaired tablet can reach the pairing flow + health without a token.
@@ -3327,6 +3348,16 @@ if FASTAPI_AVAILABLE:
         except Exception as _e:
             print(f'[dashboard] _seed_prog_revs_from_disk failed: {_e}',
                   flush=True)
+        # First-boot admin provisioning (add-61 §690). If the user
+        # store is empty, mint an admin with a random password and
+        # write it to /opt/cobot/admin_bootstrap.txt (mode 0600). No
+        # fixed-default password — pinned by
+        # test_no_fixed_default_admin_password_in_provisioning.
+        try:
+            _user_mod.provision_default_admin_if_empty()
+        except Exception as _e:
+            print(f'[dashboard] admin provisioning failed: {_e}',
+                  flush=True)
         task = asyncio.create_task(_broadcast_loop())
         # Server-side hold keepalive — drives /robot/jog_command at a
         # steady 100 ms cadence. Runs on a dedicated NATIVE thread, not
@@ -3523,6 +3554,45 @@ if FASTAPI_AVAILABLE:
     # Register the revoke callback so pulling a device drops its live
     # WebSocket sessions immediately (not "on next reconnect").
     _pairing_mod.get_store().on_revoke(_ws_close_by_token)
+
+    # ── Control-auth middleware (2026-09-18 add-61 §690) ──
+    # Auth model pivot. VIEW = open (state streams + reads).
+    # CONTROL = /api/login-token required when AUTH_ENFORCED is on.
+    # Classification:
+    #   GET / HEAD / OPTIONS       → always VIEW
+    #   POST / PUT / DELETE / PATCH→ CONTROL unless matches
+    #                                 _UNAUTH_CONTROL_PATHS
+    # Localhost callers grandfather through (Jetson display + deploy
+    # tool + CLI). Runs BEFORE the pairing middleware, edition gate,
+    # and every handler.
+    @app.middleware("http")
+    async def _control_auth_middleware(request, call_next):
+        if not AUTH_ENFORCED:
+            return await call_next(request)
+        method = (request.method or 'GET').upper()
+        if method in ('GET', 'HEAD', 'OPTIONS'):
+            return await call_next(request)
+        path = request.url.path or '/'
+        for pref in _UNAUTH_CONTROL_PATHS:
+            if path == pref or path.startswith(pref):
+                return await call_next(request)
+        # Only mutating verbs on non-exempt paths reach here.
+        client = getattr(request, 'client', None)
+        host = getattr(client, 'host', '') if client else ''
+        if host in ('127.0.0.1', '::1', 'localhost'):
+            return await call_next(request)
+        raw = ''
+        auth = request.headers.get('authorization') or ''
+        if auth.lower().startswith('bearer '):
+            raw = auth[7:].strip()
+        if not raw:
+            raw = (request.query_params.get('token') or '').strip()
+        if not raw or _pairing_mod.get_store().validate_token(raw) is None:
+            return JSONResponse(
+                {'ok': False, 'kind': 'login_required',
+                 'reason': 'Sign in to control the robot.'},
+                status_code=401)
+        return await call_next(request)
 
     # ------------------------------------------------------------------
     # Broadcast loop — pushes state + lidar to WebSocket queues at Hz
@@ -5638,6 +5708,71 @@ if FASTAPI_AVAILABLE:
     def _pair_remote(request: Request) -> str:
         client = getattr(request, 'client', None)
         return (getattr(client, 'host', '') or '') if client else ''
+
+    # ────────── Login / logout / whoami (add-61 §690) ──────────
+    # Login mints a session token via the SAME PairingStore as
+    # pair/confirm (kind='user'), so the interceptor seam +
+    # revoke-drops-live-WS behaviour are all reused. Rate-limit
+    # lives inside user_store (5 fails / 5 min / IP → 5 min
+    # lockout).
+    def _bearer_of(request: Request) -> str:
+        auth = request.headers.get('authorization') or ''
+        if auth.lower().startswith('bearer '):
+            return auth[7:].strip()
+        return (request.query_params.get('token') or '').strip()
+
+    @app.post("/api/login")
+    async def api_login(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        username = (body or {}).get('username') or ''
+        password = (body or {}).get('password') or ''
+        remote   = _pair_remote(request)
+        verdict = _user_mod.get_store().verify_password(
+            username, password, remote)
+        if not verdict.get('ok'):
+            status = 429 if verdict.get('kind') == 'locked_out' else 401
+            return JSONResponse(verdict, status_code=status)
+        session = _pairing_mod.get_store().mint_user_session(
+            verdict['username'], verdict['role'])
+        return {
+            'ok':       True,
+            'token':    session['token'],
+            'token_id': session['token_id'],
+            'username': session['username'],
+            'role':     session['role'],
+        }
+
+    @app.post("/api/logout")
+    async def api_logout(request: Request):
+        raw = _bearer_of(request)
+        if not raw:
+            # Idempotent: no token to revoke, still ok.
+            return {'ok': True, 'revoked': False}
+        revoked = _pairing_mod.get_store().revoke_by_token(raw)
+        return {'ok': True, 'revoked': bool(revoked)}
+
+    @app.get("/api/whoami")
+    async def api_whoami(request: Request):
+        raw = _bearer_of(request)
+        if not raw:
+            return {'ok': True, 'authenticated': False,
+                    'auth_enforced': AUTH_ENFORCED}
+        row = _pairing_mod.get_store().resolve_token(raw)
+        if row is None:
+            return {'ok': True, 'authenticated': False,
+                    'auth_enforced': AUTH_ENFORCED}
+        return {
+            'ok':             True,
+            'authenticated':  True,
+            'auth_enforced':  AUTH_ENFORCED,
+            'kind':           row.get('kind'),
+            'username':       row.get('username'),
+            'role':           row.get('role'),
+            'token_id':       row.get('token_id'),
+        }
 
     @app.get("/api/identity")
     async def api_identity(request: Request):
