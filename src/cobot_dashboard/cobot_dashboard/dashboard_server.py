@@ -141,11 +141,13 @@ _UNAUTH_STATIC_PREFIXES = (
     '/assets/', '/static/', '/favicon', '/robots.txt', '/manifest',
 )
 # WS tracker so a revoke can drop live sockets holding a token_id.
-_ws_by_token_id: "Dict[str, Set]" = {}
+# token_id → set of WebSocket objects. Grown by _ws_register_token,
+# pruned by _ws_sweep_dead_peers + _ws_close_by_token.
+_ws_by_token_id = {}
 _ws_token_lock = threading.Lock()
 
 
-def _ws_auth_check(websocket) -> "Tuple[bool, Optional[str]]":
+def _ws_auth_check(websocket):
     """WS gate. Returns (allowed, token_id).
 
     * PAIRING_ENFORCED=false → always (True, None) — grandfather path.
