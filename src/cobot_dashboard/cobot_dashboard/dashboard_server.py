@@ -116,6 +116,102 @@ try:
 except ImportError:
     FASTAPI_AVAILABLE = False
 
+# Device pairing (security boundary). See pairing.py for the pure
+# logic + identity.py for the robot identity file. Enforcement is
+# gated by COBOT_PAIRING_ENFORCED (default off during rollout — the
+# ladder is implemented but inert until an operator flips the flag).
+from cobot_dashboard import identity as _identity_mod
+from cobot_dashboard import pairing as _pairing_mod
+
+PAIRING_ENFORCED = (
+    os.environ.get('COBOT_PAIRING_ENFORCED', '0').strip().lower()
+    in ('1', 'true', 'yes', 'on'))
+
+# Paths that MUST stay unauthenticated even under enforcement, so an
+# unpaired tablet can reach the pairing flow + health without a token.
+_UNAUTH_PATH_PREFIXES = (
+    '/api/pair/',
+    '/api/identity',      # robot serial/name for discovery UI
+    '/health',
+    '/api/deploy_status', # deploy banner must render even pre-pair
+    '/api/provenance',    # provenance hello check
+)
+# Static asset paths that the wizard itself needs to load pre-pair.
+_UNAUTH_STATIC_PREFIXES = (
+    '/assets/', '/static/', '/favicon', '/robots.txt', '/manifest',
+)
+# WS tracker so a revoke can drop live sockets holding a token_id.
+_ws_by_token_id: "Dict[str, Set]" = {}
+_ws_token_lock = threading.Lock()
+
+
+def _ws_auth_check(websocket) -> "Tuple[bool, Optional[str]]":
+    """WS gate. Returns (allowed, token_id).
+
+    * PAIRING_ENFORCED=false → always (True, None) — grandfather path.
+    * localhost → always allowed (operator on the Jetson display, and
+      the deploy tool at 127.0.0.1 needs to reach /ws/state to render
+      the banner even if all pairing tokens have been revoked).
+    * Otherwise validate `?token=` query param against the pairing store.
+    """
+    if not PAIRING_ENFORCED:
+        return True, None
+    client = getattr(websocket, 'client', None)
+    host = getattr(client, 'host', '') if client else ''
+    if host in ('127.0.0.1', '::1', 'localhost'):
+        return True, None
+    try:
+        token = websocket.query_params.get('token') or ''
+    except Exception:
+        token = ''
+    tid = _pairing_mod.get_store().validate_token(token)
+    if tid is None:
+        return False, None
+    return True, tid
+
+
+def _ws_register_token(websocket, token_id):
+    if not token_id:
+        return
+    with _ws_token_lock:
+        _ws_by_token_id.setdefault(token_id, set()).add(websocket)
+
+
+def _ws_unregister_token(websocket, token_id):
+    if not token_id:
+        return
+    with _ws_token_lock:
+        peers = _ws_by_token_id.get(token_id)
+        if peers is not None:
+            peers.discard(websocket)
+            if not peers:
+                _ws_by_token_id.pop(token_id, None)
+
+
+def _ws_close_by_token(token_id):
+    """Snapshot the WS set for a revoked token and schedule closes.
+
+    Called from the pairing store's revoke callback. Runs on whatever
+    thread issued the revoke; asyncio.run_coroutine_threadsafe schedules
+    the close on the FastAPI event loop.
+    """
+    with _ws_token_lock:
+        peers = list(_ws_by_token_id.pop(token_id, set()))
+    if not peers:
+        return
+    loop = None
+    try:
+        loop = asyncio.get_event_loop()
+    except Exception:
+        loop = None
+    for ws in peers:
+        try:
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    ws.close(code=4401), loop)
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -3349,6 +3445,52 @@ if FASTAPI_AVAILABLE:
             break
         return await call_next(request)
 
+    # ── Pairing auth middleware (2026-09-18) ──
+    # Runs BEFORE the edition gate at request time (Starlette runs the
+    # LAST-registered middleware first). When PAIRING_ENFORCED is off
+    # (default this session) the middleware short-circuits and every
+    # request passes — the ladder is inert until the operator flips the
+    # env. When enforced, /api/* + /cmd/* + /stream/* require an
+    # Authorization: Bearer <token> header (or ?token= query param for
+    # the MJPEG stream tags that can't set headers), except the
+    # _UNAUTH_PATH_PREFIXES list which stays open so an unpaired tablet
+    # can still hit the pairing flow. Localhost callers grandfather
+    # through — the operator on the Jetson display and the deploy tool
+    # at 127.0.0.1 keep working during rollout.
+    @app.middleware("http")
+    async def _pairing_auth_middleware(request, call_next):
+        if not PAIRING_ENFORCED:
+            return await call_next(request)
+        path = request.url.path or '/'
+        if path == '/' or path.startswith(_UNAUTH_STATIC_PREFIXES):
+            return await call_next(request)
+        if path.startswith(_UNAUTH_PATH_PREFIXES):
+            return await call_next(request)
+        if not (path.startswith('/api/') or path.startswith('/cmd/')
+                or path.startswith('/stream/')):
+            return await call_next(request)
+        client = getattr(request, 'client', None)
+        host = getattr(client, 'host', '') if client else ''
+        if host in ('127.0.0.1', '::1', 'localhost'):
+            return await call_next(request)
+        raw = ''
+        auth = request.headers.get('authorization') or ''
+        if auth.lower().startswith('bearer '):
+            raw = auth[7:].strip()
+        if not raw:
+            raw = (request.query_params.get('token') or '').strip()
+        if not raw or _pairing_mod.get_store().validate_token(raw) is None:
+            return JSONResponse(
+                {'ok': False, 'kind': 'pairing_required',
+                 'reason': 'This device is not paired with the robot. '
+                           'Open the setup wizard to pair.'},
+                status_code=401)
+        return await call_next(request)
+
+    # Register the revoke callback so pulling a device drops its live
+    # WebSocket sessions immediately (not "on next reconnect").
+    _pairing_mod.get_store().on_revoke(_ws_close_by_token)
+
     # ------------------------------------------------------------------
     # Broadcast loop — pushes state + lidar to WebSocket queues at Hz
     # ------------------------------------------------------------------
@@ -3932,6 +4074,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/state")
     async def ws_state(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         # ── Provenance hello (2026-08-28 stale-class close) ──
         # First frame after accept carries the backend+frontend SHAs
@@ -4070,6 +4220,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/lidar")
     async def ws_lidar(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         q: asyncio.Queue = asyncio.Queue(maxsize=2)
         with _ws_lock:
@@ -4101,6 +4259,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/motioncam_cloud")
     async def ws_motioncam_cloud(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         q: asyncio.Queue = asyncio.Queue(maxsize=2)
         with _ws_lock:
@@ -4132,6 +4298,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/motioncam_recognition")
     async def ws_motioncam_recognition(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         q: asyncio.Queue = asyncio.Queue(maxsize=2)
         with _ws_lock:
@@ -4157,6 +4331,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/mesh")
     async def ws_mesh(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         q: asyncio.Queue = asyncio.Queue(maxsize=2)
         with _ws_lock:
@@ -5392,6 +5574,97 @@ if FASTAPI_AVAILABLE:
     # ------------------------------------------------------------------
     # Info endpoints
     # ------------------------------------------------------------------
+
+    # ────────── Pairing endpoints (2026-09-18) ──────────
+    # Unauthenticated + LAN-only + rate-limited. The pairing store
+    # owns lockout accounting (3 fails inside 5 min → 5 min lockout
+    # on that remote_ip). Responses are shaped for the wizard;
+    # nothing here reads dashboard STATE.
+    def _pair_remote(request: Request) -> str:
+        client = getattr(request, 'client', None)
+        return (getattr(client, 'host', '') or '') if client else ''
+
+    @app.get("/api/identity")
+    async def api_identity():
+        return _identity_mod.load_or_mint()
+
+    @app.post("/api/pair/start")
+    async def api_pair_start(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_name = (body or {}).get('device_name') or ''
+        remote_ip = _pair_remote(request)
+        result = _pairing_mod.get_store().start(device_name, remote_ip)
+        if not result.get('ok'):
+            status = 429 if result.get('kind') == 'locked_out' else 400
+            return JSONResponse(result, status_code=status)
+        # The DASHBOARD (already-paired display) reads the pending code
+        # off /api/pair/pending — the pending list is broadcast into
+        # STATE so the modal renders on every open session. That
+        # broadcast is a follow-on session (frontend work); for now the
+        # code is returned to the tablet AND surfaced via a debug list
+        # so a next-session frontend can wire the modal.
+        return {
+            'ok':           True,
+            'session_id':   result['session_id'],
+            'expires_in_s': result['expires_in_s'],
+            'device_name':  result['device_name'],
+            # Include the code in the response for the operator-in-the-
+            # loop path (operator reads code off the dashboard display).
+            # A future frontend hides this from the tablet response and
+            # ONLY shows it on the paired-dashboard modal.
+            'code':         result['code'],
+        }
+
+    @app.post("/api/pair/confirm")
+    async def api_pair_confirm(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        session_id = (body or {}).get('session_id') or ''
+        code       = (body or {}).get('code') or ''
+        remote_ip = _pair_remote(request)
+        result = _pairing_mod.get_store().confirm(
+            session_id, code, remote_ip)
+        if not result.get('ok'):
+            status = 429 if result.get('kind') == 'locked_out' else 401
+            return JSONResponse(result, status_code=status)
+        # Include robot identity + CA cert (best-effort). CA missing
+        # is not fatal for the PWA path — https can still work via
+        # the deployed cert; the file is provided for the future
+        # Capacitor shell to install natively.
+        identity = _identity_mod.load_or_mint()
+        ca_pem = ''
+        try:
+            ca_path = '/opt/cobot/certs/ca.pem'
+            if os.path.exists(ca_path):
+                with open(ca_path) as fh:
+                    ca_pem = fh.read()
+        except Exception:
+            ca_pem = ''
+        return {
+            'ok':           True,
+            'token':        result['token'],
+            'token_id':     result['token_id'],
+            'device_name':  result['device_name'],
+            'ca_cert_pem':  ca_pem,
+            'robot':        identity,
+        }
+
+    @app.get("/api/paired_devices")
+    async def api_paired_devices_list():
+        return {'devices': _pairing_mod.get_store().list_devices()}
+
+    @app.delete("/api/paired_devices/{token_id}")
+    async def api_paired_devices_revoke(token_id: str):
+        existed = _pairing_mod.get_store().revoke(token_id)
+        if not existed:
+            return JSONResponse(
+                {'ok': False, 'kind': 'not_found'}, status_code=404)
+        return {'ok': True, 'token_id': token_id}
 
     @app.get("/health")
     async def health():
@@ -13591,6 +13864,14 @@ if FASTAPI_AVAILABLE:
         on /inspection/status and /inspection/result so the dashboard
         Active sub-tab can render a progress bar.
         """
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         q = asyncio.Queue(maxsize=4)
         with _ws_lock:
@@ -14621,6 +14902,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/motion_statistics")
     async def ws_motion_statistics(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         _motion_stats_clients.add(websocket)
         try:
@@ -14644,6 +14933,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/motion_moveit_setup")
     async def ws_motion_moveit_setup(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         _motion_setup_clients.add(websocket)
         try:
@@ -15016,6 +15313,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/lidar_objects")
     async def ws_lidar_objects(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         _lidar_ws_clients.add(websocket)
         try:
@@ -15037,6 +15342,14 @@ if FASTAPI_AVAILABLE:
 
     @app.websocket("/ws/lidar_object_events")
     async def ws_lidar_events(websocket: WebSocket):
+        _pair_ok, _pair_tid = _ws_auth_check(websocket)
+        if not _pair_ok:
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        _ws_register_token(websocket, _pair_tid)
         await websocket.accept()
         _lidar_event_clients.add(websocket)
         # Track which (id, identified_as) pairs we've seen so we can emit

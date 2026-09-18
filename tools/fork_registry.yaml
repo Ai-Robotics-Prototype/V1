@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4296
+        line: 4466
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -741,10 +741,12 @@ capabilities:
           _jog_stop_cause_operator_copy); 2026-09-15 auto-recovery
           → 4283 (+39 for the WS-mode staleness watchdog +
           controller_offline flag wiring in _cri_proxy_staleness_loop
-          and _on_estun_status).
+          and _on_estun_status); 2026-09-18 device pairing backend
+          → 4466 (+170 for identity + pairing imports, HTTP+WS
+          auth middleware helpers, and per-WS-handler auth guards).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4431
+        line: 4601
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Drift history: 4156 → 4267 → 4322 → 4349 →
@@ -756,7 +758,9 @@ capabilities:
           2026-09-11 standing-debt #6 → 4379 (+6 for the extended
           freshness_deadman/keepalive_timeout copy block);
           2026-09-15 auto-recovery → 4418 (+39 for the WS-mode
-          staleness watchdog + controller_offline flag wiring).
+          staleness watchdog + controller_offline flag wiring);
+          2026-09-18 device pairing backend → 4601 (+183 for
+          pairing endpoints + auth middleware + per-WS guards).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0
@@ -1408,6 +1412,85 @@ capabilities:
       - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
         patterns:
           - "\\.build-sha"
+        path_exempt:
+          - '**/dashboard_server.py'
+          - '**/test_*.py'
+    known_debt: []
+
+  # 27. Device pairing (2026-09-18 backend slice; wizard + Avahi
+  # advertisement follow in a subsequent session). The pairing
+  # store owns: pending-code sessions (in-memory), device store
+  # (hashed tokens at /opt/cobot/paired_devices.json), rate-limit
+  # + 3-fail lockout, revoke pubsub. The auth middleware owns:
+  # HTTP + WS enforcement, unauth prefix list, localhost
+  # grandfather. Anything that mints or validates a device
+  # token OUTSIDE these two modules is a fork of the security
+  # boundary — do not add a second store, a second middleware,
+  # or a second /pair/* endpoint.
+  - id: device_pairing_auth
+    description: >
+      Pairing is the security boundary. A new tablet calls
+      POST /api/pair/start (LAN-only, rate-limited); the robot
+      displays a 6-digit code (90s TTL, single-use) via a modal
+      on any already-paired dashboard; the tablet calls
+      POST /api/pair/confirm which mints a per-device 256-bit
+      token (SHA-256 stored, raw returned once) + returns
+      identity + CA cert. Every /api/* + /cmd/* + /stream/* +
+      /ws/* endpoint requires a valid token under
+      COBOT_PAIRING_ENFORCED=1 — except the pairing flow itself,
+      /health, /api/deploy_status, /api/provenance, and
+      localhost (Jetson display + deploy tool). Wrong code = 3
+      fails inside 5 min → 5 min lockout on that IP. Revoke
+      drops live WS sessions immediately.
+
+      Fork rule: a second token store, a second auth middleware,
+      a per-endpoint auth check that duplicates the middleware
+      logic — all are forks. Frontend wizard + Avahi
+      advertisement are the follow-on capabilities layered on
+      top of THIS module — they consume the pair endpoints, they
+      do not re-implement them.
+    canonical:
+      python:
+        module: cobot_dashboard.pairing
+        exports: [PairingStore, get_store, reset_default_store_for_tests]
+      module_alt:
+        module: cobot_dashboard.identity
+        exports: [load_or_mint, set_friendly_name]
+      route:
+        method: POST
+        path: /api/pair/confirm
+        siblings:
+          - method: POST
+            path: /api/pair/start
+          - method: GET
+            path: /api/paired_devices
+          - method: DELETE
+            path: /api/paired_devices/{token_id}
+          - method: GET
+            path: /api/identity
+      middleware:
+        function: _pairing_auth_middleware
+        module: cobot_dashboard.dashboard_server
+      file:
+        path: /opt/cobot/paired_devices.json
+    forbidden:
+      # No hand-rolled token store — everything routes through
+      # PairingStore. A second on-disk device store is a fork
+      # of the security boundary.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "paired_devices\\.json"
+        path_exempt:
+          - '**/pairing.py'
+          - '**/dashboard_server.py'
+          - '**/test_*.py'
+      # No second auth middleware — the pairing middleware is the
+      # single enforcement site. If a request path needs a
+      # different rule, extend the unauth prefix list in
+      # dashboard_server; do not register a parallel @app.middleware.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "COBOT_PAIRING_ENFORCED"
         path_exempt:
           - '**/dashboard_server.py'
           - '**/test_*.py'

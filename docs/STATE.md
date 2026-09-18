@@ -1,6 +1,22 @@
-# STATE.md — current truth as of 2026-08-27 (F1 CLOSED — WS-jog PROVEN, twin phantom-feedback class ENDED, F2 STARTED on bba8cea)
+# STATE.md — current truth as of 2026-09-18 (pairing backend slice landed, default-off)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
+
+## 2026-09-18 session close (backend-only, arm untouched)
+
+- **Device pairing backend landed** default-off (add-57 §686).
+  Identity + PairingStore + auth middleware + 10 WS-handler guards
+  + 5 pair endpoints + revoke-drops-live-WS + fork-registry entry
+  #27 + 9 backend pins. Suites: 22/22 green (13 fork_registry + 9
+  pairing). `COBOT_PAIRING_ENFORCED=0` this session — the ladder is
+  built but inert. Frontend wizard, Avahi advertisement, device-mgmt
+  UI, CA-cert pipeline: scoped to follow-on sessions.
+- **Arm untouched.** Session was code-only, no launch touched, no
+  motion issued. Arm state at session open carries forward.
+- **Next-session opener (pairing track):** frontend wizard slice 1
+  — three pages, `/api/pair/*` client, localStorage token, 401
+  re-pair loop, tests. Then Avahi `_neurobots._tcp` unit. Then
+  operator-flips-flag ritual.
 
 ## Where we are
 
