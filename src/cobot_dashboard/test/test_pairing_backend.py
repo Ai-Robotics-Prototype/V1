@@ -271,6 +271,74 @@ def test_pairing_store_lists_pending_and_deny(tmp_path):
 
 # ── (5) Both-flag suite proof (add-58 §687) ─────────────────────────
 
+# ── (6) Reachability (add-59 §688 field bug) ────────────────────────
+
+def test_identity_enumerates_interface_addresses():
+    """enumerate_advertised_hosts must return every advertised IP so
+    the wizard can probe each one from the client side. Field bug
+    2026-09-18: tablet on 192.168.1.x got "site cannot be reached"
+    on the Jetson's wired IP; discovery has to know the WiFi leg
+    exists and only present addresses reachable from the client."""
+    from cobot_dashboard import identity as ident
+    hosts = ident.enumerate_advertised_hosts()
+    assert isinstance(hosts, dict)
+    assert 'mdns_host' in hosts and hosts['mdns_host'].endswith('.local')
+    assert isinstance(hosts.get('addresses'), list)
+    # IPv6 link-local addresses excluded — they never route across
+    # subnets and would clutter the wizard's unreachable list.
+    for a in hosts['addresses']:
+        assert not a.lower().startswith('fe80:'), (
+            f'fe80:: link-local leaked into advertised addresses: {a}')
+
+
+def test_identity_endpoint_shape_grep_pins_network_payload():
+    """/api/identity returns network:{addresses,mdns_host,port}. Pin
+    the exact wire shape by grep so a refactor that drops the network
+    sub-dict fails this test."""
+    src_path = os.path.join(SERVER_DIR, 'dashboard_server.py')
+    with open(src_path) as fh:
+        src = fh.read()
+    assert "enumerate_advertised_hosts" in src
+    assert "'network':" in src
+    assert "'addresses'" in src
+    assert "'mdns_host'" in src
+    assert "'port'" in src
+
+
+def test_wizard_carries_unreachable_copy_verbatim():
+    """The 2026-09-18 field directive names the copy verbatim.
+    The wizard exports UNREACHABLE_COPY as the single site."""
+    wiz_path = os.path.join(
+        os.path.dirname(SERVER_DIR),
+        'frontend', 'src', 'components', 'DevicePairingWizard.jsx')
+    with open(wiz_path) as fh:
+        js = fh.read()
+    expected = ("This address didn't respond from your device — it may "
+                "be on a different network than this tablet.")
+    assert 'export const UNREACHABLE_COPY' in js, (
+        'UNREACHABLE_COPY must be the single export owning this string')
+    assert expected in js, (
+        f'operator-approved unreachable-copy missing verbatim: {expected!r}')
+
+
+def test_wizard_probes_client_side_and_splits_reachable():
+    """Grep-pin: DiscoverPage builds candidates from /api/identity's
+    network.addresses + network.mdns_host, probes each from the
+    client, splits reachable/unreachable. If a refactor pulls the
+    address list off the server-side host header instead, this test
+    catches the regression."""
+    wiz_path = os.path.join(
+        os.path.dirname(SERVER_DIR),
+        'frontend', 'src', 'components', 'DevicePairingWizard.jsx')
+    with open(wiz_path) as fh:
+        js = fh.read()
+    assert "fetch('/api/identity'" in js
+    assert 'net.addresses' in js or 'network.addresses' in js.replace('net.', 'network.')
+    assert 'mdns_host' in js
+    assert 'Reachable from this device' in js
+    assert 'Advertised but not reachable from this device' in js
+
+
 @pytest.mark.parametrize('flag', ['0', '1'])
 def test_middleware_reads_flag_lazily(flag, monkeypatch, tmp_path):
     """Import the pairing module fresh under both flag states and

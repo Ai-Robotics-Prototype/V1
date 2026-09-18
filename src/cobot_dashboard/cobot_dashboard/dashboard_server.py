@@ -5640,8 +5640,26 @@ if FASTAPI_AVAILABLE:
         return (getattr(client, 'host', '') or '') if client else ''
 
     @app.get("/api/identity")
-    async def api_identity():
-        return _identity_mod.load_or_mint()
+    async def api_identity(request: Request):
+        ident = _identity_mod.load_or_mint()
+        # Attach the network topology so the wizard's DiscoverPage
+        # can probe every address the dashboard actually listens on,
+        # from the client's own side, and only present the ones that
+        # answer (field bug 2026-09-18 add-59 §688: tablet on
+        # 192.168.1.x hit "site cannot be reached" on the wired leg
+        # 192.168.2.246). Port is inferred from the incoming request
+        # so the wizard doesn't have to guess.
+        try:
+            port = request.url.port or 8080
+        except Exception:
+            port = 8080
+        hosts = _identity_mod.enumerate_advertised_hosts()
+        return {**ident, 'network': {
+            'hostname':   hosts.get('hostname', ''),
+            'mdns_host':  hosts.get('mdns_host', ''),
+            'addresses':  hosts.get('addresses', []),
+            'port':       int(port),
+        }}
 
     @app.post("/api/pair/start")
     async def api_pair_start(request: Request):

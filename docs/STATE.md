@@ -24,12 +24,21 @@
 - **Real CA live:** `/opt/cobot/certs/ca.pem` = self-signed 20 y
   root, CN `NeuRobots Root CA NR-5CF998`, returned by
   `/api/pair/confirm` in `ca_cert_pem`.
-- **Next-session opener (pairing track):** operator walkthrough
-  on the real tablet at `https://192.168.2.246:8080` (flag still
-  off) → confirm wizard → confirm PairRequestModal renders on the
-  desktop dashboard → confirm token stored + dashboard loads →
-  confirm Settings → I/O → Paired devices shows the row + Revoke
-  works. THEN the operator decides when to flip
+- **Field bug caught + fixed same session (add-59 §688):**
+  operator's tablet was on WiFi (192.168.1.x); Jetson wired leg
+  192.168.2.246 unroutable from there. Wizard now enumerates every
+  advertised IP via /api/identity and probes each from the client
+  side — only reachable ones show as clickable, unreachable get the
+  exact operator-approved copy "This address didn't respond from
+  your device — it may be on a different network than this tablet."
+- **Next-session opener (pairing track):** operator retry on the
+  real tablet at whichever address the tablet's network CAN reach
+  (`https://192.168.1.143:8080` for WiFi, or `teddy-desktop.local:8080`
+  via mDNS). Wizard renders → reachable list shows the WiFi IP +
+  mdns_host as clickable; the wired IP shows in the greyed
+  "advertised but not reachable" block. Click through, code appears
+  on desktop dashboard, land on dashboard, confirm Settings → I/O
+  paired devices. Then operator decides when to flip
   `COBOT_PAIRING_ENFORCED=1` per the rollout checklist.
 
 ## Where we are

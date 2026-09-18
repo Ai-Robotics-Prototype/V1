@@ -109,36 +109,78 @@ function Field({ label, hint, children }) {
 // candidates on port 8080 via /api/identity. The address-entry fallback
 // covers non-.local networks (managed WiFi, dhcp corp).
 
+// UNREACHABLE_COPY (2026-09-18 add-59 §688 field-directive): the
+// exact operator-facing copy for "you typed an address that didn't
+// answer from your device". Duplicating this string ANYWHERE else
+// is a fork of `mode_refusal_copy`-adjacent doctrine — the wizard
+// is the one voice for pairing errors.
+export const UNREACHABLE_COPY =
+  "This address didn't respond from your device — it may be on a different network than this tablet."
+
 function DiscoverPage({ onFound }) {
   const [address, setAddress] = useState('')
   const [probing, setProbing] = useState(false)
   const [err, setErr]         = useState('')
-  const [candidates, setCandidates] = useState([])
+  // Reachable candidates rendered as clickable rows.
+  const [reachable, setReachable] = useState([])
+  // Addresses the robot claims to listen on that DID NOT answer from
+  // this device — surfaced as informational text so the operator sees
+  // the wired/WiFi split honestly.
+  const [unreachable, setUnreachable] = useState([])
+  const [scanned, setScanned] = useState(false)
+
   const platformNote = useMemo(() => {
     const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || ''
     if (/iPhone|iPad|iPod|Android/.test(ua))
-      return 'On mobile browsers, discovery scans a short list of names. If your robot is not shown, type its address below.'
-    return 'Automatic discovery scans a short list of names on this network. Type an address below if your robot is on a different network.'
+      return "We're checking every network address your robot advertises. Only the ones this tablet can reach appear below."
+    return "We're checking every network address your robot advertises. Only the ones your device can reach appear below."
   }, [])
 
   useEffect(() => {
     let alive = true
     async function scan() {
-      // Probe a small curated set — the robot advertises `<friendly_name>.local`
-      // and the raw hostname. This is a UX helper, not the security surface.
-      const guesses = [
-        `${window.location.hostname}`,
-        'neurobots.local:8080',
-        'cobot.local:8080',
-        'teddy-desktop.local:8080',
-      ].filter(Boolean)
-      const results = []
-      for (const g of guesses) {
-        if (!alive) return
-        const id = await probeRobotIdentity(g)
-        if (id && id.serial) results.push({ host: g, id })
-      }
-      if (alive) setCandidates(results)
+      // Step 1: ask the robot at the CURRENT origin (which loaded
+      // this wizard so we know it's reachable) for its own list of
+      // advertised addresses. /api/identity returns
+      //   {serial, model, friendly_name,
+      //    network: {mdns_host, addresses, port}}.
+      //
+      // Step 2: build one host:port per address + mdns_host, probe
+      // each from the client's own side, split reachable /
+      // unreachable. This is the client-side reachability check that
+      // add-59 §688 requires — the server doesn't decide, the client
+      // does.
+      let own = null
+      try {
+        const res = await fetch('/api/identity', { credentials: 'omit' })
+        if (res.ok) own = await res.json()
+      } catch (_) { /* nop */ }
+      if (!alive) return
+
+      const currentHost = window.location.host          // host:port
+      const net         = (own && own.network) || {}
+      const port        = net.port || Number(window.location.port) || 8080
+      const raw         = new Set()
+      raw.add(currentHost)
+      if (net.mdns_host)  raw.add(`${net.mdns_host}:${port}`)
+      for (const a of net.addresses || []) raw.add(`${a}:${port}`)
+
+      const candidates = Array.from(raw)
+      const probes = candidates.map(async (host) => {
+        const id = await probeRobotIdentity(host)
+        return { host, id, ok: !!(id && id.serial),
+                 current: host === currentHost }
+      })
+      const settled = await Promise.all(probes)
+      if (!alive) return
+      const ok   = settled.filter((r) => r.ok)
+      const bad  = settled.filter((r) => !r.ok)
+      // Put the current-origin row first so the operator has a
+      // guaranteed-working path even if a race made one probe fail.
+      ok.sort((a, b) => (b.current ? 1 : 0) - (a.current ? 1 : 0))
+      setReachable(ok)
+      setUnreachable(bad)
+      setScanned(true)
     }
     scan()
     return () => { alive = false }
@@ -148,15 +190,13 @@ function DiscoverPage({ onFound }) {
     const host = address.trim().replace(/^https?:\/\//i, '')
     if (!host) { setErr('Enter an address'); return }
     setErr(''); setProbing(true)
-    try {
-      const id = await probeRobotIdentity(host)
-      if (!id || !id.serial) throw new Error('That address does not answer as a NeuRobots robot.')
+    const id = await probeRobotIdentity(host)
+    if (id && id.serial) {
       onFound({ host, id })
-    } catch (e) {
-      setErr(e.message || 'Could not reach that address.')
-    } finally {
-      setProbing(false)
+    } else {
+      setErr(UNREACHABLE_COPY)
     }
+    setProbing(false)
   }
 
   return (
@@ -168,24 +208,57 @@ function DiscoverPage({ onFound }) {
       <div style={{ color: NEURO_COLORS.muted, marginBottom: 16, fontSize: 14 }}>
         {platformNote}
       </div>
-      {candidates.length > 0 && (
-        <div style={{ marginBottom: 20 }}>
+      {!scanned && (
+        <div style={{ color: NEURO_COLORS.muted, fontSize: 13, marginBottom: 16 }}>
+          Checking network addresses…
+        </div>
+      )}
+      {scanned && reachable.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
           <div style={{ fontSize: 13, color: NEURO_COLORS.muted, marginBottom: 8 }}>
-            Discovered
+            Reachable from this device
           </div>
-          {candidates.map((c) => (
+          {reachable.map((c) => (
             <div key={c.host}
               onClick={() => onFound(c)}
               style={{
                 padding: '12px 14px', border: `1px solid ${NEURO_COLORS.border}`,
                 borderRadius: 10, marginBottom: 8, cursor: 'pointer',
               }}>
-              <div style={{ fontWeight: 600 }}>{c.id.friendly_name || 'NeuRobots robot'}</div>
+              <div style={{ fontWeight: 600 }}>
+                {c.id.friendly_name || 'NeuRobots robot'}
+                {c.current && (
+                  <span style={{ fontSize: 11, marginLeft: 8, color: NEURO_COLORS.ok,
+                                 padding: '2px 6px', borderRadius: 4,
+                                 border: `1px solid ${NEURO_COLORS.ok}` }}>
+                    connected here
+                  </span>
+                )}
+              </div>
               <div style={{ fontSize: 12, color: NEURO_COLORS.muted, marginTop: 2 }}>
                 {c.id.serial} · {c.id.model} · {c.host}
               </div>
             </div>
           ))}
+        </div>
+      )}
+      {scanned && unreachable.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 13, color: NEURO_COLORS.muted, marginBottom: 6 }}>
+            Advertised but not reachable from this device
+          </div>
+          <div style={{ fontSize: 12, color: NEURO_COLORS.muted, marginBottom: 6,
+                        lineHeight: 1.5 }}>
+            {UNREACHABLE_COPY}
+          </div>
+          <div style={{
+            fontSize: 12, color: NEURO_COLORS.muted,
+            fontFamily: 'ui-monospace, Menlo, monospace',
+            padding: '8px 10px', border: `1px dashed ${NEURO_COLORS.border}`,
+            borderRadius: 8,
+          }}>
+            {unreachable.map((r) => r.host).join('  ·  ')}
+          </div>
         </div>
       )}
       <Field label="Or enter the robot's address"

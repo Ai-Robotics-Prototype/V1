@@ -115,3 +115,47 @@ def reset_cache() -> None:
     global _cached
     with _lock:
         _cached = None
+
+
+def enumerate_advertised_hosts():
+    """Return every host string the dashboard is reachable at.
+
+    Field bug 2026-09-18 (add-59 §688): the operator's tablet hit
+    "site cannot be reached" on the Jetson's wired IP because the
+    tablet was on the WiFi subnet where the wired leg is unroutable.
+    The wizard needs to probe EVERY interface the robot claims to
+    listen on, from the client's own side, and only present the
+    ones that answer.
+
+    Returns:
+      {'mdns_host': str, 'addresses': [str], 'hostname': str}
+
+    All entries are raw host strings (no port, no scheme). The client
+    joins each with `window.location.port` when probing.
+    """
+    hostname = socket.gethostname().split('.')[0].strip() or 'cobot'
+    mdns_host = f'{hostname}.local'
+    addresses = []
+    seen = set()
+    # Interface addresses via `hostname -I` (space-separated list).
+    try:
+        import subprocess
+        out = subprocess.run(
+            ['hostname', '-I'], capture_output=True,
+            text=True, timeout=1.5)
+        for tok in (out.stdout or '').split():
+            tok = tok.strip()
+            if not tok or tok in seen:
+                continue
+            # Skip IPv6 link-local (fe80::) — not routable across subnets.
+            if tok.lower().startswith('fe80:'):
+                continue
+            seen.add(tok)
+            addresses.append(tok)
+    except Exception:
+        pass
+    return {
+        'hostname':  hostname,
+        'mdns_host': mdns_host,
+        'addresses': addresses,
+    }
