@@ -369,6 +369,40 @@ const storeDefinition = (set, get) => ({
   // this edition render NOTHING (absent, not disabled-greyed).
   edition: 'basic',
   editionHydrated: false,
+  // Fleet-home state (2026-09-21 operator directive). Populated once
+  // at boot from /api/fleet/peers. `fleetTotal` gates the back-to-
+  // fleet chip in TopBar; `robotIdentity` names THIS robot in the
+  // E-STOP label + status copy so an operator on the connected
+  // dashboard always knows which robot they can stop.
+  fleetTotal: 1,
+  fleetHydrated: false,
+  robotIdentity: { serial: '', model: '', friendly_name: '' },
+  async hydrateFleet() {
+    try {
+      const res = await fetch('/api/fleet/peers', {
+        credentials: 'omit',
+        cache: 'no-store',
+      })
+      if (!res.ok) {
+        set({ fleetHydrated: true })
+        return
+      }
+      const body = await res.json()
+      const self = (body && body.self) || null
+      const ident = (self && self.identity) || {}
+      set({
+        fleetTotal:   Math.max(1, Number(body?.total || 1)),
+        fleetHydrated: true,
+        robotIdentity: {
+          serial:        String(ident.serial || ''),
+          model:         String(ident.model || ''),
+          friendly_name: String(ident.friendly_name || ''),
+        },
+      })
+    } catch {
+      set({ fleetHydrated: true })
+    }
+  },
   async hydrateEdition() {
     try {
       const res = await fetch('/api/edition', {

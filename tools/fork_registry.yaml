@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4584
+        line: 4586
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -743,10 +743,12 @@ capabilities:
           controller_offline flag wiring in _cri_proxy_staleness_loop
           and _on_estun_status); 2026-09-18 device pairing backend
           → 4466 (+170 for identity + pairing imports, HTTP+WS
-          auth middleware helpers, and per-WS-handler auth guards).
+          auth middleware helpers, and per-WS-handler auth guards);
+          2026-09-21 fleet home → 4586 (+2 for the fleet import
+          + /api/fleet/ line in _UNAUTH_PATH_PREFIXES).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4719
+        line: 4721
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Drift history: 4156 → 4267 → 4322 → 4349 →
@@ -760,7 +762,9 @@ capabilities:
           2026-09-15 auto-recovery → 4418 (+39 for the WS-mode
           staleness watchdog + controller_offline flag wiring);
           2026-09-18 device pairing backend → 4601 (+183 for
-          pairing endpoints + auth middleware + per-WS guards).
+          pairing endpoints + auth middleware + per-WS guards);
+          2026-09-21 fleet home → 4721 (+2 for the fleet import
+          + /api/fleet/ line in _UNAUTH_PATH_PREFIXES).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0

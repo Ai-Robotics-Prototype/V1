@@ -121,6 +121,7 @@ except ImportError:
 # gated by COBOT_PAIRING_ENFORCED (default off during rollout — the
 # ladder is implemented but inert until an operator flips the flag).
 from cobot_dashboard import identity as _identity_mod
+from cobot_dashboard import fleet as _fleet_mod
 from cobot_dashboard import pairing as _pairing_mod
 from cobot_dashboard import user_store as _user_mod
 
@@ -153,6 +154,7 @@ _UNAUTH_CONTROL_PATHS = (
 _UNAUTH_PATH_PREFIXES = (
     '/api/pair/',
     '/api/identity',      # robot serial/name for discovery UI
+    '/api/fleet/',        # VIEW-tier fleet home (status + peers)
     '/health',
     '/api/deploy_status', # deploy banner must render even pre-pair
     '/api/provenance',    # provenance hello check
@@ -5795,6 +5797,32 @@ if FASTAPI_AVAILABLE:
             'addresses':  hosts.get('addresses', []),
             'port':       int(port),
         }}
+
+    # ── Fleet home (Standard-Bots-style) ─────────────────────────────
+    # Two VIEW-tier endpoints:
+    #   * /api/fleet/status — cheap self snapshot (identity + status
+    #     ladder), consumed by OTHER robots' fleet-home probes.
+    #   * /api/fleet/peers  — Avahi-browse + parallel probe. This is
+    #     what the frontend's FleetHome page calls on load.
+    # Neither endpoint accepts a control payload. The registry stays
+    # a read model in v1 — fleet-level control (start/stop from grid)
+    # is deferred per the operator directive; adding it here would
+    # need its own auth + refusal ladder.
+
+    @app.get("/api/fleet/status")
+    async def api_fleet_status():
+        ident = _identity_mod.load_or_mint()
+        with _state_lock:
+            state_snapshot = copy.deepcopy(STATE)
+        return _fleet_mod.compose_self_status(ident, state_snapshot)
+
+    @app.get("/api/fleet/peers")
+    async def api_fleet_peers():
+        ident = _identity_mod.load_or_mint()
+        with _state_lock:
+            state_snapshot = copy.deepcopy(STATE)
+        self_status = _fleet_mod.compose_self_status(ident, state_snapshot)
+        return await _fleet_mod.compose_fleet_peers(ident, self_status)
 
     @app.post("/api/pair/start")
     async def api_pair_start(request: Request):
