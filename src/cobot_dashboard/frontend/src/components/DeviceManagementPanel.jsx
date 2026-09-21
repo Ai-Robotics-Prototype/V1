@@ -82,6 +82,14 @@ export default function DeviceManagementPanel() {
       background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12,
       padding: 20, color: C.text, marginTop: 16,
       fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+      // 2026-09-21 field bug B remainder: without a reserved height
+      // the section grew from "Loading…" (short) → populated list
+      // (tall) after the fetch resolved, and the layout shift read
+      // to the operator as a "flash" even after the color retheme.
+      // Reserve a stable height so the section always occupies the
+      // same footprint; content transitions in place without
+      // jittering the port map above it.
+      minHeight: 140,
     }}>
       <div style={{
         display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
