@@ -169,29 +169,26 @@ test('DevicePairingWizard is an OVERLAY, not a top-level return branch', () => {
       + 'event listener).'))
 })
 
-test('DeviceManagementPanel uses IOPage-white theme (no dark flash)', () => {
-  // 2026-09-21 field bug B (real root cause): the operator's "brief
-  // pair device prompt flash" on I/O nav was the DeviceManagement-
-  // Panel's dark #141418 panel bg rendering against the IOPortMap's
-  // white parent. Under a white-themed IOPage, the panel MUST NOT
-  // reintroduce a dark bg color — any dark hex here regresses the
-  // field bug at the exact same site.
-  const dmpPath = join(FRONT_ROOT, 'src', 'components',
-                        'DeviceManagementPanel.jsx')
-  const src = readFileSync(dmpPath, 'utf8')
-  // Extract the color table (a `const C = { ... }` block near the top).
-  const cIdx = src.indexOf('const C = {')
-  assert.ok(cIdx > 0,
-    v('DeviceManagementPanel must define its color palette as '
-      + '`const C = { ... }` at the top of the file (grep pin).'))
-  const cBlock = src.slice(cIdx, cIdx + 600)
-  // Forbid the four dark tokens the old table used.
-  for (const forbidden of ['#0C0C0E', '#141418', '#242429', '#F4F4F6']) {
-    assert.equal(cBlock.includes(forbidden), false,
-      v(`DeviceManagementPanel color table must NOT contain `
-        + `"${forbidden}" — that dark token is what produced the `
-        + `2026-09-21 I/O-nav flash. Keep the light-theme palette.`))
-  }
+test('IOPage does NOT mount DeviceManagementPanel', () => {
+  // 2026-09-21 operator directive: the paired-devices section
+  // (added add-58 §687 for discoverability) is RETIRED from
+  // IOPage. Its render was flashing on tab-nav (first as a dark
+  // panel, then as a layout shift even after retheme). Operator
+  // wants it gone from the I/O surface entirely. If a paired-
+  // devices list is needed later it belongs on a dedicated
+  // Settings tab, not stacked below operational I/O.
+  const ioSrc = readFileSync(
+    join(FRONT_ROOT, 'src', 'pages', 'IOPage.jsx'), 'utf8')
+  // Forbid the IMPORT and the JSX usage. Commentary references
+  // (explaining why it was removed) are allowed so the tombstone
+  // survives a casual re-read of the file.
+  assert.equal(/^import\s+DeviceManagementPanel/m.test(ioSrc), false,
+    v('IOPage.jsx must not import DeviceManagementPanel — '
+      + 'operator directive 2026-09-21.'))
+  assert.equal(/<DeviceManagementPanel\b/.test(ioSrc), false,
+    v('IOPage.jsx must not render <DeviceManagementPanel> — '
+      + 'the paired-devices section is retired from the I/O tab. '
+      + 'If it needs to come back, put it on a Settings tab.'))
 })
 
 test('roboai-pair-required event goes through the confirmation probe', () => {

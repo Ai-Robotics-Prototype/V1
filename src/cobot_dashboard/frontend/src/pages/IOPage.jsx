@@ -1,5 +1,4 @@
 import IOPortMap from '../components/IOPortMap'
-import DeviceManagementPanel from '../components/DeviceManagementPanel'
 
 // I/O tab — routes to the v2 Port Map ONLY. The legacy IOPanel
 // (a flat list mirror of digital / analog port states) used to
@@ -9,10 +8,12 @@ import DeviceManagementPanel from '../components/DeviceManagementPanel'
 // 2026-07-22 after IOPortMap v2 landed with live values + manual
 // actuation. IOPanel.jsx is now dead code and has been deleted.
 //
-// 2026-09-18 add-58 §687: DeviceManagementPanel lives below the
-// port map. Same page keeps the "operator settings" surfaces
-// discoverable in one place; a separate Settings tab would be a
-// second navigation site to reason about.
+// 2026-09-21 operator directive: DeviceManagementPanel RETIRED
+// from this page. The paired-devices list added at add-58 §687
+// was a settings surface parked on I/O for discoverability; the
+// operator does not want it flashing here on tab nav. If the list
+// is needed again it belongs on a dedicated Settings tab, not
+// alongside operational I/O.
 export default function IOPage() {
   return (
     <div style={{
@@ -23,7 +24,6 @@ export default function IOPage() {
       boxSizing: 'border-box',
     }}>
       <IOPortMap />
-      <DeviceManagementPanel />
     </div>
   )
 }
