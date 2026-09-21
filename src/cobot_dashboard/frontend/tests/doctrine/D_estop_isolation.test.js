@@ -152,13 +152,21 @@ test('DevicePairingWizard is an OVERLAY, not a top-level return branch', () => {
       + 'return` block. Rendering it as a top-level early return '
       + 'unmounts the dashboard tree on every spurious pair-required '
       + 'event — the exact 2026-09-21 I/O-tab flash bug.'))
-  // Positive assertion: the wizard IS rendered inside the JSX
-  // subtree that also contains PairRequestModal / LoginModal.
-  assert.ok(/\{needsPair && \(\s*<DevicePairingWizard/.test(appSrc),
-    v('DevicePairingWizard must render as `{needsPair && '
-      + '(<DevicePairingWizard ... />)}` alongside PairRequestModal '
-      + '/ LoginModal — an overlay layered on top of the dashboard, '
-      + 'never a replacement for it.'))
+  // Positive assertion: DevicePairingWizardOverlay wraps the
+  // wizard as an overlay (double-gated component). The overlay
+  // itself is rendered in the same tree as PairRequestModal /
+  // LoginModal, so it never replaces the dashboard.
+  assert.ok(/<DevicePairingWizardOverlay/.test(appSrc),
+    v('App.jsx must render <DevicePairingWizardOverlay ... /> '
+      + 'in the JSX tree (never a top-level return). The overlay '
+      + 'wrapper is the double-gate that swallows spurious pair-'
+      + 'required events under an unenforced backend.'))
+  assert.ok(/function DevicePairingWizardOverlay/.test(appSrc),
+    v('App.jsx must define DevicePairingWizardOverlay — the '
+      + 'wrapper that probes /api/paired_devices before mounting '
+      + 'the wizard (belt-and-suspenders against any code path '
+      + 'that flips needsPair=true without going through the '
+      + 'event listener).'))
 })
 
 test('roboai-pair-required event goes through the confirmation probe', () => {

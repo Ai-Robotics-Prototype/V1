@@ -34,6 +34,12 @@ const storeDefinition = (set, get) => ({
   lidarWsStatus: 'disconnected',
   wsLatency: 0,
   lastMessageTime: 0,
+  // Client-side E-STOP latch — see the WS state merge above for the
+  // full story. 2500 ms window covers the ~50–100 ms POST + several
+  // subsequent WS ticks so a slow backend can't reopen the flash
+  // window. Cleared implicitly when the timestamp ages out.
+  _estopPressTs: 0,
+  _estopLatchMs: 2500,
   // Cross-client staleness invariant (2026-07-31 §D10 in the
   // Program Doctrine). programRevConfirmed goes:
   //   * true  — a fresh /api/programs/<id> fetch confirmed the
@@ -770,8 +776,32 @@ const storeDefinition = (set, get) => ({
         // idle→run→pause cycle classifies state=3 correctly.
         const _nextIntent = (_prevProgState === 2 && _curProgState === 0)
           ? null : get().programIntent
+        // Client-side E-STOP latch (2026-09-21 regression sweep,
+        // bug A part 2). Root cause of the persistent flash: the
+        // WS state broadcast fires every ~40 ms independent of the
+        // POST /cmd/estop. In the ~50–100 ms window between the
+        // client's optimistic set(estop=true) and the backend's
+        // acknowledgement, the WS pushes the PRE-POST snapshot
+        // (estop=false) and clobbered our optimistic true. The
+        // overlay unmounted, the operator saw a flash, then the
+        // backend caught up and it remounted.
+        // Fix: hold the client's optimistic `estop=true` for
+        // ESTOP_LATCH_MS after the press. During that window the
+        // WS merge PRESERVES estop=true even if the incoming
+        // snapshot says false. Backend-composed estop (SW OR HW
+        // per test_software_estop_latch.py) is authoritative
+        // AFTER the latch expires.
+        const _pressAt   = get()._estopPressTs || 0
+        const _pressAge  = Date.now() - _pressAt
+        const _incoming  = msg.safety
+        let _mergedSafety = _incoming ?? get().safety
+        if (_incoming && _pressAt > 0
+            && _pressAge < get()._estopLatchMs
+            && _incoming.estop === false) {
+          _mergedSafety = { ..._incoming, estop: true }
+        }
         set({
-          safety: msg.safety ?? get().safety,
+          safety: _mergedSafety,
           joints: msg.joints ?? get().joints,
           robot: msg.robot ?? get().robot,
           task: msg.task ?? get().task,
@@ -976,8 +1006,15 @@ const storeDefinition = (set, get) => ({
   // ---------------------------------------------------------------------------
 
   triggerEstop() {
-    // Optimistic update
-    set((s) => ({ safety: { ...s.safety, estop: true } }))
+    // Optimistic update + client-side latch (see WS state merge for
+    // the race explanation). Stamping _estopPressTs FIRST guarantees
+    // any WS broadcast that lands during the fetch preserves our
+    // optimistic true instead of clobbering it with the pre-POST
+    // server snapshot.
+    set((s) => ({
+      safety: { ...s.safety, estop: true },
+      _estopPressTs: Date.now(),
+    }))
     get().sendCommand('estop', { active: true })
   },
 
@@ -987,12 +1024,16 @@ const storeDefinition = (set, get) => ({
       get().addToast('Move clear first (> 1.2 m) — zone must be GREEN', 'warning')
       return
     }
+    // Clear the latch immediately — subsequent WS broadcasts must
+    // reflect the release without a 2.5 s hold.
+    set({ _estopPressTs: 0 })
     get().sendCommand('estop', { active: false })
   },
 
   overrideEstop() {
     // Bypass zone check — operator has manually verified area is clear.
     // Speed stays at 0 until zone naturally returns to GREEN.
+    set({ _estopPressTs: 0 })  // clear latch — same reason as releaseEstop
     get().sendCommand('estop', { active: false, override: true })
   },
 

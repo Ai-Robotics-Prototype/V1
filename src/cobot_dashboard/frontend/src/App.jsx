@@ -80,6 +80,48 @@ class ErrorBoundary extends Component {
   }
 }
 
+// Double-gate wrapper (2026-09-21 regression sweep). The wizard's
+// Screen wrapper is a full-viewport #0C0C0E overlay — even one
+// frame is visible as a black flash. This wrapper acts as the
+// SECOND gate: it mounts the wizard ONLY after confirming the
+// backend actually requires pairing (probe /api/paired_devices ==
+// 401). The first gate (App's event listener) already covers the
+// stale-token race; this one is belt-and-suspenders against any
+// path that flips needsPair=true directly.
+function DevicePairingWizardOverlay({ needsPair, onDismiss, onPaired }) {
+  const [confirmed, setConfirmed] = useState(false)
+  useEffect(() => {
+    if (!needsPair) { setConfirmed(false); return }
+    let alive = true
+    ;(async () => {
+      try {
+        const res = await fetch('/api/paired_devices', {
+          credentials: 'omit',
+          cache:       'no-store',
+        })
+        if (!alive) return
+        if (res.ok) {
+          // Backend does not require pairing — swallow the mount
+          // request. Never let the black Screen wrapper flash.
+          // eslint-disable-next-line no-console
+          console.warn('[wizard-overlay] skipped mount — backend unenforced')
+          onDismiss()
+          return
+        }
+        setConfirmed(true)   // 401 → legitimately mount
+      } catch (_) {
+        if (!alive) return
+        setConfirmed(true)   // network error → mount so operator can retry
+      }
+    })()
+    return () => { alive = false }
+  }, [needsPair, onDismiss])
+  if (!needsPair || !confirmed) return null
+  return (
+    <DevicePairingWizard onComplete={onPaired} onSkip={onDismiss} />
+  )
+}
+
 // App shell.
 // - width/maxWidth: pin to viewport (sw=iw measurements confirm no overflow).
 // - height inherits 100dvh from #root via tokens.css, so the bottom row
@@ -394,17 +436,19 @@ export default function App() {
             the dashboard behind it is exactly where the operator
             left it. Fixes the 2026-09-21 IO-tab black-flash bug
             (see the operator's field report + commit body).
-            Wizard is skipped entirely under !needsPair — cheap. */}
-        {needsPair && (
-          <DevicePairingWizard
-            onComplete={() => {
-              setNeedsPair(false)
-              try { connectWS() } catch (_) { /* nop */ }
-              try { hydrateEdition() } catch (_) { /* nop */ }
-            }}
-            onSkip={() => setNeedsPair(false)}
-          />
-        )}
+            Wizard is skipped entirely under !needsPair — cheap.
+            The event listener already probes /api/paired_devices
+            before setting needsPair=true; the wizard renders only
+            after that gate has said "yes, we do need this". */}
+        <DevicePairingWizardOverlay
+          needsPair={needsPair}
+          onDismiss={() => setNeedsPair(false)}
+          onPaired={() => {
+            setNeedsPair(false)
+            try { connectWS() } catch (_) { /* nop */ }
+            try { hydrateEdition() } catch (_) { /* nop */ }
+          }}
+        />
       </div>
     </ErrorBoundary>
   )
