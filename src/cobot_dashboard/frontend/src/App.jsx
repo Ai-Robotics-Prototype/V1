@@ -33,6 +33,7 @@ import ProgramLibrary from './pages/ProgramLibrary'
 import IOPage from './pages/IOPage'
 import SafetyPage from './pages/SafetyPage'
 import EventLog from './pages/EventLog'
+import SynapsePage from './pages/SynapsePage'
 import FleetHome from './pages/FleetHome'
 import { pickLandingView } from './lib/fleet'
 
@@ -293,6 +294,7 @@ export default function App() {
     configure:        <ConfigureLayout />,
     safety:           <SafetyPage />,
     event_log:        <EventLog />,
+    synapse:          <SynapsePage />,
   }
 
   // Edition gate for the layout switch (2026-09-04, extended

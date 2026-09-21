@@ -70,6 +70,9 @@ FEATURE_MAP: dict = {
     '3d_view':            EDITION_BASIC,
     'io_panel':           EDITION_BASIC,
     'event_log':          EDITION_BASIC,
+    # 2026-09-21 Synapse Connection Map — read-only wiring reference,
+    # both editions. VIEW-tier; no backend surface.
+    'synapse':            EDITION_BASIC,
     'per_step_overrides': EDITION_BASIC,
     # Full-only surfaces. Each has its own backend refusal wired on
     # the endpoints ONLY consumed by that surface — endpoints that

@@ -44,6 +44,9 @@ export const FEATURE_MAP = Object.freeze({
   '3d_view':          EDITION_BASIC,
   io_panel:           EDITION_BASIC,
   event_log:          EDITION_BASIC,
+  // 2026-09-21 Synapse Connection Map — read-only wiring reference,
+  // both editions. VIEW-tier, no backend surface, static layout.
+  synapse:            EDITION_BASIC,
   per_step_overrides: EDITION_BASIC,
   // Full-only (six surfaces hidden on Basic).
   cameras_lidar:      EDITION_FULL,
@@ -126,5 +129,6 @@ export const TAB_TO_FEATURE = Object.freeze({
   io:               'io_panel',
   safety:           'safety_page',
   event_log:        'event_log',
+  synapse:          'synapse',
   configure:        'configure',
 })

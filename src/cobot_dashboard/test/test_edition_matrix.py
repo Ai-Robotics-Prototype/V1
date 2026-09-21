@@ -69,6 +69,9 @@ def test_basic_set_exact():
         'corner_smoothing',
         'deep_editor', '3d_view', 'io_panel',
         'event_log', 'per_step_overrides',
+        # 2026-09-21 Synapse Connection Map — VIEW-tier read-only
+        # wiring reference in both editions.
+        'synapse',
     }
 
 
@@ -204,7 +207,8 @@ def test_tab_to_feature_map_present_and_covers_every_tab():
     # parser, so we assert against the known set).
     expected_tabs = {
         'monitor', 'programs', 'program', '3dview', 'sensors',
-        'adaptive_picking', 'io', 'safety', 'event_log', 'configure',
+        'adaptive_picking', 'io', 'safety', 'event_log', 'synapse',
+        'configure',
     }
     assert set(tab_map.keys()) == expected_tabs
     # The safety TAB maps to `safety_page` which IS edition-gated.

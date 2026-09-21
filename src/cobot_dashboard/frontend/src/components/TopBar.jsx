@@ -17,6 +17,11 @@ const TABS = [
   // platform surfaces. Sits under Safety in nav order so operators
   // reach for it in the "something went wrong" mental sequence.
   { id: 'event_log',        label: 'Event Log' },
+  // 2026-09-21 Synapse Connection Map — read-only wiring reference
+  // for the Synapse controller (pneumatic valves, digital IO, safety
+  // connectors). Static layout in this pass; hooks ready for a
+  // later "glow when energized" pass. VIEW-tier, both editions.
+  { id: 'synapse',          label: 'Synapse' },
   { id: 'configure',        label: 'Configure' },
 ]
 
