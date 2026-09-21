@@ -36,6 +36,20 @@ PART_FIELDS = {
 }
 ACTION_FIELDS = {'action'}
 LABEL_FIELDS  = {'label'}
+# Pattern-family (Task 1 §5, 2026-07-28) — carries the count/pattern
+# corrections the composer's unroll consumes. Landing these in their
+# own bucket means the future local model can be trained specifically
+# on "AI said 1 pair, operator wanted N" without them being drowned
+# by generic 'other' scalar drift.
+PATTERN_FIELDS = {
+    'iter_index', 'iter_count', 'iter_pattern',
+    'count', 'count_hint',
+    'pick_pattern', 'place_pattern',
+    'pick_pitch_dx_mm', 'pick_pitch_dy_mm',
+    'place_pitch_dx_mm', 'place_pitch_dy_mm',
+    'place_stack_dz_mm',
+    'iter_offset_mm',
+}
 
 
 def _categorize(field_name: str) -> str:
@@ -46,6 +60,7 @@ def _categorize(field_name: str) -> str:
     if field_name in PART_FIELDS:    return 'part'
     if field_name in ACTION_FIELDS:  return 'action'
     if field_name in LABEL_FIELDS:   return 'label'
+    if field_name in PATTERN_FIELDS: return 'pattern'
     return 'other'
 
 
@@ -306,16 +321,71 @@ def compute_correction_diff(ai_draft: Optional[Dict[str, Any]],
             entry['offset_z_delta_mm'] = oz['delta']
         matched_pairs.append(entry)
 
-    added_summary = [{
-        'corrected_index': ci,
-        'action':          str(cs.get('action') or ''),
-        'label':           str(cs.get('label') or ''),
-    } for ci, cs in match['added']]
-    removed_summary = [{
-        'draft_index':     di,
-        'action':          str(ds.get('action') or ''),
-        'label':           str(ds.get('label') or ''),
-    } for di, ds in match['removed']]
+    def _iter_meta(step):
+        m = {}
+        for k in ('iter_index', 'iter_count', 'iter_pattern'):
+            v = step.get(k)
+            if v is not None:
+                m[k] = v
+        return m or None
+    added_summary = []
+    for ci, cs in match['added']:
+        rec = {
+            'corrected_index': ci,
+            'action':          str(cs.get('action') or ''),
+            'label':           str(cs.get('label') or ''),
+        }
+        im = _iter_meta(cs)
+        if im:
+            rec['iter'] = im
+        added_summary.append(rec)
+    removed_summary = []
+    for di, ds in match['removed']:
+        rec = {
+            'draft_index':     di,
+            'action':          str(ds.get('action') or ''),
+            'label':           str(ds.get('label') or ''),
+        }
+        im = _iter_meta(ds)
+        if im:
+            rec['iter'] = im
+        removed_summary.append(rec)
+
+    # Task 1 §5 (2026-07-28): first-class pattern-correction summary.
+    # Infer per-operation iteration count from the max iter_count seen
+    # in each program's steps. The AI's initial draft carries iter_count
+    # only when count>1 (bit-identical single-pair guard); a count=1
+    # draft therefore reports iter_count_max=1. When the corrected
+    # program's iter_count_max exceeds the draft's, this correction
+    # represents the exact class the three-bowl demo failed on
+    # (transcript said 3, draft said 1, operator answered 3).
+    def _max_iter_count(steps):
+        best = 1
+        for s in steps:
+            v = (s or {}).get('iter_count')
+            try:
+                if isinstance(v, (int, float)) and int(v) > best:
+                    best = int(v)
+            except Exception:
+                pass
+        return best
+    def _pick_pattern(steps):
+        for s in steps:
+            p = (s or {}).get('iter_pattern')
+            if p:
+                return str(p)
+        return None
+    draft_count = _max_iter_count(draft_steps)
+    corr_count  = _max_iter_count(corr_steps)
+    pattern_correction = None
+    if draft_count != corr_count or _pick_pattern(draft_steps) != _pick_pattern(corr_steps):
+        pattern_correction = {
+            'draft_iter_count':     draft_count,
+            'corrected_iter_count': corr_count,
+            'draft_pattern':        _pick_pattern(draft_steps),
+            'corrected_pattern':    _pick_pattern(corr_steps),
+            'count_delta':          corr_count - draft_count,
+        }
 
     top_level_changed_count = (
         (1 if 'name'        in top else 0)
@@ -343,6 +413,7 @@ def compute_correction_diff(ai_draft: Optional[Dict[str, Any]],
         'steps_reordered':  len(match['reordered']),
         'poses_adjusted':   poses_adjusted,
         'fields_by_category': category_totals,
+        'pattern_correction': pattern_correction,
         'degraded':         degraded,
         'notes':            notes,
     }

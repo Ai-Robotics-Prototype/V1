@@ -35,6 +35,31 @@ launch
 ## Architecture
 See [CLAUDE.md](CLAUDE.md) for full architecture documentation.
 
+## Editions (basic + full)
+
+The dashboard ships as a single codebase with two editions selected by a
+feature-map switch: **basic** (operator tablet — Monitor, Program Library,
+Wizard, Demonstration, Speed, Corner smoothing) and **full** (our PC —
+adds Deep Editor, 3D View, Cameras & LiDAR, Part Recognition, I/O Panel,
+Event Log, Configure). E-STOP, safety interlocks, delete integrity, and
+codegen behaviour are edition-independent and cannot be gated.
+
+Repo rules (non-negotiable):
+- **ONE repo, ONE branch flow.** No edition branches, ever.
+- **Releases are TAGS**: `vX.Y-basic` and `vX.Y-full` cut from the SAME
+  commit. Both editions ship whatever's on that commit; the runtime
+  edition flag decides which surfaces render.
+- **Feature map is the single source of truth**:
+  - Backend: `src/cobot_dashboard/cobot_dashboard/edition.py`
+  - Frontend mirror: `src/cobot_dashboard/frontend/src/lib/edition.js`
+  - Drift caught by `src/cobot_dashboard/test/test_edition_matrix.py`.
+- **Safety-invariant keys** (`estop`, `safety_interlocks`,
+  `delete_integrity`, `codegen`, `refusal_gates`) MUST NOT appear as
+  feature keys. Both edition modules reject them at import time.
+- Per-device edition persists in `/opt/cobot/dashboard_editions.json`
+  and is unlocked via the StatusBar affordance (passphrase from
+  `COBOT_EDITION_UNLOCK_PASS`, default `full-please`).
+
 ## Packages
 
 | Package | Type | Role |
