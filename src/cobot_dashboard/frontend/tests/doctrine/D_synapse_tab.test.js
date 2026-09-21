@@ -66,13 +66,22 @@ test('App.jsx routes activeTab="synapse" to <SynapsePage />', () => {
 
 // ── (2) Section counts + (3) labels match the data ──────────────────
 
-test('SynapsePage defines VALVES with exactly 10 entries', () => {
-  const m = pageSrc.match(/const VALVES = \[([\s\S]*?)\]/)
-  assert.ok(m, v('VALVES array not found'))
-  const entries = m[1].match(/\{\s*id:/g) || []
-  assert.equal(entries.length, 10,
-    v(`VALVES must have 10 entries — found ${entries.length}. `
+test('SynapsePage defines 10 valve slots + 8 valve-type entries', () => {
+  // 2026-09-21 valve-info directive: valve rows now live on
+  // `_VALVE_SLOTS` (id/label/type triples) and derive final
+  // `VALVES` by merging in the per-type copy from
+  // `VALVE_TYPE_INFO`. Pin both.
+  const slots = pageSrc.match(/const _VALVE_SLOTS = \[([\s\S]*?)\]/)
+  assert.ok(slots, v('_VALVE_SLOTS array not found'))
+  const slotEntries = slots[1].match(/\{\s*id:/g) || []
+  assert.equal(slotEntries.length, 10,
+    v(`_VALVE_SLOTS must have 10 entries — found ${slotEntries.length}. `
       + `The mock's pneumatic section is 2 rows of 5.`))
+  // VALVES is derived; must be built via .map so id/label/type
+  // + title/plain_explanation/best_use all end up on each entry.
+  assert.ok(/const VALVES = _VALVE_SLOTS\.map/.test(pageSrc),
+    v('VALVES must be `_VALVE_SLOTS.map((v) => ({ ...v, ...(VALVE_TYPE_INFO[v.type] || {}) }))` '
+      + 'so per-type copy attaches without duplicating slot data.'))
 })
 
 test('VALVES types match the mock exactly', () => {
@@ -568,4 +577,131 @@ test('valve-card ports stack VERTICALLY (PA above PB)', () => {
   assert.ok(contIdx > 0 && paIdx > contIdx && pbIdx > paIdx,
     v('The ports container must precede <PneumaticPortGlyph _PA> and '
       + '<PneumaticPortGlyph _PB> in that order.'))
+})
+
+
+// ── Valve-info panel (2026-09-21 operator directive) ────────────────
+
+test('every VALVE_TYPE_INFO entry has non-empty plain_explanation + best_use', () => {
+  // The data-completeness pin — the operator explicitly required
+  // "each valve entry has non-empty plain_explanation + best_use".
+  // Parse the map at source level: locate the VALVE_TYPE_INFO
+  // block, walk each `'key': { ... }` entry, and assert both
+  // fields are present + non-empty (>= 20 chars — short enough
+  // that a real one-liner passes, long enough to catch stub
+  // placeholders).
+  const infoIdx = pageSrc.indexOf('const VALVE_TYPE_INFO = {')
+  assert.ok(infoIdx > 0, v('VALVE_TYPE_INFO map must exist'))
+  const infoEnd = pageSrc.indexOf('\n}\n', infoIdx)
+  assert.ok(infoEnd > 0, v('VALVE_TYPE_INFO closing brace not found'))
+  const block = pageSrc.slice(infoIdx, infoEnd + 2)
+  // Grep every `'TYPE': { ... }` pair. TYPE keys use single quotes
+  // and contain / characters — accept them.
+  const entryPattern = /'([^']+)':\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g
+  const entries = [...block.matchAll(entryPattern)]
+  assert.ok(entries.length >= 8,
+    v(`VALVE_TYPE_INFO must have at least 8 entries (one per valve `
+      + `TYPE in the mock) — found ${entries.length}.`))
+  // Every REQUIRED type must be present.
+  const requiredTypes = [
+    '5/2 SS', '5/2 DS', '5/3',
+    'HI/LO 3/2 N/C', 'HI/LO 3/2 N/O', 'HI/LO 2/2 N/C',
+    'SPARE 1', 'SPARE 2',
+  ]
+  const foundKeys = new Set(entries.map((m) => m[1]))
+  for (const t of requiredTypes) {
+    assert.ok(foundKeys.has(t),
+      v(`VALVE_TYPE_INFO must include key ${JSON.stringify(t)} — `
+        + `operator directive covers all card labels.`))
+  }
+  // Every entry must have non-empty title + plain_explanation +
+  // best_use. Field bodies are concatenated string-plus expressions;
+  // the pin only requires presence + minimum length.
+  for (const [, key, body] of entries) {
+    for (const field of ['title', 'plain_explanation', 'best_use']) {
+      const re = new RegExp(`${field}:\\s*(['"][^'"]{0,400}['"]|[^,}]{15,})`, 's')
+      assert.ok(re.test(body),
+        v(`VALVE_TYPE_INFO[${JSON.stringify(key)}] must include a `
+          + `non-empty ${field}.`))
+    }
+  }
+})
+
+test('ValveCard opens ValveInfoPanel on click (VIEW-tier, keyboard-accessible)', () => {
+  // Card is a <button> — Enter/Space work automatically for
+  // keyboard operators.
+  const idx = pageSrc.indexOf('function ValveCard(')
+  assert.ok(idx > 0, v('ValveCard must exist'))
+  const nextFn = pageSrc.indexOf('\nfunction ', idx + 1)
+  const body = pageSrc.slice(idx, nextFn > 0 ? nextFn : idx + 4000)
+  assert.ok(/<button\b/.test(body),
+    v('ValveCard must render a <button> element (keyboard-'
+      + 'accessible via Enter/Space by default).'))
+  assert.ok(/onOpen\(valve\)/.test(body),
+    v('ValveCard must invoke `onOpen(valve)` on click so the '
+      + 'parent (SynapsePage) can open the ValveInfoPanel.'))
+  // Hover affordance discoverability — cursor: pointer + subtle
+  // lift. Grep for the two markers.
+  assert.ok(/cursor:\s*['"]pointer['"]/.test(body),
+    v('ValveCard must set cursor: pointer so tap targets are '
+      + 'visually discoverable.'))
+  assert.ok(/translateY\(/.test(body),
+    v('ValveCard must apply a translateY lift on hover/focus '
+      + '(hover discoverability affordance).'))
+})
+
+test('ValveInfoPanel is VIEW-tier (no control verbs)', () => {
+  // Extract the ValveInfoPanel function body and forbid any
+  // control-path token. This is a pure read view of the valve's
+  // copy — no /api, no /cmd, no POST/PUT/DELETE/PATCH, no
+  // dispatchEvent, no useStore write actions.
+  const idx = pageSrc.indexOf('function ValveInfoPanel(')
+  assert.ok(idx > 0, v('ValveInfoPanel must exist'))
+  const nextFn = pageSrc.indexOf('\nfunction ', idx + 1)
+  const body = pageSrc.slice(idx, nextFn > 0 ? nextFn : idx + 5000)
+  for (const forbidden of [
+    { pat: /\bfetch\s*\(/,       label: 'fetch()' },
+    { pat: /dispatchEvent\s*\(/, label: 'dispatchEvent()' },
+    { pat: /\/api\//,            label: '/api/ path literal' },
+    { pat: /\/cmd\//,            label: '/cmd/ path literal' },
+    { pat: /method:\s*['"](POST|PUT|DELETE|PATCH)['"]/,
+      label: 'POST/PUT/DELETE/PATCH method' },
+  ]) {
+    assert.equal(forbidden.pat.test(body), false,
+      v(`ValveInfoPanel must NOT contain ${forbidden.label} — the `
+        + `panel is a read-only explainer with zero control `
+        + `affordances.`))
+  }
+})
+
+test('ValveInfoPanel exposes stable testids for open/close + content', () => {
+  for (const tid of [
+    'synapse-valve-info-backdrop',
+    'synapse-valve-info-panel',
+    'synapse-valve-info-title',
+    'synapse-valve-info-close',
+    'synapse-valve-info-explanation',
+    'synapse-valve-info-best-use',
+  ]) {
+    assert.ok(new RegExp(`data-testid="${tid}"`).test(pageSrc),
+      v(`ValveInfoPanel must expose data-testid="${tid}"`))
+  }
+})
+
+test('ValveInfoPanel mount-once: gated on non-null `valve` prop', () => {
+  // The panel returns null when valve is null; opens on state
+  // transition null→valve, closes null on transition valve→null.
+  // Grep-pin the render gate and the mount site's prop wiring.
+  const idx = pageSrc.indexOf('function ValveInfoPanel(')
+  const nextFn = pageSrc.indexOf('\nfunction ', idx + 1)
+  const body = pageSrc.slice(idx, nextFn > 0 ? nextFn : idx + 5000)
+  assert.ok(/if\s*\(!valve\)\s*return null/.test(body),
+    v('ValveInfoPanel must early-return null when `valve` is falsy '
+      + '— the fiber only exists while a valve is open.'))
+  // Mounted with openValve state; closed by setOpenValve(null).
+  assert.ok(/<ValveInfoPanel[\s\S]*valve=\{openValve\}/.test(pageSrc),
+    v('SynapsePage must mount <ValveInfoPanel valve={openValve} ... />'))
+  assert.ok(/setOpenValve\(null\)/.test(pageSrc),
+    v('SynapsePage must close via setOpenValve(null) — clean '
+      + 'transition, no in-place state fiddling.'))
 })

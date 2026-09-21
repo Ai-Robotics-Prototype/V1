@@ -42,7 +42,111 @@ const SAFETY_ACCENT  = '#DC2626'   // red
 
 // ── Data (edit these arrays, not the JSX) ────────────────────────────
 
-const VALVES = [
+// 2026-09-21 operator directive: each valve card is clickable and
+// opens an information panel with plain-language copy per valve
+// TYPE. Content lives on the data structure (title / plain_
+// explanation / best_use) so future revisions edit these fields
+// only — never the JSX. Copy is operator-plain, not textbook.
+
+const VALVE_TYPE_INFO = {
+  '5/2 SS': {
+    title: '5/2 Single Solenoid',
+    plain_explanation:
+      'This valve has one electric coil and an internal spring. '
+      + 'Energize the coil and the valve shifts one way; drop power '
+      + 'and the spring snaps it back to home. That means on power '
+      + 'loss OR air loss, this valve automatically returns to its '
+      + 'safe/home position — a fail-safe you get for free.',
+    best_use:
+      'Grippers, cylinders, and air dumps that MUST return to a '
+      + 'safe state on stop or E-STOP. The spring return does '
+      + 'the safe-home job for you.',
+  },
+  '5/2 DS': {
+    title: '5/2 Double Solenoid',
+    plain_explanation:
+      'Two coils, one for each direction, and NO spring. When '
+      + 'power drops the valve HOLDS whatever position it was last '
+      + 'commanded to; it only changes when you send a new signal '
+      + 'to the opposite coil. Safety difference from a Single '
+      + 'Solenoid: this one does not snap home — it remembers.',
+    best_use:
+      'Motion that must NOT let go on power loss — a clamp holding '
+      + 'a part, a load-lift cylinder. Pick 5/2 SS instead if you '
+      + 'WANT the actuator to snap home when power drops.',
+  },
+  '5/3': {
+    title: '5/3 Three-Position',
+    plain_explanation:
+      'Three states instead of two: extend, retract, and a middle '
+      + 'rest position. The center usually either BLOCKS air '
+      + '(freezing the cylinder wherever it is) or VENTS it '
+      + '(releasing all pressure). That gives you a real "stop '
+      + 'mid-stroke" capability the two-position valves cannot do.',
+    best_use:
+      'Positioning a cylinder at intermediate points, pausing '
+      + 'motion partway through a stroke, or isolating / venting '
+      + 'air on a controlled stop.',
+  },
+  'HI/LO 3/2 N/C': {
+    title: '3/2 Normally Closed',
+    plain_explanation:
+      'A simple on/off valve with a built-in exhaust port. The '
+      + 'default state is CLOSED — no air flows through the output '
+      + 'until you energize the coil. When you drop the coil, the '
+      + 'output line vents through the exhaust rather than staying '
+      + 'pressurized.',
+    best_use:
+      'On-demand air — blow-off nozzles, vacuum ejectors, air '
+      + 'blasts. Anything that should sit OFF by default and only '
+      + 'run when the program commands it.',
+  },
+  'HI/LO 3/2 N/O': {
+    title: '3/2 Normally Open',
+    plain_explanation:
+      'The inverse of a Normally Closed 3/2: the output flows by '
+      + 'DEFAULT and shuts off when you energize the coil. '
+      + 'Uncommon — pick this only when you specifically need air '
+      + 'to be on unless something actively commands it off.',
+    best_use:
+      'Air bearings, cooling purges, or continuous utility flows '
+      + 'that must stay on unless explicitly commanded to stop.',
+  },
+  'HI/LO 2/2 N/C': {
+    title: '2/2 Normally Closed',
+    plain_explanation:
+      'Simple two-port on/off shutoff — one inlet, one outlet, NO '
+      + 'exhaust port. Different from a 3/2 in one important way: '
+      + 'when this valve closes, the downstream line STAYS '
+      + 'pressurized because there is no vent path. Use only when '
+      + 'you do not want the downstream side to bleed off.',
+    best_use:
+      'Supply isolation — turning a manifold or subsystem on and '
+      + 'off without venting the lines below it.',
+  },
+  'SPARE 1': {
+    title: 'Spare Port',
+    plain_explanation:
+      'This valve slot is unassigned. Reserved for future devices.',
+    best_use:
+      'Assign this port in the application setup wizard before '
+      + 'connecting any device.',
+  },
+  'SPARE 2': {
+    title: 'Spare Port',
+    plain_explanation:
+      'This valve slot is unassigned. Reserved for future devices.',
+    best_use:
+      'Assign this port in the application setup wizard before '
+      + 'connecting any device.',
+  },
+}
+
+// Build the VALVES array by merging the per-type info into each
+// slot. Every valve entry ends up with { id, label, type, title,
+// plain_explanation, best_use } — the data-completeness pin asserts
+// non-empty explanation + best_use on every entry.
+const _VALVE_SLOTS = [
   { id: 'V01', label: 'Valve 01', type: '5/2 SS' },
   { id: 'V02', label: 'Valve 02', type: '5/2 SS' },
   { id: 'V03', label: 'Valve 03', type: 'HI/LO 3/2 N/C' },
@@ -54,6 +158,11 @@ const VALVES = [
   { id: 'V09', label: 'Valve 09', type: '5/2 DS' },
   { id: 'V10', label: 'Valve 10', type: 'SPARE 2' },
 ]
+
+const VALVES = _VALVE_SLOTS.map((v) => ({
+  ...v,
+  ...(VALVE_TYPE_INFO[v.type] || {}),
+}))
 
 const DIGITAL_INPUTS = Array.from({ length: 10 }, (_, i) => ({
   id:    `IN${String(i + 1).padStart(2, '0')}`,
@@ -276,16 +385,43 @@ function SubHeader({ text, right, accent }) {
 
 // ── Cards ────────────────────────────────────────────────────────────
 
-function ValveCard({ valve }) {
+function ValveCard({ valve, onOpen }) {
+  const [hover, setHover] = useState(false)
+  // 2026-09-21 operator directive: valve cards are clickable —
+  // tapping opens the ValveInfoPanel with the type explanation.
+  // Card is a <button> so keyboard operators get Enter/Space for
+  // free; hover/press adds a subtle lift so clickability is
+  // discoverable. All VIEW-tier — no control affordance on the
+  // card or the panel.
   return (
-    <div
+    <button
+      type="button"
       data-testid="synapse-valve-card"
       data-valve-id={valve.id}
+      onClick={() => onOpen(valve)}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onFocus={() => setHover(true)}
+      onBlur={() => setHover(false)}
+      aria-label={`Open explainer for ${valve.label}, ${valve.type}`}
       style={{
         display: 'flex', flexDirection: 'column', alignItems: 'center',
         gap: 6, padding: 12,
-        background: CARD_BG, border: `1px solid ${CARD_BORDER}`,
+        background: CARD_BG,
+        border: `1px solid ${hover ? APP_BLUE : CARD_BORDER}`,
         borderRadius: 10, minWidth: 0,
+        cursor: 'pointer',
+        textAlign: 'inherit',
+        color: 'inherit',
+        fontFamily: 'inherit',
+        // Subtle lift on hover/focus; no motion on rest so the
+        // page reads as calm at idle.
+        transform: hover ? 'translateY(-1px)' : 'translateY(0)',
+        boxShadow: hover
+          ? '0 4px 10px rgba(37,99,235,0.12)'
+          : '0 0 0 rgba(0,0,0,0)',
+        transition: 'transform 120ms ease, border-color 120ms ease,'
+                    + ' box-shadow 120ms ease',
       }}
     >
       <div style={{
@@ -298,15 +434,7 @@ function ValveCard({ valve }) {
         minHeight: 28,
       }}>{valve.type}</div>
       {/* 2026-09-21 operator correction: ports STACK VERTICALLY
-          (PA above PB) to match the original mock. The two glyphs
-          were previously rendered side-by-side; the vertical stack
-          reads as one valve's PA/PB port pair rather than two
-          unrelated ports at the same rank. Card sizing/grid
-          untouched — cards grow slightly taller but still fit
-          two rows of five without horizontal overflow at tablet
-          or desktop widths (auto-fit grid; each column takes
-          minmax(0, 1fr)). data-testid="synapse-valve-card-ports"
-          exposed for the layout pin. */}
+          (PA above PB) to match the original mock. */}
       <div
         data-testid="synapse-valve-card-ports"
         style={{
@@ -316,6 +444,118 @@ function ValveCard({ valve }) {
       >
         <PneumaticPortGlyph dataIo={`${valve.id}_PA`} />
         <PneumaticPortGlyph dataIo={`${valve.id}_PB`} />
+      </div>
+    </button>
+  )
+}
+
+
+// ── ValveInfoPanel — modal-family explainer, VIEW-tier only ─────────
+//
+// Matches the Orient/Enable modal token set: white card, subtle
+// shadow, rgba(15,23,42,0.55) backdrop, X + Escape + backdrop-click
+// dismissal. Zero control affordances — the panel is a read view
+// of the valve TYPE's plain_explanation + best_use. Mount-once:
+// mounted while `valve` prop is non-null, unmounted when null.
+// Body sits above pointer-events:auto backdrop so operator taps
+// on the backdrop cleanly dismiss without click-through.
+
+function ValveInfoPanel({ valve, onClose }) {
+  // Escape dismisses. Handler installed only while open.
+  useEffect(() => {
+    if (!valve) return undefined
+    const onKey = (e) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [valve, onClose])
+  if (!valve) return null
+
+  const title = valve.title
+    ? `${valve.label} — ${valve.title}`
+    : `${valve.label} — ${valve.type}`
+
+  return (
+    <div
+      data-testid="synapse-valve-info-backdrop"
+      role="presentation"
+      onClick={onClose}   // backdrop dismiss
+      style={{
+        position: 'fixed', inset: 0, zIndex: 1000,
+        background: 'rgba(15, 23, 42, 0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        pointerEvents: 'auto',
+      }}
+    >
+      <div
+        data-testid="synapse-valve-info-panel"
+        data-valve-id={valve.id}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="synapse-valve-info-title"
+        onClick={(e) => e.stopPropagation()}   // don't dismiss on card taps
+        style={{
+          background: '#fff', color: '#111318',
+          border: '1px solid rgba(0,0,0,0.10)', borderRadius: 8,
+          boxShadow: '0 12px 32px rgba(0,0,0,0.25)',
+          padding: 20, minWidth: 320, maxWidth: 520,
+          display: 'flex', flexDirection: 'column', gap: 14,
+          fontFamily: 'inherit', fontSize: 13,
+        }}
+      >
+        <div style={{
+          display: 'flex', alignItems: 'flex-start', gap: 12,
+        }}>
+          <div
+            id="synapse-valve-info-title"
+            data-testid="synapse-valve-info-title"
+            style={{
+              fontSize: 16, fontWeight: 700, color: '#0f172a',
+              flex: 1,
+            }}>
+            {title}
+          </div>
+          <button
+            type="button"
+            data-testid="synapse-valve-info-close"
+            onClick={onClose}
+            aria-label="Close"
+            style={{
+              background: 'transparent', border: 'none',
+              color: TEXT_SECONDARY, fontSize: 20, lineHeight: 1,
+              cursor: 'pointer', padding: '0 4px',
+              fontFamily: 'inherit',
+            }}
+          >
+            ×
+          </button>
+        </div>
+
+        <div
+          data-testid="synapse-valve-info-explanation"
+          style={{
+            fontSize: 13, lineHeight: 1.55, color: '#334155',
+          }}>
+          {valve.plain_explanation}
+        </div>
+
+        <div
+          data-testid="synapse-valve-info-best-use"
+          style={{
+            padding: '10px 12px',
+            background: '#EFF6FF',
+            border: '1px solid #BFDBFE',
+            borderRadius: 6,
+            fontSize: 13, lineHeight: 1.5, color: '#1E3A8A',
+          }}>
+          <div style={{
+            fontSize: 10, fontWeight: 700, letterSpacing: 0.6,
+            color: '#1E40AF', textTransform: 'uppercase',
+            marginBottom: 4,
+          }}>
+            Best use
+          </div>
+          {valve.best_use}
+        </div>
       </div>
     </div>
   )
@@ -410,6 +650,12 @@ export default function SynapsePage() {
   const setSynapseIOSectionOpen = useStore(
     (s) => s.setSynapseIOSectionOpen)
   const [ioExpanded, setIoExpanded] = useState(false)
+  // 2026-09-21 operator directive: clicking a valve card opens the
+  // ValveInfoPanel with plain-language copy for that valve type.
+  // openValve holds the ENTIRE valve object (id + label + type +
+  // title + plain_explanation + best_use) so the panel is a pure
+  // render of its prop — no lookups, no store access, no fetch.
+  const [openValve, setOpenValve] = useState(null)
   useEffect(() => {
     if (autoOpen) {
       setIoExpanded(true)
@@ -467,13 +713,13 @@ export default function SynapsePage() {
         />
         <Grid5>
           {VALVES.slice(0, 5).map((v) => (
-            <ValveCard key={v.id} valve={v} />
+            <ValveCard key={v.id} valve={v} onOpen={setOpenValve} />
           ))}
         </Grid5>
         <div style={{ height: 10 }} />
         <Grid5>
           {VALVES.slice(5, 10).map((v) => (
-            <ValveCard key={v.id} valve={v} />
+            <ValveCard key={v.id} valve={v} onOpen={setOpenValve} />
           ))}
         </Grid5>
       </Section>
@@ -620,6 +866,17 @@ export default function SynapsePage() {
       }}>
         Connect only the devices assigned in the application setup wizard.
       </div>
+
+      {/* Valve-info panel — mounted while `openValve` is non-null,
+          unmounted when closed. Mount-once on open (single fiber
+          creation, no repeated setup between mount and close);
+          mount-once on close (single fiber destruction, no re-run
+          during subsequent card taps because `openValve` state
+          transitions null→valve→null cleanly). */}
+      <ValveInfoPanel
+        valve={openValve}
+        onClose={() => setOpenValve(null)}
+      />
     </div>
   )
 }
