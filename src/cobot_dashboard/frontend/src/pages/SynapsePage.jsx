@@ -48,7 +48,7 @@ const SAFETY_ACCENT  = '#DC2626'   // red
 // explanation / best_use) so future revisions edit these fields
 // only — never the JSX. Copy is operator-plain, not textbook.
 
-const VALVE_TYPE_INFO = {
+export const VALVE_TYPE_INFO = {
   '5/2 SS': {
     title: '5/2 Single Solenoid',
     plain_explanation:
@@ -159,22 +159,22 @@ const _VALVE_SLOTS = [
   { id: 'V10', label: 'Valve 10', type: 'SPARE 2' },
 ]
 
-const VALVES = _VALVE_SLOTS.map((v) => ({
+export const VALVES = _VALVE_SLOTS.map((v) => ({
   ...v,
   ...(VALVE_TYPE_INFO[v.type] || {}),
 }))
 
-const DIGITAL_INPUTS = Array.from({ length: 10 }, (_, i) => ({
+export const DIGITAL_INPUTS = Array.from({ length: 10 }, (_, i) => ({
   id:    `IN${String(i + 1).padStart(2, '0')}`,
   label: `IN ${String(i + 1).padStart(2, '0')}`,
 }))
 
-const DIGITAL_OUTPUTS = Array.from({ length: 10 }, (_, i) => ({
+export const DIGITAL_OUTPUTS = Array.from({ length: 10 }, (_, i) => ({
   id:    `OUT${String(i + 1).padStart(2, '0')}`,
   label: `OUT ${String(i + 1).padStart(2, '0')}`,
 }))
 
-const SAFETY_DEVICES = Array.from({ length: 4 }, (_, i) => ({
+export const SAFETY_DEVICES = Array.from({ length: 4 }, (_, i) => ({
   id:    `SAFETY${String(i + 1).padStart(2, '0')}`,
   label: `SAFETY ${String(i + 1).padStart(2, '0')}`,
 }))
@@ -385,43 +385,52 @@ function SubHeader({ text, right, accent }) {
 
 // ── Cards ────────────────────────────────────────────────────────────
 
-function ValveCard({ valve, onOpen }) {
+function ValveCard({ valve, onOpen, dim = false, glow = false }) {
   const [hover, setHover] = useState(false)
-  // 2026-09-21 operator directive: valve cards are clickable —
-  // tapping opens the ValveInfoPanel with the type explanation.
-  // Card is a <button> so keyboard operators get Enter/Space for
-  // free; hover/press adds a subtle lift so clickability is
-  // discoverable. All VIEW-tier — no control affordance on the
-  // card or the panel.
+  // 2026-09-21 operator directive: valve cards are clickable in
+  // PAGE mode — tapping opens the ValveInfoPanel. Card is a
+  // <button> so keyboard operators get Enter/Space for free.
+  // In GUIDANCE mode (parent passes onOpen=null), the button is
+  // still a <button> but clicks are inert; dim + glow visual state
+  // reflect the guidance highlight set.
+  const clickable = typeof onOpen === 'function'
   return (
     <button
       type="button"
       data-testid="synapse-valve-card"
       data-valve-id={valve.id}
-      onClick={() => onOpen(valve)}
+      data-dim={String(dim)}
+      data-glow={String(glow)}
+      onClick={() => clickable && onOpen(valve)}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onFocus={() => setHover(true)}
       onBlur={() => setHover(false)}
-      aria-label={`Open explainer for ${valve.label}, ${valve.type}`}
+      disabled={!clickable}
+      aria-label={clickable
+        ? `Open explainer for ${valve.label}, ${valve.type}`
+        : `${valve.label}, ${valve.type}`}
       style={{
         display: 'flex', flexDirection: 'column', alignItems: 'center',
         gap: 6, padding: 12,
         background: CARD_BG,
-        border: `1px solid ${hover ? APP_BLUE : CARD_BORDER}`,
+        border: `1px solid ${
+          glow ? APP_BLUE : (hover && clickable) ? APP_BLUE : CARD_BORDER}`,
         borderRadius: 10, minWidth: 0,
-        cursor: 'pointer',
+        cursor: clickable ? 'pointer' : 'default',
         textAlign: 'inherit',
         color: 'inherit',
         fontFamily: 'inherit',
-        // Subtle lift on hover/focus; no motion on rest so the
-        // page reads as calm at idle.
-        transform: hover ? 'translateY(-1px)' : 'translateY(0)',
-        boxShadow: hover
-          ? '0 4px 10px rgba(37,99,235,0.12)'
-          : '0 0 0 rgba(0,0,0,0)',
+        opacity: dim ? 0.35 : 1,
+        transform: (hover && clickable) ? 'translateY(-1px)' : 'translateY(0)',
+        boxShadow: glow
+          ? '0 0 0 2px rgba(37,99,235,0.15), 0 4px 10px rgba(37,99,235,0.18)'
+          : (hover && clickable)
+              ? '0 4px 10px rgba(37,99,235,0.12)'
+              : '0 0 0 rgba(0,0,0,0)',
+        animation: glow ? 'synapse-map-glow 1.8s ease-out infinite' : 'none',
         transition: 'transform 120ms ease, border-color 120ms ease,'
-                    + ' box-shadow 120ms ease',
+                    + ' box-shadow 120ms ease, opacity 120ms ease',
       }}
     >
       <div style={{
@@ -433,8 +442,6 @@ function ValveCard({ valve, onOpen }) {
         color: TEXT_PRIMARY, textAlign: 'center', lineHeight: 1.2,
         minHeight: 28,
       }}>{valve.type}</div>
-      {/* 2026-09-21 operator correction: ports STACK VERTICALLY
-          (PA above PB) to match the original mock. */}
       <div
         data-testid="synapse-valve-card-ports"
         style={{
@@ -561,18 +568,28 @@ function ValveInfoPanel({ valve, onClose }) {
   )
 }
 
-function IoCard({ item, kind }) {
+function IoCard({ item, kind, dim = false, glow = false }) {
   const Glyph = kind === 'input' ? DigitalInputGlyph : DigitalOutputGlyph
   const accent = kind === 'input' ? INPUT_ACCENT : OUTPUT_ACCENT
   return (
     <div
       data-testid={`synapse-io-card-${kind}`}
       data-io-id={item.id}
+      data-dim={String(dim)}
+      data-glow={String(glow)}
       style={{
         display: 'flex', flexDirection: 'column', alignItems: 'center',
         gap: 6, padding: 10,
-        background: CARD_BG, border: `1px solid ${CARD_BORDER}`,
+        background: CARD_BG,
+        border: `1px solid ${glow ? accent : CARD_BORDER}`,
         borderRadius: 10, minWidth: 0,
+        opacity: dim ? 0.35 : 1,
+        boxShadow: glow
+          ? `0 0 0 2px ${accent}22, 0 4px 10px ${accent}22`
+          : 'none',
+        animation: glow ? 'synapse-map-glow 1.8s ease-out infinite' : 'none',
+        transition: 'opacity 120ms ease, border-color 120ms ease,'
+                    + ' box-shadow 120ms ease',
       }}
     >
       <Glyph dataIo={item.id} />
@@ -584,16 +601,26 @@ function IoCard({ item, kind }) {
   )
 }
 
-function SafetyCard({ item }) {
+function SafetyCard({ item, dim = false, glow = false }) {
   return (
     <div
       data-testid="synapse-safety-card"
       data-safety-id={item.id}
+      data-dim={String(dim)}
+      data-glow={String(glow)}
       style={{
         display: 'flex', flexDirection: 'column', alignItems: 'center',
         gap: 8, padding: 14,
-        background: CARD_BG, border: `1px solid ${CARD_BORDER}`,
+        background: CARD_BG,
+        border: `1px solid ${glow ? SAFETY_ACCENT : CARD_BORDER}`,
         borderRadius: 10, minWidth: 0,
+        opacity: dim ? 0.35 : 1,
+        boxShadow: glow
+          ? `0 0 0 2px ${SAFETY_ACCENT}22, 0 4px 10px ${SAFETY_ACCENT}22`
+          : 'none',
+        animation: glow ? 'synapse-map-glow 1.8s ease-out infinite' : 'none',
+        transition: 'opacity 120ms ease, border-color 120ms ease,'
+                    + ' box-shadow 120ms ease',
       }}
     >
       <SafetyGlyph dataIo={item.id} />
@@ -626,6 +653,217 @@ function Grid5({ children }) {
       gridTemplateColumns: 'repeat(5, minmax(0, 1fr))',
       gap: 10,
     }}>{children}</div>
+  )
+}
+
+
+// ── SynapseConnectionMap — reused shell (page + wizard-guidance) ────
+//
+// One component, two modes, mounted from TWO sites:
+//   * pages/SynapsePage.jsx renders it as `mode="page"` (clickable
+//     valve cards → info panel, no highlight, no dim).
+//   * components/HardwareSetupWizard.jsx renders it as
+//     `mode="guidance"` with a `highlight` prop naming which ports
+//     the operator's chosen tool needs. Highlighted glyphs pulse;
+//     non-highlighted glyphs render dimmed. Card clicks are inert
+//     in guidance mode — this is a wiring guide, not a control
+//     surface. VIEW-tier grep-pin in D_synapse_tab.test.js pins
+//     no /api/ or /cmd/ writes in this file's tree.
+//
+// Props:
+//   mode           'page' | 'guidance'
+//   highlight      { valves?, inputs?, outputs?, safety? } — string
+//                  ID arrays of ports to glow. Undefined = no glow.
+//   labelOverrides { [portId]: string } — swap the primary label
+//                  (e.g. relabel `V05` from "Valve 05" to "My Tool").
+//                  A second field `typeOverrides[portId]` swaps the
+//                  type subtitle.
+//   onValveClick   optional function; page mode only — inert in
+//                  guidance mode (the wiring guide doesn't open a
+//                  panel that could imply control).
+//   typeOverrides  see labelOverrides.
+
+function _asSet(arr) {
+  const s = new Set()
+  if (!Array.isArray(arr)) return s
+  for (const v of arr) s.add(String(v))
+  return s
+}
+
+export function SynapseConnectionMap({
+  mode = 'page',
+  highlight = null,
+  labelOverrides = null,
+  typeOverrides = null,
+  onValveClick = null,
+}) {
+  const _hVal = _asSet(highlight?.valves)
+  const _hIn  = _asSet(highlight?.inputs)
+  const _hOut = _asSet(highlight?.outputs)
+  const _hSaf = _asSet(highlight?.safety)
+  const _labels = labelOverrides || {}
+  const _types  = typeOverrides  || {}
+
+  // In guidance mode, the caller intentionally does NOT get a click
+  // handler — the map is a wiring reference, not a control panel.
+  const _valveClick = mode === 'page' ? onValveClick : null
+
+  // Any port not in ANY highlight set defaults to normal (no dim)
+  // when `highlight` is null. When highlight IS passed, any port
+  // NOT in its own section's set gets dimmed so the required ones
+  // pop visually.
+  const _dim = (kind, id) => {
+    if (!highlight) return false
+    const set = kind === 'valve' ? _hVal
+              : kind === 'input' ? _hIn
+              : kind === 'output' ? _hOut
+              : kind === 'safety' ? _hSaf : null
+    if (!set) return false
+    // Valve highlight tracks the VALVE id (V01..V10). Ports
+    // (V01_PA/V01_PB) belong to a valve — highlight if their valve
+    // id is highlighted.
+    const key = id.split('_')[0]
+    return !set.has(key) && !set.has(id)
+  }
+  const _glow = (kind, id) => {
+    if (!highlight) return false
+    const set = kind === 'valve' ? _hVal
+              : kind === 'input' ? _hIn
+              : kind === 'output' ? _hOut
+              : kind === 'safety' ? _hSaf : null
+    if (!set) return false
+    const key = id.split('_')[0]
+    return set.has(key) || set.has(id)
+  }
+
+  // Merge label + type overrides onto a card item.
+  const _valve = (v) => ({
+    ...v,
+    label: _labels[v.id] || v.label,
+    type:  _types[v.id]  || v.type,
+  })
+  const _io = (item) => ({
+    ...item,
+    label: _labels[item.id] || item.label,
+  })
+
+  return (
+    <div
+      data-testid="synapse-connection-map"
+      data-mode={mode}
+      style={{ fontFamily: 'inherit', color: TEXT_PRIMARY }}
+    >
+      {/* Guidance-mode pulse keyframes — scoped locally to this
+          component so the animation lives with its owner. */}
+      <style>{`
+        @keyframes synapse-map-glow {
+          0%   { box-shadow: 0 0 0 0 rgba(37,99,235,0.55); }
+          70%  { box-shadow: 0 0 0 10px rgba(37,99,235,0); }
+          100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); }
+        }
+      `}</style>
+
+      {/* Section 1 — Pneumatic valves */}
+      <Section testid="synapse-section-pneumatic">
+        <SectionHeader
+          title="Pneumatic Valve Ports"
+          chipLabel="AIR"
+          chipAccent={PNEUM_ACCENT}
+        />
+        <Grid5>
+          {VALVES.slice(0, 5).map((v) => (
+            <ValveCard
+              key={v.id}
+              valve={_valve(v)}
+              onOpen={_valveClick}
+              dim={_dim('valve', v.id)}
+              glow={_glow('valve', v.id)}
+            />
+          ))}
+        </Grid5>
+        <div style={{ height: 10 }} />
+        <Grid5>
+          {VALVES.slice(5, 10).map((v) => (
+            <ValveCard
+              key={v.id}
+              valve={_valve(v)}
+              onOpen={_valveClick}
+              dim={_dim('valve', v.id)}
+              glow={_glow('valve', v.id)}
+            />
+          ))}
+        </Grid5>
+      </Section>
+
+      {/* Section 2 — Sensor inputs + outputs */}
+      <Section testid="synapse-section-io">
+        <SectionHeader
+          title="Sensor Inputs & Outputs"
+          chipLabel="M8 · 24 VDC"
+          chipAccent={APP_BLUE}
+        />
+        <SubHeader text="Digital Inputs" accent={INPUT_ACCENT}
+                    right="Top 10 Connections" />
+        <Grid5>
+          {DIGITAL_INPUTS.slice(0, 5).map((i) => (
+            <IoCard key={i.id} item={_io(i)} kind="input"
+                     dim={_dim('input', i.id)}
+                     glow={_glow('input', i.id)} />
+          ))}
+        </Grid5>
+        <div style={{ height: 10 }} />
+        <Grid5>
+          {DIGITAL_INPUTS.slice(5, 10).map((i) => (
+            <IoCard key={i.id} item={_io(i)} kind="input"
+                     dim={_dim('input', i.id)}
+                     glow={_glow('input', i.id)} />
+          ))}
+        </Grid5>
+
+        <hr style={{
+          border: 'none', borderTop: `1px solid ${CARD_BORDER}`,
+          margin: '18px 0',
+        }} />
+
+        <SubHeader text="Digital Outputs" accent={OUTPUT_ACCENT}
+                    right="Bottom 10 Connections" />
+        <Grid5>
+          {DIGITAL_OUTPUTS.slice(0, 5).map((o) => (
+            <IoCard key={o.id} item={_io(o)} kind="output"
+                     dim={_dim('output', o.id)}
+                     glow={_glow('output', o.id)} />
+          ))}
+        </Grid5>
+        <div style={{ height: 10 }} />
+        <Grid5>
+          {DIGITAL_OUTPUTS.slice(5, 10).map((o) => (
+            <IoCard key={o.id} item={_io(o)} kind="output"
+                     dim={_dim('output', o.id)}
+                     glow={_glow('output', o.id)} />
+          ))}
+        </Grid5>
+      </Section>
+
+      {/* Section 3 — Safety devices */}
+      <Section testid="synapse-section-safety">
+        <SectionHeader
+          title="Safety Device Connections"
+          chipLabel="M12"
+          chipAccent={SAFETY_ACCENT}
+        />
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+          gap: 12,
+        }}>
+          {SAFETY_DEVICES.map((s) => (
+            <SafetyCard key={s.id} item={_io(s)}
+                         dim={_dim('safety', s.id)}
+                         glow={_glow('safety', s.id)} />
+          ))}
+        </div>
+      </Section>
+    </div>
   )
 }
 
@@ -704,84 +942,13 @@ export default function SynapsePage() {
         <Chip label="UI Guide" accent={APP_BLUE} />
       </div>
 
-      {/* Section 1 — Pneumatic valves */}
-      <Section testid="synapse-section-pneumatic">
-        <SectionHeader
-          title="Pneumatic Valve Ports"
-          chipLabel="AIR"
-          chipAccent={PNEUM_ACCENT}
-        />
-        <Grid5>
-          {VALVES.slice(0, 5).map((v) => (
-            <ValveCard key={v.id} valve={v} onOpen={setOpenValve} />
-          ))}
-        </Grid5>
-        <div style={{ height: 10 }} />
-        <Grid5>
-          {VALVES.slice(5, 10).map((v) => (
-            <ValveCard key={v.id} valve={v} onOpen={setOpenValve} />
-          ))}
-        </Grid5>
-      </Section>
-
-      {/* Section 2 — Sensor inputs + outputs */}
-      <Section testid="synapse-section-io">
-        <SectionHeader
-          title="Sensor Inputs & Outputs"
-          chipLabel="M8 · 24 VDC"
-          chipAccent={APP_BLUE}
-        />
-        <SubHeader text="Digital Inputs" accent={INPUT_ACCENT}
-                    right="Top 10 Connections" />
-        <Grid5>
-          {DIGITAL_INPUTS.slice(0, 5).map((i) => (
-            <IoCard key={i.id} item={i} kind="input" />
-          ))}
-        </Grid5>
-        <div style={{ height: 10 }} />
-        <Grid5>
-          {DIGITAL_INPUTS.slice(5, 10).map((i) => (
-            <IoCard key={i.id} item={i} kind="input" />
-          ))}
-        </Grid5>
-
-        <hr style={{
-          border: 'none', borderTop: `1px solid ${CARD_BORDER}`,
-          margin: '18px 0',
-        }} />
-
-        <SubHeader text="Digital Outputs" accent={OUTPUT_ACCENT}
-                    right="Bottom 10 Connections" />
-        <Grid5>
-          {DIGITAL_OUTPUTS.slice(0, 5).map((o) => (
-            <IoCard key={o.id} item={o} kind="output" />
-          ))}
-        </Grid5>
-        <div style={{ height: 10 }} />
-        <Grid5>
-          {DIGITAL_OUTPUTS.slice(5, 10).map((o) => (
-            <IoCard key={o.id} item={o} kind="output" />
-          ))}
-        </Grid5>
-      </Section>
-
-      {/* Section 3 — Safety devices */}
-      <Section testid="synapse-section-safety">
-        <SectionHeader
-          title="Safety Device Connections"
-          chipLabel="M12"
-          chipAccent={SAFETY_ACCENT}
-        />
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
-          gap: 12,
-        }}>
-          {SAFETY_DEVICES.map((s) => (
-            <SafetyCard key={s.id} item={s} />
-          ))}
-        </div>
-      </Section>
+      {/* Sections 1–3 — Pneumatic valves + Sensor IO + Safety.
+          Rendered by the shared SynapseConnectionMap component so
+          the wizard's guidance step reuses the SAME map (no fork). */}
+      <SynapseConnectionMap
+        mode="page"
+        onValveClick={setOpenValve}
+      />
 
       {/* Section 4 — Main Internal Robot Controller I/O (expandable) */}
       <section

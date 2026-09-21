@@ -641,10 +641,13 @@ test('ValveCard opens ValveInfoPanel on click (VIEW-tier, keyboard-accessible)',
     v('ValveCard must invoke `onOpen(valve)` on click so the '
       + 'parent (SynapsePage) can open the ValveInfoPanel.'))
   // Hover affordance discoverability — cursor: pointer + subtle
-  // lift. Grep for the two markers.
-  assert.ok(/cursor:\s*['"]pointer['"]/.test(body),
-    v('ValveCard must set cursor: pointer so tap targets are '
-      + 'visually discoverable.'))
+  // lift. Accept the conditional form the guidance refactor
+  // introduced (page mode: pointer; guidance mode: default).
+  assert.ok(
+    /cursor:\s*['"]pointer['"]|cursor:\s*clickable\s*\?\s*['"]pointer['"]/
+      .test(body),
+    v('ValveCard must set cursor: pointer in page mode (conditional '
+      + 'on clickable is fine — guidance mode disables the click).'))
   assert.ok(/translateY\(/.test(body),
     v('ValveCard must apply a translateY lift on hover/focus '
       + '(hover discoverability affordance).'))
@@ -704,4 +707,181 @@ test('ValveInfoPanel mount-once: gated on non-null `valve` prop', () => {
   assert.ok(/setOpenValve\(null\)/.test(pageSrc),
     v('SynapsePage must close via setOpenValve(null) — clean '
       + 'transition, no in-place state fiddling.'))
+})
+
+
+// ── Hardware Setup × Synapse map integration (2026-09-21) ───────────
+
+const wizardSrc = readSrc('components/HardwareSetupWizard.jsx')
+const portMapSrc = readSrc('lib/toolPortMap.js')
+
+test('SynapsePage exports the SynapseConnectionMap component', () => {
+  // Import-identity pin — the wizard reuses THIS export, not a
+  // fork. If a future edit copies the map JSX into the wizard
+  // this pin fails at the source level.
+  assert.ok(/export function SynapseConnectionMap\(/.test(pageSrc),
+    v('SynapsePage must `export function SynapseConnectionMap(...)` — '
+      + 'the reusable map shell that the wizard imports.'))
+})
+
+test('HardwareSetupWizard imports SynapseConnectionMap from SynapsePage (no fork)', () => {
+  assert.ok(
+    /import\s*\{[^}]*SynapseConnectionMap[^}]*\}\s*from\s*['"]\.\.\/pages\/SynapsePage['"]/
+      .test(wizardSrc),
+    v('HardwareSetupWizard must import { SynapseConnectionMap } '
+      + 'from "../pages/SynapsePage". No fork of the map JSX — '
+      + 'one component, two mount sites (page + wizard).'))
+})
+
+test('SynapseConnectionMap has a guidance mode driven by highlight prop', () => {
+  // Grep-pin: the component branches on `mode="guidance"` and reads
+  // `highlight` to decide which glyphs pulse vs dim.
+  const idx = pageSrc.indexOf('export function SynapseConnectionMap(')
+  assert.ok(idx > 0, v('SynapseConnectionMap must exist'))
+  const nextFn = pageSrc.indexOf('\nfunction ', idx + 1)
+  const nextEx = pageSrc.indexOf('\nexport ', idx + 1)
+  const end = Math.min(
+    nextFn > 0 ? nextFn : pageSrc.length,
+    nextEx > 0 ? nextEx : pageSrc.length,
+  )
+  const body = pageSrc.slice(idx, end)
+  assert.ok(/mode\s*=\s*['"]page['"]/.test(body),
+    v("SynapseConnectionMap must accept mode with default 'page'"))
+  assert.ok(/highlight/.test(body),
+    v('SynapseConnectionMap must consume `highlight` prop'))
+  assert.ok(/labelOverrides/.test(body),
+    v('SynapseConnectionMap must consume `labelOverrides` prop '
+      + '(SPARE relabeling after custom-EOAT assignment).'))
+  assert.ok(/data-mode=\{mode\}/.test(body),
+    v('SynapseConnectionMap must expose data-mode on its root '
+      + 'so tests can key on the current mode.'))
+})
+
+test('ValveCard / IoCard / SafetyCard accept dim + glow props', () => {
+  for (const comp of ['ValveCard', 'IoCard', 'SafetyCard']) {
+    const idx = pageSrc.indexOf(`function ${comp}(`)
+    assert.ok(idx > 0, v(`${comp} must exist`))
+    const nextFn = pageSrc.indexOf('\nfunction ', idx + 1)
+    const body = pageSrc.slice(idx, nextFn > 0 ? nextFn : idx + 3000)
+    assert.ok(/dim\s*=\s*false/.test(body),
+      v(`${comp} must accept a dim prop (default false)`))
+    assert.ok(/glow\s*=\s*false/.test(body),
+      v(`${comp} must accept a glow prop (default false)`))
+    // Data attributes so DOM-level pins can key on the guidance
+    // state without re-deriving it from the CSS.
+    assert.ok(/data-dim=\{String\(dim\)\}/.test(body),
+      v(`${comp} must expose data-dim on its root`))
+    assert.ok(/data-glow=\{String\(glow\)\}/.test(body),
+      v(`${comp} must expose data-glow on its root`))
+  }
+})
+
+
+// ── Tool → ports mapping data (2026-09-21) ──────────────────────────
+
+test('lib/toolPortMap has getToolPortMap for the built-in tools', () => {
+  assert.ok(/export function getToolPortMap\(/.test(portMapSrc),
+    v('lib/toolPortMap must export `getToolPortMap(toolKey)`'))
+  // Two built-in tool records — finger + vacuum — present in the
+  // fixed table with required_valves + required_inputs.
+  for (const key of ['finger:', 'vacuum:']) {
+    assert.ok(portMapSrc.includes(key),
+      v(`lib/toolPortMap must include a ${key} entry`))
+  }
+})
+
+test('lib/toolPortMap.resolveCustomEOATRecord picks free SPARE + IN', () => {
+  assert.ok(/export function resolveCustomEOATRecord\(/.test(portMapSrc),
+    v('lib/toolPortMap must export resolveCustomEOATRecord'))
+  // Recommendation ladder reused from VALVE_TYPE_INFO — no copy
+  // duplication.
+  assert.ok(/import\s*\{[^}]*VALVE_TYPE_INFO[^}]*\}\s*from\s*['"]\.\.\/pages\/SynapsePage['"]/
+              .test(portMapSrc),
+    v('lib/toolPortMap must import VALVE_TYPE_INFO from '
+      + 'pages/SynapsePage — the valve-info-panel copy is the '
+      + 'single source for the recommendation WHY strings.'))
+})
+
+test('lib/toolPortMap emits no /api or /cmd calls (VIEW-tier)', () => {
+  // Strip comments before grepping — the file DOES mention "/api/tools"
+  // in its docstring narrating what the wizard consumes, but must not
+  // actually FETCH from any endpoint.
+  const code = _stripComments(portMapSrc)
+  for (const pat of [/\bfetch\s*\(/, /\/api\//, /\/cmd\//]) {
+    assert.equal(pat.test(code), false,
+      v(`lib/toolPortMap must NOT contain ${pat} in code — guidance `
+        + `is visual only, no IO in this session.`))
+  }
+})
+
+
+// ── Wizard: cleanup + guidance + custom flow ────────────────────────
+
+test('HardwareSetupWizard BUILT_IN keeps ONLY real tools + custom_new', () => {
+  const m = wizardSrc.match(/const BUILT_IN = \[([\s\S]*?)\n\]/)
+  assert.ok(m, v('HardwareSetupWizard must define const BUILT_IN = [...]'))
+  const body = m[1]
+  const keys = [...body.matchAll(/key:\s*['"]([^'"]+)['"]/g)].map((x) => x[1])
+  assert.deepEqual(keys.sort(),
+    ['custom_new', 'finger', 'vacuum'],
+    v(`BUILT_IN must contain exactly ['finger', 'vacuum', 'custom_new'] `
+      + `— found [${keys.join(', ')}]. Removed test-fixture tools `
+      + `(junk / trash-me / sample / no-tcp / no-payload / complete `
+      + `/ mt / referred) live only in /api/tools and are filtered `
+      + `at the picker via visibleCustoms.`))
+})
+
+test('HardwareSetupWizard filters customs on confirmed + converted', () => {
+  // Grep-pin the filter predicate — protects against a regression
+  // where the picker starts showing every /api/tools row again.
+  assert.ok(/conversion\?\.state === ['"]converted['"]/.test(wizardSrc),
+    v('HardwareSetupWizard visibleCustoms must gate on '
+      + '`conversion.state === "converted"`'))
+  assert.ok(/!!t\?\.confirmed/.test(wizardSrc),
+    v('HardwareSetupWizard visibleCustoms must gate on `confirmed`'))
+})
+
+test('HardwareSetupWizard renders SynapseConnectionMap in guidance mode', () => {
+  assert.ok(/<SynapseConnectionMap[\s\S]*?mode="guidance"/.test(wizardSrc),
+    v('HardwareSetupWizard must render <SynapseConnectionMap '
+      + 'mode="guidance" ... /> so highlighted ports pulse against '
+      + 'dimmed non-required ports.'))
+  // Guidance mode passes highlight from the tool port map.
+  assert.ok(/highlight=\{highlight\}/.test(wizardSrc),
+    v('The guidance block must thread `highlight={highlight}` '
+      + 'into the map so the highlight-driven glow works.'))
+})
+
+test('HardwareSetupWizard has a Custom EOAT flow with 4 steps', () => {
+  for (const tid of [
+    'hardware-setup-custom-flow',
+    'hardware-setup-custom-step-mass',
+    'hardware-setup-custom-step-actuation',
+    'hardware-setup-custom-step-sensors',
+    'hardware-setup-custom-step-summary',
+  ]) {
+    assert.ok(new RegExp(`data-testid="${tid}"`).test(wizardSrc),
+      v(`Custom EOAT flow must expose data-testid="${tid}"`))
+  }
+})
+
+test('Custom EOAT mass step warns above the S10-140 payload cap', () => {
+  // Constants live in lib/toolPortMap so the sanity number has
+  // exactly one source. The wizard imports + branches on them.
+  assert.ok(/S10_140_PAYLOAD_KG_MAX/.test(wizardSrc),
+    v('Wizard must import S10_140_PAYLOAD_KG_MAX from '
+      + 'lib/toolPortMap for the overcap warning.'))
+  assert.ok(/S10_140_PAYLOAD_KG_MAX\s*=\s*10\.0/.test(portMapSrc),
+    v('S10_140_PAYLOAD_KG_MAX must be 10.0 kg — the arm datasheet '
+      + '+ ledger references (era-01, add-01, add-08a) agree.'))
+})
+
+test('Wizard is VIEW-tier for guidance — no /cmd/ writes', () => {
+  // Two /api paths ARE allowed in this file: the confirmToolHookup
+  // call (already existed pre-directive) and getToolHookup (same).
+  // The NEW guidance code must not add any /cmd calls or new /api
+  // writes; grep for those specifically.
+  assert.equal(/\/cmd\//.test(wizardSrc), false,
+    v('HardwareSetupWizard must not contain any /cmd/ path — '
+      + 'guidance mode is visual only.'))
 })
