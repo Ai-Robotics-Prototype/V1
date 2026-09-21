@@ -200,20 +200,27 @@ export default function TopBar() {
 
         {/* E-STOP — fires on first tap (no confirm). Sized large for
             safety: it must be the most prominent control in the row.
-            Labeled with THIS robot's friendly_name (2026-09-21
-            fleet directive) so an operator with two dashboards open
-            always knows which robot they're stopping. Fleet grid
-            NEVER renders an E-STOP — safety stays per-robot inside
-            the connected dashboard. */}
+            Robot-name subtitle renders ONLY under a multi-robot
+            registry (fleetTotal > 1), matching the Fleet chip gate —
+            wrong-robot confusion is a multi-robot problem and the
+            subtitle solves it there. Single-robot dashboards render
+            E-STOP exactly as they did pre-fleet (no subtitle, no
+            column-flex layout, no name in the title). Operator
+            correction 2026-09-21. */}
         <button
           data-testid="topbar-estop"
           data-robot-name={robotName || ''}
+          data-multi-robot={String(fleetTotal > 1)}
           onClick={handleEstopClick}
           title={
-            estop
-              ? `E-Stop active on ${robotName || 'this robot'}`
-                + ' — click to release (requires green zone)'
-              : `Click to trigger emergency stop on ${robotName || 'this robot'}`
+            fleetTotal > 1
+              ? (estop
+                  ? `E-Stop active on ${robotName || 'this robot'}`
+                    + ' — click to release (requires green zone)'
+                  : `Click to trigger emergency stop on ${robotName || 'this robot'}`)
+              : (estop
+                  ? 'E-Stop active — click to release (requires green zone)'
+                  : 'Click to trigger emergency stop')
           }
           style={{
             background: '#DC2626',
@@ -225,22 +232,36 @@ export default function TopBar() {
             minHeight: 56,
             borderRadius: 10,
             cursor: 'pointer',
-            display: 'flex', flexDirection: 'column',
-            alignItems: 'center', justifyContent: 'center',
-            lineHeight: 1.05,
+            // Column-flex layout is a fleet-context enhancement (it
+            // makes room for the subtitle). Single-robot dashboards
+            // keep the pre-fleet default button layout.
+            ...(fleetTotal > 1
+              ? { display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', justifyContent: 'center',
+                  lineHeight: 1.05 }
+              : {}),
             animation: estop ? 'pulse-opacity 1s ease-in-out infinite' : 'none',
             letterSpacing: '0.06em',
             boxShadow: '0 2px 6px rgba(220,38,38,0.35)',
           }}
         >
-          <span>{estop ? 'ESTOP ACTIVE' : 'E-STOP'}</span>
-          {robotName && (
-            <span style={{
-              fontSize: 10, fontWeight: 600, letterSpacing: 0.4,
-              opacity: 0.85, marginTop: 2, textTransform: 'uppercase',
-            }}>
-              {robotName}
-            </span>
+          {fleetTotal > 1 ? (
+            <>
+              <span>{estop ? 'ESTOP ACTIVE' : 'E-STOP'}</span>
+              {robotName && (
+                <span
+                  data-testid="topbar-estop-robot-subtitle"
+                  style={{
+                    fontSize: 10, fontWeight: 600, letterSpacing: 0.4,
+                    opacity: 0.85, marginTop: 2, textTransform: 'uppercase',
+                  }}
+                >
+                  {robotName}
+                </span>
+              )}
+            </>
+          ) : (
+            estop ? 'ESTOP ACTIVE' : 'E-STOP'
           )}
         </button>
       </div>

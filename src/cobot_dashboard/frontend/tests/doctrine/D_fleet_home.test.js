@@ -170,16 +170,84 @@ test('store.hydrateFleet is the single fleet-hydrate site', () => {
 })
 
 
-// ── E-STOP stays per-robot, named with friendly_name ────────────────
+// ── E-STOP stays per-robot; subtitle is a MULTI-ROBOT-ONLY affordance ─
+//
+// Operator correction (2026-09-21): the robot-name subtitle under
+// E-STOP is scoped to multi-robot context. Wrong-robot confusion
+// only exists when the operator has more than one robot to reach;
+// on a single-robot dashboard the subtitle is wrong scope and
+// visual noise. Gate: identical to the Fleet chip — render iff
+// fleetTotal > 1. This pair of pins guards the conditional at
+// source level.
 
-test('TopBar E-STOP is labeled with the robot friendly_name', () => {
+test('TopBar E-STOP carries testids for both subtitle-branch pins', () => {
   assert.ok(/data-testid="topbar-estop"/.test(topbarSrc),
     v('TopBar E-STOP must carry data-testid="topbar-estop"'))
   assert.ok(/robotIdentity\?\.friendly_name/.test(topbarSrc),
-    v('TopBar must read robotIdentity.friendly_name from the store '
-      + 'and render it under the E-STOP label — the operator on '
-      + 'a two-dashboard workstation must always know which robot '
-      + 'they are stopping'))
+    v('TopBar must read robotIdentity.friendly_name from the store — '
+      + 'the source of the subtitle text under multi-robot context'))
+  // The subtitle span is a distinct testid so pins can assert its
+  // presence + absence independently of the E-STOP button itself.
+  assert.ok(/data-testid="topbar-estop-robot-subtitle"/.test(topbarSrc),
+    v('TopBar E-STOP subtitle must carry '
+      + 'data-testid="topbar-estop-robot-subtitle" so tests can pin '
+      + 'the conditional render'))
+})
+
+test('E-STOP subtitle is gated on fleetTotal > 1 (multi-robot ONLY)', () => {
+  // The subtitle span MUST appear inside a `fleetTotal > 1` branch,
+  // NEVER at the top level of the button. This is what makes the
+  // single-robot dashboard render E-STOP exactly as before the
+  // fleet commit — no subtitle, no column-flex, no wrong scope.
+  //
+  // Extract the E-STOP button block and prove the subtitle
+  // subtree lives inside a `fleetTotal > 1` conditional. Doing
+  // this at the source level (not DOM) keeps the pin honest under
+  // any future refactor that inverts the ternary.
+  const idx = topbarSrc.indexOf('data-testid="topbar-estop"')
+  assert.ok(idx > 0, v('E-STOP button block not found in TopBar'))
+  const buttonBlock = topbarSrc.slice(idx, idx + 3000)
+
+  // (1) The subtitle span appears in the source (present branch).
+  const subtitleIdx = buttonBlock.indexOf(
+    'data-testid="topbar-estop-robot-subtitle"')
+  assert.ok(subtitleIdx > 0,
+    v('E-STOP subtitle span must be present in the source — it is '
+      + 'the multi-robot branch of the conditional'))
+
+  // (2) Between the button opening and the subtitle span there
+  //     MUST be a `fleetTotal > 1` gate — otherwise the subtitle
+  //     would render on single-robot dashboards too.
+  const preSubtitle = buttonBlock.slice(0, subtitleIdx)
+  assert.ok(/fleetTotal\s*>\s*1/.test(preSubtitle),
+    v('E-STOP subtitle must be inside a `fleetTotal > 1` branch. '
+      + 'On a single-robot dashboard (fleetTotal === 1) E-STOP '
+      + 'renders exactly as it did before the fleet commit — no '
+      + 'subtitle, no column-flex layout, no robot name in the '
+      + 'title. Operator correction 2026-09-21.'))
+
+  // (3) Grep-pin that the button has a `data-multi-robot` marker
+  //     wired to `fleetTotal > 1` — makes the branch state
+  //     visible in the DOM for downstream tests without them
+  //     re-deriving the gate.
+  assert.ok(/data-multi-robot=\{String\(fleetTotal\s*>\s*1\)\}/
+              .test(topbarSrc),
+    v('E-STOP button must expose data-multi-robot="true|false" '
+      + 'reflecting fleetTotal > 1 — the DOM must announce which '
+      + 'branch it rendered so tests do not have to re-derive it'))
+})
+
+test('E-STOP button title text is bare when fleetTotal === 1', () => {
+  // The multi-robot title interpolates the robot name; the single-
+  // robot title MUST NOT — that would violate "renders exactly as
+  // before the fleet commit". Pin the pre-fleet copy verbatim.
+  assert.ok(
+    /title=\{[\s\S]*fleetTotal\s*>\s*1[\s\S]*'E-Stop active — click to release \(requires green zone\)'[\s\S]*'Click to trigger emergency stop'/.test(topbarSrc),
+    v('E-STOP title must branch on fleetTotal > 1 and include the '
+      + 'pre-fleet bare copy ("E-Stop active — click to release …" '
+      + '/ "Click to trigger emergency stop") in the single-robot '
+      + 'leaf. Any drift here re-scopes the label change to '
+      + 'single-robot dashboards, which the operator retired.'))
 })
 
 test('TopBar renders a Fleet chip only when fleetTotal > 1', () => {
