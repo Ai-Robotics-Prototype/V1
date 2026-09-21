@@ -526,3 +526,46 @@ test('font-token pin: only inherit / var(--font) fontFamily on Synapse page', ()
         + `local system-ui / Segoe UI / Inter stacks on this page.`))
   }
 })
+
+
+// ── Valve-card port layout (2026-09-21 operator correction) ─────────
+
+test('valve-card ports stack VERTICALLY (PA above PB)', () => {
+  // Extract the ValveCard function body and locate the port
+  // container. The two <PneumaticPortGlyph> elements must be
+  // wrapped in a container whose inline style declares
+  // `flexDirection: 'column'` — the original mock stacks PA
+  // above PB. Side-by-side (`flexDirection: 'row'` or bare
+  // `display: 'flex'` without column) is the regression the
+  // operator flagged; this pin fails if it reappears.
+  const idx = pageSrc.indexOf('function ValveCard(')
+  assert.ok(idx > 0, v('ValveCard must exist'))
+  const nextFn = pageSrc.indexOf('\nfunction ', idx + 1)
+  const body = pageSrc.slice(idx, nextFn > 0 ? nextFn : idx + 2000)
+
+  // Locate the port container by its testid, then walk backward
+  // to the enclosing <div opening tag and inspect its style attr.
+  assert.ok(/data-testid="synapse-valve-card-ports"/.test(body),
+    v('ValveCard must expose data-testid="synapse-valve-card-ports" '
+      + 'on the container that holds the two PneumaticPortGlyphs.'))
+
+  // The container's style must set flexDirection: 'column'. Match
+  // the surrounding style object (roughly 400 chars around the
+  // testid mark).
+  const containerRegion = body.slice(
+    Math.max(0, body.indexOf('data-testid="synapse-valve-card-ports"') - 400),
+    body.indexOf('data-testid="synapse-valve-card-ports"') + 400)
+  assert.ok(/flexDirection:\s*['"]column['"]/.test(containerRegion),
+    v('Port container must declare flexDirection: "column" — ports '
+      + 'stack VERTICALLY (PA above PB). Side-by-side is the '
+      + '2026-09-21 regression the operator flagged.'))
+
+  // And the two glyphs must sit inside that container. Grep for
+  // the sequence: container opening → PA → PB (in order).
+  const paIdx = body.indexOf('_PA`}')
+  const pbIdx = body.indexOf('_PB`}')
+  const contIdx = body.indexOf('data-testid="synapse-valve-card-ports"')
+  assert.ok(contIdx > 0 && paIdx > contIdx && pbIdx > paIdx,
+    v('The ports container must precede <PneumaticPortGlyph _PA> and '
+      + '<PneumaticPortGlyph _PB> in that order.'))
+})

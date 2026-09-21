@@ -297,7 +297,23 @@ function ValveCard({ valve }) {
         color: TEXT_PRIMARY, textAlign: 'center', lineHeight: 1.2,
         minHeight: 28,
       }}>{valve.type}</div>
-      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+      {/* 2026-09-21 operator correction: ports STACK VERTICALLY
+          (PA above PB) to match the original mock. The two glyphs
+          were previously rendered side-by-side; the vertical stack
+          reads as one valve's PA/PB port pair rather than two
+          unrelated ports at the same rank. Card sizing/grid
+          untouched — cards grow slightly taller but still fit
+          two rows of five without horizontal overflow at tablet
+          or desktop widths (auto-fit grid; each column takes
+          minmax(0, 1fr)). data-testid="synapse-valve-card-ports"
+          exposed for the layout pin. */}
+      <div
+        data-testid="synapse-valve-card-ports"
+        style={{
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          gap: 8, marginTop: 4,
+        }}
+      >
         <PneumaticPortGlyph dataIo={`${valve.id}_PA`} />
         <PneumaticPortGlyph dataIo={`${valve.id}_PB`} />
       </div>
