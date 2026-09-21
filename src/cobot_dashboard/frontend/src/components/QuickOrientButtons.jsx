@@ -9,6 +9,13 @@ import {
   solveIKToPose,
   measureAchievedError,
 } from '../lib/orient'
+import {
+  POSE_FRESH_MS,
+  POSE_WAIT_TIMEOUT_MS,
+  computePoseAgeMs,
+  isPoseFresh,
+  formatPoseAge,
+} from '../lib/poseFreshness'
 
 // 2026-09-14 operator directive — Orient Flange Down control.
 //
@@ -123,11 +130,26 @@ export default function OrientFlangeDownControl({ jogApi }) {
   const [modalOpen, setModalOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState(null)   // {ok, kind, message}
+  // Freshness-gate state: 'idle' (no wait active), 'waiting' (spinner
+  // showing "reading arm pose…" while we wait up to
+  // POSE_WAIT_TIMEOUT_MS for a fresh WS frame), 'stale' (timed out,
+  // display is confirmed stale — the honest warning renders and
+  // Continue becomes "Continue anyway").
+  const [poseWait, setPoseWait] = useState('idle')
+  // Frozen age (ms) captured at the moment the freshness gate gave
+  // up. Used ONLY for operator-facing copy — the driver's own pose
+  // precondition is authoritative for whether motion may proceed.
+  const [staleAgeMs, setStaleAgeMs] = useState(0)
   const continueBtnRef = useRef(null)
 
   const robot   = useStore((s) => s.robot) || {}
   const safety  = useStore((s) => s.safety) || {}
   const liveJointsRad = useStore((s) => s.joints?.positions) || []
+  // Same freshness signal ArmViewer3D subscribes to (see
+  // components/ArmViewer3D.jsx line 550). Modal + 3D render provably
+  // share ONE pose source — the D_orient_pose_source doctrine test
+  // pins the shared selector at the source level.
+  const lastMessageTime = useStore((s) => s.lastMessageTime)
 
   // Wire authority: state_code==2 is the numeric truth per FACTS.md;
   // boolean `enabled` is a legacy fallback for older builds. Same
@@ -163,16 +185,120 @@ export default function OrientFlangeDownControl({ jogApi }) {
   const openModal = () => {
     if (disabled) return
     setStatus(null)
+    setPoseWait('idle')
+    setStaleAgeMs(0)
     setModalOpen(true)
   }
 
   const onCancel = () => {
     if (busy) return
+    setPoseWait('idle')
+    setStaleAgeMs(0)
     setModalOpen(false)
+  }
+
+  // Wait up to POSE_WAIT_TIMEOUT_MS for a fresh WS frame. Polls the
+  // store directly (getState()) rather than the closed-over
+  // lastMessageTime — a state subscription inside an async function
+  // would capture the value at call time and never see updates. The
+  // spinner runs off `poseWait === 'waiting'`.
+  async function waitForFreshPose() {
+    const start = Date.now()
+    while (true) {
+      const t = useStore.getState().lastMessageTime
+      if (isPoseFresh(t, Date.now())) return { fresh: true, ageMs: 0 }
+      if (Date.now() - start > POSE_WAIT_TIMEOUT_MS) {
+        return {
+          fresh: false,
+          ageMs: computePoseAgeMs(t, Date.now()),
+        }
+      }
+      await new Promise((r) => setTimeout(r, 50))
+    }
   }
 
   const onContinue = async () => {
     if (busy || !twinReady) return
+
+    // Freshness gate — the SAME lastMessageTime the 3D render tracks.
+    // Fresh at press → skip the gate entirely (normal path, no
+    // spinner, no warning). Stale at press → block briefly for a
+    // fresh WS frame; a spinner tells the operator we're reading.
+    // Timeout → surface the honest "display is stale" warning
+    // (staleAgeMs is what the operator sees) AND log the event.
+    // Success mid-wait clears back to normal without warning.
+    //
+    // Second press after a stale-timeout (poseWait === 'stale'):
+    // operator has already read the honest copy — skip the gate and
+    // route through the existing endpoint. The driver's OWN pose
+    // precondition (server-side stale_joint_state check + FK cross-
+    // check) is authoritative for whether motion may proceed; we
+    // never bypass orient_near_singularity or VERIFY-SAVED.
+    const _now       = Date.now()
+    const _t         = lastMessageTime
+    const _pressAge  = computePoseAgeMs(_t, _now)
+    const _bypassGate = poseWait === 'stale'
+    if (!_bypassGate && !isPoseFresh(_t, _now)) {
+      setPoseWait('waiting')
+      setStatus(null)
+      const _res = await waitForFreshPose()
+      if (!_res.fresh) {
+        // Honest warning: the DISPLAY is stale; the robot verifies
+        // its own pose before moving. Log a loud event so we can see
+        // whether the tablet WiFi is the driver of these misses.
+        setStaleAgeMs(_res.ageMs)
+        setPoseWait('stale')
+        try {
+          const payload = {
+            severity: 'warning',
+            source:   'dashboard',
+            code:     'orient_flange_down.pose_display_stale',
+            operator_message: (
+              'Dashboard pose display is stale at Orient-Flange-Down '
+              + `press (${formatPoseAge(_res.ageMs)}).`
+            ),
+            technical_detail: (
+              `press_age_ms=${_pressAge.toFixed(0)} `
+              + `timeout_age_ms=${_res.ageMs.toFixed(0)} `
+              + `pose_fresh_ms=${POSE_FRESH_MS} `
+              + `pose_wait_timeout_ms=${POSE_WAIT_TIMEOUT_MS}`
+            ),
+            context: {
+              press_age_ms:      Math.round(_pressAge),
+              timeout_age_ms:    Math.round(_res.ageMs),
+              pose_fresh_ms:     POSE_FRESH_MS,
+              pose_wait_ms:      POSE_WAIT_TIMEOUT_MS,
+              user_agent:        (typeof navigator !== 'undefined'
+                                    && navigator.userAgent) || '',
+              ws_status:         useStore.getState().wsStatus || '',
+              last_message_time: _t || 0,
+            },
+          }
+          fetch('/api/event_log/append', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+            keepalive: true,
+          }).catch(() => { /* nop — log path is best-effort */ })
+        } catch (_) { /* nop */ }
+        return
+      }
+      // Fresh mid-wait — fall through to the normal path with no
+      // warning, no stale banner.
+      setPoseWait('idle')
+      setStaleAgeMs(0)
+    }
+
+    // Operator either had a fresh frame at press, saw one arrive
+    // during the wait, or explicitly overrode the stale warning
+    // ("Continue anyway"). Either way: clear the frontend gate so
+    // the endpoint call site stays a single POST — no bypass, no
+    // new motion path. The driver's server-side stale_joint_state +
+    // TCP-FK cross-check is now authoritative.
+    if (_bypassGate) {
+      setPoseWait('idle')
+      setStaleAgeMs(0)
+    }
     setBusy(true)
     setStatus(null)
     try {
@@ -301,6 +427,7 @@ export default function OrientFlangeDownControl({ jogApi }) {
           style={styles.backdrop}
           role="presentation"
         >
+          <style>{`@keyframes orient-spin { to { transform: rotate(360deg); } }`}</style>
           <div
             data-testid="orient-flange-down-modal"
             role="dialog"
@@ -315,6 +442,24 @@ export default function OrientFlangeDownControl({ jogApi }) {
               The arm will rotate the flange to point straight down at
               its current position.
             </div>
+            {poseWait === 'waiting' && (
+              <div
+                data-testid="orient-flange-down-pose-waiting"
+                style={styles.waiting}>
+                <span style={styles.spinner} aria-hidden="true" />
+                <span>reading arm pose…</span>
+              </div>
+            )}
+            {poseWait === 'stale' && (
+              <div
+                data-testid="orient-flange-down-pose-stale"
+                data-age-ms={String(Math.round(staleAgeMs))}
+                style={styles.staleBanner}>
+                The dashboard&apos;s pose display is stale
+                (last update {formatPoseAge(staleAgeMs)} ago). The
+                robot verifies its own pose before moving.
+              </div>
+            )}
             {status && !status.ok && (
               <div
                 data-testid="orient-flange-down-modal-refusal"
@@ -341,15 +486,23 @@ export default function OrientFlangeDownControl({ jogApi }) {
                 type="button"
                 ref={continueBtnRef}
                 data-testid="orient-flange-down-continue"
+                data-pose-wait={poseWait}
                 onClick={onContinue}
-                disabled={busy}
+                disabled={busy || poseWait === 'waiting'}
                 style={{
                   ...styles.btnPrimary,
-                  cursor: busy ? 'not-allowed' : 'pointer',
-                  opacity: busy ? 0.55 : 1,
+                  cursor: (busy || poseWait === 'waiting')
+                    ? 'not-allowed' : 'pointer',
+                  opacity: (busy || poseWait === 'waiting') ? 0.55 : 1,
                 }}
               >
-                {busy ? 'Sending…' : 'Continue'}
+                {busy
+                  ? 'Sending…'
+                  : poseWait === 'waiting'
+                    ? 'Reading pose…'
+                    : poseWait === 'stale'
+                      ? 'Continue anyway'
+                      : 'Continue'}
               </button>
             </div>
           </div>
@@ -381,6 +534,32 @@ const styles = {
     whiteSpace: 'nowrap',
   },
   refusal: {
+    padding: '8px 12px',
+    background: '#FEF3C7', color: '#92400E',
+    border: '1px solid #FDE68A', borderRadius: 4,
+    fontSize: 12, lineHeight: 1.4,
+  },
+  // Freshness gate — spinner + "reading arm pose…" line while we
+  // wait up to POSE_WAIT_TIMEOUT_MS for a fresh WS frame.
+  waiting: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    padding: '8px 12px',
+    background: '#EFF6FF', color: '#1E40AF',
+    border: '1px solid #BFDBFE', borderRadius: 4,
+    fontSize: 12, lineHeight: 1.4,
+  },
+  spinner: {
+    display: 'inline-block',
+    width: 12, height: 12,
+    border: '2px solid #93C5FD',
+    borderTopColor: '#1E40AF',
+    borderRadius: '50%',
+    animation: 'orient-spin 0.8s linear infinite',
+  },
+  // Honest stale-display banner. Copy is deliberate: names the
+  // display feed (not the robot's pose) and reminds the operator
+  // the driver runs its own pose precondition before moving.
+  staleBanner: {
     padding: '8px 12px',
     background: '#FEF3C7', color: '#92400E',
     border: '1px solid #FDE68A', borderRadius: 4,
