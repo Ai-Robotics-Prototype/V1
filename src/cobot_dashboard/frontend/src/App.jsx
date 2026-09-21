@@ -114,7 +114,40 @@ export default function App() {
   // (device-trust legacy path) but doesn't gate the app.
   const [needsPair, setNeedsPair] = useState(false)
   useEffect(() => {
-    const onReq = () => setNeedsPair(true)
+    // Confirmation gate (2026-09-21 regression sweep). A spurious
+    // `roboai-pair-required` event during nav caused the entire
+    // dashboard to unmount and render the black wizard for one
+    // frame. Before honouring the event, probe /api/paired_devices
+    // WITHOUT credentials — if the backend answers 200 the pairing
+    // middleware is inert (dev posture, PAIRING_ENFORCED=0) and
+    // the event is stale (e.g., a race, a transient WS close from
+    // a mid-nav browser hiccup). Only a real 401 should mount the
+    // wizard. The old behaviour (mount on any dispatch) is a
+    // permanent hazard because the wizard's Screen bg is a full
+    // viewport #0C0C0E — even a one-frame flash is loud.
+    const onReq = async (ev) => {
+      try {
+        const res = await fetch('/api/paired_devices', {
+          credentials: 'omit',
+          cache:       'no-store',
+        })
+        if (res.ok) {
+          // Backend does not require pairing. Ignore the event.
+          // Log the ignore so a future regression is visible in
+          // the console rather than silently swallowed.
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[pair-required] ignored — backend is unenforced',
+            (ev && ev.detail) || {})
+          return
+        }
+      } catch (_) {
+        // Network error during probe: fall through and mount the
+        // wizard — a hard failure is exactly when the operator
+        // needs a way to re-pair.
+      }
+      setNeedsPair(true)
+    }
     window.addEventListener('roboai-pair-required', onReq)
     return () => window.removeEventListener('roboai-pair-required', onReq)
   }, [])
@@ -270,29 +303,19 @@ export default function App() {
     return <FleetHome />
   }
 
-  if (needsPair) {
-    return (
-      <DevicePairingWizard
-        onComplete={() => {
-          setNeedsPair(false)
-          // Re-connect WS + hydrate now that we have a token.
-          try { connectWS() } catch (_) { /* nop */ }
-          try { hydrateEdition() } catch (_) { /* nop */ }
-        }}
-        onSkip={() => {
-          // Dev-posture "Continue without pairing" (add-60 §689 fix
-          // for the wizard-blocked-dashboard bug — enforcement flag
-          // OFF, so the backend answers unauthenticated requests
-          // anyway; the wizard was purely a UI gate that ran ahead
-          // of enforcement). Skip dismisses the wizard for the rest
-          // of this browser session; a page reload puts it back so
-          // it stays discoverable.
-          setNeedsPair(false)
-        }}
-      />
-    )
-  }
-
+  // 2026-09-21 regression sweep: DevicePairingWizard is now an
+  // OVERLAY (rendered inside the dashboard tree, last), NOT a top-
+  // level return branch. Field bug B root cause: any spurious
+  // `roboai-pair-required` event (WS transient close, stale-token
+  // 401) would flip `needsPair=true` and the dashboard tree
+  // UNMOUNTED — every mounted page (IOPage, MonitorDashboard, the
+  // 3D twin) was destroyed and remounted on the next flip. The
+  // operator saw a black flash on I/O navigation because the
+  // wizard's Screen (full-viewport `#0C0C0E` bg, zIndex 9999)
+  // renders in front of the dashboard tree. Fix: keep the tree
+  // ALIVE and layer the wizard on top when needed. Its own
+  // fixed-position styling already covers the dashboard when
+  // mounted; on unmount, the dashboard is right where it was.
   return (
     <ErrorBoundary>
       <div style={gridStyle}>
@@ -364,6 +387,24 @@ export default function App() {
         <JogDebugPanel />
         <PairRequestModal />
         <LoginModal />
+        {/* Device-pairing wizard as an OVERLAY (not a top-level
+            return). Its own Screen wrapper positions fixed at
+            zIndex 9999 and covers the viewport when mounted; when
+            needsPair goes back to false, the wizard unmounts and
+            the dashboard behind it is exactly where the operator
+            left it. Fixes the 2026-09-21 IO-tab black-flash bug
+            (see the operator's field report + commit body).
+            Wizard is skipped entirely under !needsPair — cheap. */}
+        {needsPair && (
+          <DevicePairingWizard
+            onComplete={() => {
+              setNeedsPair(false)
+              try { connectWS() } catch (_) { /* nop */ }
+              try { hydrateEdition() } catch (_) { /* nop */ }
+            }}
+            onSkip={() => setNeedsPair(false)}
+          />
+        )}
       </div>
     </ErrorBoundary>
   )

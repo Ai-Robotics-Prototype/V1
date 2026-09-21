@@ -130,6 +130,51 @@ test('showFleetHome memo deps are [fleetHydrated, fleetTotal] only', () => {
       + `black-flash window during in-app navigation.`))
 })
 
+test('DevicePairingWizard is an OVERLAY, not a top-level return branch', () => {
+  // 2026-09-21 field bug B: operator saw a "brief pair device
+  // prompt" flash on I/O tab navigation. Root cause: DevicePairing-
+  // Wizard was rendered via `if (needsPair) return <Wizard />` — a
+  // top-level return, which UNMOUNTED the whole dashboard tree
+  // (TopBar / IOPage / 3D twin / EStopOverlay ALL destroyed) when
+  // any spurious `roboai-pair-required` event fired. Fix: render
+  // the wizard as an in-tree overlay after the dashboard grid so
+  // the dashboard NEVER unmounts. Any spurious dispatch is now
+  // capped at rendering a fixed-position overlay that layers on
+  // top; underlying pages stay mounted with their local state.
+  //
+  // Pin at source level: DevicePairingWizard must appear inside
+  // the JSX tree (near LoginModal), NOT inside any `if (...)
+  // return <DevicePairingWizard ...>` shape.
+  assert.equal(
+    /if\s*\([^)]*\)\s*\{?\s*return\s*<DevicePairingWizard/.test(appSrc),
+    false,
+    v('DevicePairingWizard must NOT appear inside an `if (...) '
+      + 'return` block. Rendering it as a top-level early return '
+      + 'unmounts the dashboard tree on every spurious pair-required '
+      + 'event — the exact 2026-09-21 I/O-tab flash bug.'))
+  // Positive assertion: the wizard IS rendered inside the JSX
+  // subtree that also contains PairRequestModal / LoginModal.
+  assert.ok(/\{needsPair && \(\s*<DevicePairingWizard/.test(appSrc),
+    v('DevicePairingWizard must render as `{needsPair && '
+      + '(<DevicePairingWizard ... />)}` alongside PairRequestModal '
+      + '/ LoginModal — an overlay layered on top of the dashboard, '
+      + 'never a replacement for it.'))
+})
+
+test('roboai-pair-required event goes through the confirmation probe', () => {
+  // Defence-in-depth: even if the wizard is an overlay, we don't
+  // want a spurious event to flash the black Screen wrapper for
+  // one frame. Under PAIRING_ENFORCED=0, no legitimate 401
+  // pairing_required can fire — so the event handler MUST probe
+  // /api/paired_devices before honouring the dispatch.
+  assert.ok(/roboai-pair-required[\s\S]*?fetch\(['"]\/api\/paired_devices['"]/
+              .test(appSrc),
+    v('roboai-pair-required listener must probe /api/paired_devices '
+      + 'before setting needsPair=true. This is the confirmation '
+      + 'gate that swallows stale/transient 401s from spurious '
+      + 'WS reconnects or middleware races.'))
+})
+
 test('App.jsx memo bails on !fleetHydrated so no flash pre-hydration', () => {
   // Belt-and-braces: the memo must fast-return false when
   // fleetHydrated is false. A single-robot install lands in the
