@@ -169,6 +169,31 @@ test('DevicePairingWizard is an OVERLAY, not a top-level return branch', () => {
       + 'event listener).'))
 })
 
+test('DeviceManagementPanel uses IOPage-white theme (no dark flash)', () => {
+  // 2026-09-21 field bug B (real root cause): the operator's "brief
+  // pair device prompt flash" on I/O nav was the DeviceManagement-
+  // Panel's dark #141418 panel bg rendering against the IOPortMap's
+  // white parent. Under a white-themed IOPage, the panel MUST NOT
+  // reintroduce a dark bg color — any dark hex here regresses the
+  // field bug at the exact same site.
+  const dmpPath = join(FRONT_ROOT, 'src', 'components',
+                        'DeviceManagementPanel.jsx')
+  const src = readFileSync(dmpPath, 'utf8')
+  // Extract the color table (a `const C = { ... }` block near the top).
+  const cIdx = src.indexOf('const C = {')
+  assert.ok(cIdx > 0,
+    v('DeviceManagementPanel must define its color palette as '
+      + '`const C = { ... }` at the top of the file (grep pin).'))
+  const cBlock = src.slice(cIdx, cIdx + 600)
+  // Forbid the four dark tokens the old table used.
+  for (const forbidden of ['#0C0C0E', '#141418', '#242429', '#F4F4F6']) {
+    assert.equal(cBlock.includes(forbidden), false,
+      v(`DeviceManagementPanel color table must NOT contain `
+        + `"${forbidden}" — that dark token is what produced the `
+        + `2026-09-21 I/O-nav flash. Keep the light-theme palette.`))
+  }
+})
+
 test('roboai-pair-required event goes through the confirmation probe', () => {
   // Defence-in-depth: even if the wizard is an overlay, we don't
   // want a spurious event to flash the black Screen wrapper for

@@ -11,13 +11,18 @@
 
 import { useCallback, useEffect, useState } from 'react'
 
+// Light theme to match IOPage's white background (see
+// pages/IOPage.jsx `background: '#fff'`). 2026-09-21 field bug:
+// on tab-nav to I/O the panel's previous dark bg #141418 flashed
+// against the white IOPortMap above it — the operator saw it as
+// "a brief pair device prompt". Aligning colors kills the flash;
+// the panel now sits quietly under IOPortMap as an in-page section.
 const C = {
-  bg:      '#0C0C0E',
-  panel:   '#141418',
-  border:  '#242429',
-  text:    '#F4F4F6',
-  muted:   '#8B8B93',
-  bad:     '#EF4444',
+  panel:   '#FFFFFF',
+  border:  '#E5E7EB',
+  text:    '#111827',
+  muted:   '#6B7280',
+  bad:     '#DC2626',
 }
 
 function fmtAgo(iso) {
