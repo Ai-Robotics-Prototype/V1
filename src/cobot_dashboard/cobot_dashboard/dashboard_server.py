@@ -555,7 +555,23 @@ except Exception:
 
 
 STATE = {
-    "safety": {"zone": "GREEN", "speed_scale": 1.0, "estop": False, "human_proximity": 2.4},
+    # Composed safety state. `estop` is the OR of two sources:
+    #   * `_software_estop` — latched by POST /cmd/estop {active:true};
+    #     cleared by POST /cmd/estop {active:false}. Only the dashboard
+    #     endpoint mutates this field.
+    #   * `_hardware_estop` — mirrored from /safety/estop (Bool) which
+    #     the estun driver publishes at 1 Hz from the physical estop
+    #     input on the cabinet. `_on_estop` mutates only this field.
+    # Legacy readers of `safety.estop` (frontend, task gates, WS
+    # broadcast consumers) see the composed value and don't need to
+    # care about the split. Root-cause of the 2026-09-21 field
+    # regression: `_on_estop` used to write `safety.estop` directly,
+    # so the driver's 1 Hz `data: false` publish reset any software-
+    # commanded stop within 1 s. Split-source keeps a soft press
+    # latched until the operator releases it via the dashboard.
+    "safety": {"zone": "GREEN", "speed_scale": 1.0, "estop": False,
+                "_software_estop": False, "_hardware_estop": False,
+                "human_proximity": 2.4},
     "joints": {
         "names": ["J1", "J2", "J3", "J4", "J5", "J6"],
         # Zeros = URDF export pose (L-shape) for the Estun S10-140. The
@@ -1972,7 +1988,13 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 if "zone"         in d: s["zone"]            = d["zone"]
                 if "proximity_m"  in d: s["human_proximity"] = d["proximity_m"]
                 if "speed_scale"  in d: s["speed_scale"]     = d["speed_scale"]
-                if "estop"        in d: s["estop"]            = d["estop"]
+                # Split-source estop (see STATE.safety docblock at L555).
+                # /safety/status is another HARDWARE source — writes only
+                # `_hardware_estop`; composed `estop` is OR-of-sources.
+                if "estop" in d:
+                    hw = bool(d["estop"])
+                    s["_hardware_estop"] = hw
+                    s["estop"] = bool(s.get("_software_estop", False)) or hw
         except Exception:
             pass
 
@@ -1989,8 +2011,18 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             STATE["safety"]["speed_scale"] = round(msg.data, 3)
 
     def _on_estop(self, msg):
+        # OR-of-sources compose. This subscriber writes the HARDWARE
+        # source ONLY; the SOFTWARE latch is owned by POST /cmd/estop
+        # and never cleared from here. Rescued the 2026-09-21 flash
+        # regression: the driver publishes /safety/estop at 1 Hz with
+        # data=False (physical estop not pressed) and used to clobber
+        # a dashboard-commanded stop within 1 s. See STATE.safety
+        # docblock (search "_software_estop") for the split rationale.
         with _state_lock:
-            STATE["safety"]["estop"] = bool(msg.data)
+            hw = bool(msg.data)
+            STATE["safety"]["_hardware_estop"] = hw
+            STATE["safety"]["estop"] = (
+                bool(STATE["safety"].get("_software_estop", False)) or hw)
 
     # ---- Task / perception ----
 
@@ -2727,9 +2759,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             tm = d.get("tcp_mm")
             if isinstance(tm, list) and len(tm) == 6:
                 r["tcp_mm"] = list(tm)
-            # Estop — real robot is authoritative when connected
+            # Estop — real robot is authoritative when connected.
+            # Split-source: writes HARDWARE only; SOFTWARE latch is
+            # owned by POST /cmd/estop. Composed estop = SW OR HW.
+            # See STATE.safety docblock at L555.
             if r["connected"] and "estop" in d:
-                STATE["safety"]["estop"] = bool(d["estop"])
+                s_sf = STATE["safety"]
+                hw = bool(d["estop"])
+                s_sf["_hardware_estop"] = hw
+                s_sf["estop"] = bool(s_sf.get("_software_estop", False)) or hw
             # Task running mirror — only when not driven by the project runner
             if r["connected"] and not STATE["task"].get("running", False):
                 STATE["task"]["running"] = bool(d.get("moving", False))
@@ -4587,23 +4625,36 @@ if FASTAPI_AVAILABLE:
         active   = bool(body.get("active", True))
         override = bool(body.get("override", False))
         if active:
+            # SOFTWARE-latch write. Writes `_software_estop` (owned by
+            # this endpoint) and composes `estop` = SW OR HW so the
+            # composed field reflects the fresh press even before the
+            # next hardware publish arrives. See STATE.safety docblock
+            # at L555. Fixes the 2026-09-21 flash regression where a
+            # dashboard-commanded stop got clobbered by /safety/estop
+            # from the driver's 1 Hz heartbeat.
             with _state_lock:
-                STATE["safety"]["estop"]      = True
-                STATE["safety"]["speed_scale"] = 0.0
+                s = STATE["safety"]
+                s["_software_estop"] = True
+                s["estop"]           = True  # SW=True OR anything = True
+                s["speed_scale"]     = 0.0
                 if STATE["task"]["running"]:
                     STATE["task"]["running"] = False
                     STATE["task"]["state"]   = "PAUSED"
             with _state_lock:
                 return {"ok": True, "safety": copy.deepcopy(STATE["safety"])}
-        # Release
+        # Release. Clear the SOFTWARE latch; composed `estop` reverts to
+        # whatever HARDWARE last reported (physical estop still latched
+        # → composed stays True). Only /cmd/estop clears the SW side.
         with _state_lock:
             zone = STATE["safety"]["zone"]
         if zone != "GREEN" and not override:
             return JSONResponse({"error": f"Cannot release estop: zone is {zone}"}, status_code=400)
         with _state_lock:
-            STATE["safety"]["estop"] = False
-            if zone == "GREEN":
-                STATE["safety"]["speed_scale"] = 1.0
+            s = STATE["safety"]
+            s["_software_estop"] = False
+            s["estop"] = bool(s.get("_hardware_estop", False))
+            if zone == "GREEN" and not s["estop"]:
+                s["speed_scale"] = 1.0
         if _ros_node:
             _ros_node.call_reset_estop()
         with _state_lock:

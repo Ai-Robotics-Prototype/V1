@@ -1,4 +1,4 @@
-import { useEffect, useState, Component } from 'react'
+import { useEffect, useMemo, useState, Component } from 'react'
 import { useStore } from './store/useStore'
 import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
 import DevicePairingWizard from './components/DevicePairingWizard'
@@ -119,21 +119,32 @@ export default function App() {
     return () => window.removeEventListener('roboai-pair-required', onReq)
   }, [])
 
-  // Fleet-home landing decision (2026-09-21 operator directive).
-  // `fleetTotal` is self + Avahi-discovered peers. When >1 the app
-  // lands in the fleet grid; when ≤1 the grid is skipped entirely
-  // and the dashboard renders as today (single-robot-skips-grid).
-  // The URL param `view` is authoritative when present so the "Back
-  // to fleet" chip in TopBar can override the count-based default.
+  // Fleet-home landing decision (2026-09-21 operator directive,
+  // 2026-09-21 regression sweep). `fleetTotal` is self + Avahi-
+  // discovered peers. When >1 the app lands in the fleet grid; when
+  // ≤1 the grid is skipped entirely and the dashboard renders as
+  // today (single-robot-skips-grid). The URL param `view` is
+  // authoritative when present so the "Back to fleet" chip in TopBar
+  // can override the count-based default.
+  //
+  // Bug B (regression sweep 2026-09-21): the landing decision must
+  // NEVER re-evaluate mid-navigation with an intermediate registry
+  // value. `showFleetHome` is memoized on the SETTLED signals
+  // (fleetHydrated + fleetTotal) and window.location.search — none
+  // of which change on `setTab(...)`. A tab click therefore CANNOT
+  // flip showFleetHome, which pins that FleetHome does not mount
+  // for one frame during in-app navigation.
   const fleetTotal    = useStore((s) => s.fleetTotal)
   const fleetHydrated = useStore((s) => s.fleetHydrated)
   const hydrateFleet  = useStore((s) => s.hydrateFleet)
   useEffect(() => { hydrateFleet() }, [hydrateFleet])
-  const landingView = pickLandingView({
-    totalRobots: fleetTotal,
-    urlSearch: (typeof window !== 'undefined'
-                 ? window.location.search : ''),
-  })
+  const showFleetHome = useMemo(() => {
+    if (!fleetHydrated) return false
+    if (fleetTotal <= 1) return false           // single-robot-skips-grid
+    const urlSearch = (typeof window !== 'undefined'
+                        ? window.location.search : '')
+    return pickLandingView({ totalRobots: fleetTotal, urlSearch }) === 'fleet'
+  }, [fleetHydrated, fleetTotal])
   const connectWS       = useStore((s) => s.connectWS)
   const activeTab       = useStore((s) => s.activeTab)
   const hydrateCells    = useStore((s) => s.hydrateCells)
@@ -253,7 +264,9 @@ export default function App() {
   // Fleet-home landing (2026-09-21). Before pair wizard because the
   // grid is VIEW-tier — no auth required — and lets the operator
   // pick a robot before that robot's own control-auth kicks in.
-  if (fleetHydrated && landingView === 'fleet' && fleetTotal > 1) {
+  // Gated on the memoized `showFleetHome` — the settled decision;
+  // never re-evaluates on in-app navigation (see bug B fix above).
+  if (showFleetHome) {
     return <FleetHome />
   }
 

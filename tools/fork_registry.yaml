@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4586
+        line: 4637
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -745,10 +745,13 @@ capabilities:
           → 4466 (+170 for identity + pairing imports, HTTP+WS
           auth middleware helpers, and per-WS-handler auth guards);
           2026-09-21 fleet home → 4586 (+2 for the fleet import
-          + /api/fleet/ line in _UNAUTH_PATH_PREFIXES).
+          + /api/fleet/ line in _UNAUTH_PATH_PREFIXES);
+          2026-09-21 estop latch → 4637 (+51 for STATE.safety split-
+          source docblock, _on_safety_status/_on_estop/_on_estun_status
+          split-source writes, /cmd/estop press+release compose).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4721
+        line: 4772
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Drift history: 4156 → 4267 → 4322 → 4349 →
@@ -764,7 +767,9 @@ capabilities:
           2026-09-18 device pairing backend → 4601 (+183 for
           pairing endpoints + auth middleware + per-WS guards);
           2026-09-21 fleet home → 4721 (+2 for the fleet import
-          + /api/fleet/ line in _UNAUTH_PATH_PREFIXES).
+          + /api/fleet/ line in _UNAUTH_PATH_PREFIXES);
+          2026-09-21 estop latch → 4772 (+51 for the same block
+          as the /cmd/jog drift note above).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0

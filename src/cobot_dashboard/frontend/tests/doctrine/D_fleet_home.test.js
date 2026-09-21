@@ -44,13 +44,24 @@ const storeSrc   = readSrc('store/useStore.js')
 
 // ── (1) grid-renders-per-registry ────────────────────────────────────
 
-test('App.jsx renders FleetHome when landingView is "fleet"', () => {
+test('App.jsx renders FleetHome via the settled `showFleetHome` memo', () => {
+  // 2026-09-21 regression sweep: the fleet branch was reshaped to
+  // route through a `useMemo` on the SETTLED signals so a tab
+  // click (which does not change fleetHydrated / fleetTotal) can
+  // NEVER flip the branch mid-navigation. Grep-pins the shape.
   assert.ok(/import\s+FleetHome\s+from\s+['"]\.\/pages\/FleetHome['"]/.test(appSrc),
     v('App.jsx must import FleetHome from ./pages/FleetHome'))
-  assert.ok(/landingView\s*===\s*['"]fleet['"]/.test(appSrc),
-    v('App.jsx must branch on landingView === "fleet"'))
-  assert.ok(/return\s*<FleetHome\s*\/>/s.test(appSrc),
-    v('App.jsx must render <FleetHome /> inside the fleet branch'))
+  assert.ok(/const showFleetHome = useMemo/.test(appSrc),
+    v('App.jsx must derive `showFleetHome` via useMemo on the '
+      + 'settled fleet signals (bug B fix — no mid-nav flip).'))
+  assert.ok(/if \(showFleetHome\)\s*\{[\s\S]*?return <FleetHome \/>/s
+              .test(appSrc),
+    v('App.jsx must render <FleetHome /> inside `if (showFleetHome)`. '
+      + 'Re-deriving the guard in JSX would defeat the memo.'))
+  // The memo body must call pickLandingView with the SETTLED count
+  // and the current URL search — no other args, no other state.
+  assert.ok(/pickLandingView\(\{\s*totalRobots:\s*fleetTotal/.test(appSrc),
+    v('showFleetHome memo must feed pickLandingView with fleetTotal'))
 })
 
 test('App.jsx uses pickLandingView from lib/fleet (single truth)', () => {
@@ -149,15 +160,17 @@ test('FleetHome cards use ONE tap action: location redirect', () => {
 
 // ── (4) single-robot-skips-grid ─────────────────────────────────────
 
-test('App.jsx gates FleetHome on fleetTotal > 1', () => {
-  // The render branch must combine BOTH the URL-view decision AND
-  // the numeric guard so a single-robot install never lands here
-  // even if a stale ?view=fleet param is on the URL.
-  assert.ok(/fleetTotal\s*>\s*1/.test(appSrc),
-    v('App.jsx must gate the FleetHome render on fleetTotal > 1'))
-  assert.ok(/fleetHydrated\s*&&\s*landingView\s*===\s*['"]fleet['"]/.test(appSrc),
-    v('App.jsx must gate on fleetHydrated so we do not flash-render '
-      + 'the fleet grid before /api/fleet/peers has answered'))
+test('App.jsx gates FleetHome on fleetTotal > 1 (inside the memo)', () => {
+  // 2026-09-21 regression sweep: the numeric + hydration guards now
+  // live INSIDE the `showFleetHome` memo (not in the JSX branch),
+  // so the settled decision cannot flip mid-navigation. Pin both.
+  assert.ok(/fleetTotal\s*<=\s*1/.test(appSrc),
+    v('showFleetHome memo must short-circuit on fleetTotal <= 1 '
+      + '(single-robot-skips-grid, hardened at the memo layer)'))
+  assert.ok(/!fleetHydrated/.test(appSrc),
+    v('showFleetHome memo must short-circuit on !fleetHydrated so '
+      + 'FleetHome never briefly renders before /api/fleet/peers '
+      + 'has answered — this is the pre-hydration flash guard.'))
 })
 
 test('store.hydrateFleet is the single fleet-hydrate site', () => {
