@@ -118,63 +118,89 @@ function PneumaticPortGlyph({ dataIo, size = 44 }) {
   )
 }
 
-function DigitalInputGlyph({ dataIo, size = 44 }) {
-  // M8 3-pin sensor input: hex + 3-pin pattern.
+// ── M8 3-pin face (shared by inputs + outputs) ──────────────────────
+//
+// Operator correction 2026-09-21: outputs must render the SAME
+// physical connector face as inputs — only the color differs. One
+// component, `M8ThreePinFace`, is parameterized by accent color.
+// DigitalInputGlyph and DigitalOutputGlyph are thin wrappers that
+// pass the correct accent (green / amber) + data-glyph tag, so
+// downstream test / live-state selectors that key on `data-glyph`
+// stay stable.
+
+function M8ThreePinFace({ dataIo, size, accent, glyph }) {
   const cx = size / 2, cy = size / 2, r = size * 0.14
   return (
-    <span data-io={dataIo} data-glyph="digital_input"
+    <span data-io={dataIo} data-glyph={glyph}
           style={{ display: 'inline-block' }}>
-      <HexOutline size={size} accent={INPUT_ACCENT}>
+      <HexOutline size={size} accent={accent}>
         <circle cx={cx} cy={cy - r * 0.9} r={size * 0.05}
-                fill={INPUT_ACCENT} opacity={0.9} />
+                fill={accent} opacity={0.9} />
         <circle cx={cx - r * 0.85} cy={cy + r * 0.55} r={size * 0.05}
-                fill={INPUT_ACCENT} opacity={0.9} />
+                fill={accent} opacity={0.9} />
         <circle cx={cx + r * 0.85} cy={cy + r * 0.55} r={size * 0.05}
-                fill={INPUT_ACCENT} opacity={0.9} />
+                fill={accent} opacity={0.9} />
         <circle cx={cx} cy={cy} r={size * 0.22}
-                fill="none" stroke={INPUT_ACCENT} strokeWidth={1.2} />
+                fill="none" stroke={accent} strokeWidth={1.2} />
       </HexOutline>
     </span>
+  )
+}
+
+function DigitalInputGlyph({ dataIo, size = 44 }) {
+  return (
+    <M8ThreePinFace dataIo={dataIo} size={size}
+                     accent={INPUT_ACCENT}
+                     glyph="digital_input" />
   )
 }
 
 function DigitalOutputGlyph({ dataIo, size = 44 }) {
-  // M8 output — same hex frame, different accent + slightly heavier
-  // center dot to signal a driven pin.
-  const cx = size / 2, cy = size / 2, r = size * 0.14
+  // 2026-09-21 operator correction: same face as DigitalInputGlyph,
+  // amber accent. NO custom shape here — this thin wrapper is what
+  // the "output-glyph-equals-input-glyph-component" pin locks in.
   return (
-    <span data-io={dataIo} data-glyph="digital_output"
-          style={{ display: 'inline-block' }}>
-      <HexOutline size={size} accent={OUTPUT_ACCENT}>
-        <circle cx={cx} cy={cy - r * 0.9} r={size * 0.05}
-                fill={OUTPUT_ACCENT} opacity={0.9} />
-        <circle cx={cx - r * 0.85} cy={cy + r * 0.55} r={size * 0.05}
-                fill={OUTPUT_ACCENT} opacity={0.9} />
-        <circle cx={cx + r * 0.85} cy={cy + r * 0.55} r={size * 0.05}
-                fill={OUTPUT_ACCENT} opacity={0.9} />
-        <circle cx={cx} cy={cy} r={size * 0.10}
-                fill={OUTPUT_ACCENT} />
-      </HexOutline>
-    </span>
+    <M8ThreePinFace dataIo={dataIo} size={size}
+                     accent={OUTPUT_ACCENT}
+                     glyph="digital_output" />
   )
 }
 
+// ── M12 5-pin safety face ───────────────────────────────────────────
+//
+// 2026-09-21 operator correction: safety must depict a face-on 5-pin
+// M12 connector, not the previous downward-arrow icon. Standard M12
+// 5-pin layout: four pins at the compass positions of a square
+// (rotated 45° so they sit at N/E/S/W) plus one center pin. Same
+// hex housing as the M8 face family, red accent.
+
 function SafetyGlyph({ dataIo, size = 52 }) {
-  // M12 safety: hex + downward arrow (mock's safety mark).
   const cx = size / 2, cy = size / 2
+  // Ring radius from center to the four outer pins.
+  const ringR = size * 0.20
+  const pinR  = size * 0.055
+  const pinFill = SAFETY_ACCENT
   return (
     <span data-io={dataIo} data-glyph="safety"
           style={{ display: 'inline-block' }}>
       <HexOutline size={size} accent={SAFETY_ACCENT}>
-        <path
-          d={`M ${cx - size * 0.13} ${cy - size * 0.08}
-              L ${cx} ${cy + size * 0.18}
-              L ${cx + size * 0.13} ${cy - size * 0.08}
-              M ${cx} ${cy - size * 0.20}
-              L ${cx} ${cy + size * 0.06}`}
-          stroke={SAFETY_ACCENT} strokeWidth={2}
-          fill="none" strokeLinecap="round" strokeLinejoin="round"
-        />
+        {/* Inner housing ring — matches the M8 face's inner circle
+            styling family for visual coherence with inputs/outputs. */}
+        <circle cx={cx} cy={cy} r={size * 0.30}
+                fill="none" stroke={SAFETY_ACCENT} strokeWidth={1.2} />
+        {/* Four outer pins — N / E / S / W layout. */}
+        <circle data-pin="N" cx={cx}          cy={cy - ringR}
+                r={pinR} fill={pinFill} opacity={0.95} />
+        <circle data-pin="E" cx={cx + ringR}  cy={cy}
+                r={pinR} fill={pinFill} opacity={0.95} />
+        <circle data-pin="S" cx={cx}          cy={cy + ringR}
+                r={pinR} fill={pinFill} opacity={0.95} />
+        <circle data-pin="W" cx={cx - ringR}  cy={cy}
+                r={pinR} fill={pinFill} opacity={0.95} />
+        {/* Fifth pin — center. Slightly larger so the eye reads
+            it as the shared common/GND pin per M12 convention. */}
+        <circle data-pin="C" cx={cx} cy={cy}
+                r={pinR * 1.15} fill={pinFill} />
       </HexOutline>
     </span>
   )
@@ -386,20 +412,29 @@ export default function SynapsePage() {
         background: '#FFFFFF',
         padding: '20px 20px 32px',
         boxSizing: 'border-box',
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        // 2026-09-21 operator correction: use the app's font token
+        // (global.css `body { font-family: 'Inter', system-ui,
+        // sans-serif; }`), not a page-local system-ui override. The
+        // mock's wide-tracking stylized headers are normalized to
+        // the Monitor / EventLog page-title style. Grep-pin:
+        // `no font-family declaration on the Synapse page other
+        // than 'inherit'` in D_synapse_tab.test.js.
+        fontFamily: 'inherit',
         color: TEXT_PRIMARY,
       }}
     >
-      {/* Page header — matches EventLog / IOPage page-title style */}
+      {/* Page header — matches EventLog / IOPage page-title style.
+          h2 uses no letterSpacing (Monitor/EventLog convention);
+          subtitle span uses inherit weight tokens only. */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 12,
         marginBottom: 20,
       }}>
         <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800,
-                      color: TEXT_PRIMARY, letterSpacing: 0.2 }}>
+                      color: TEXT_PRIMARY }}>
           Synapse
           <span style={{ color: TEXT_SECONDARY, fontWeight: 600,
-                          letterSpacing: 0.4, marginLeft: 8 }}>
+                          marginLeft: 8 }}>
             — Connection Map
           </span>
         </h2>

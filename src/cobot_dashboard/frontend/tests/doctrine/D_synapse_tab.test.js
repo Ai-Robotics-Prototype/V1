@@ -112,17 +112,29 @@ test('every connector-glyph component receives dataIo', () => {
   // Grep-pin: each glyph component reads a `dataIo` prop and renders
   // it as a `data-io` DOM attribute. Any glyph that drops the prop
   // would prevent the future live-state binding from finding it.
-  for (const comp of ['PneumaticPortGlyph', 'DigitalInputGlyph',
-                        'DigitalOutputGlyph', 'SafetyGlyph']) {
+  // 2026-09-21 operator correction: DigitalInputGlyph and
+  // DigitalOutputGlyph now delegate to the shared M8ThreePinFace,
+  // which is what actually renders `data-io={dataIo}`. Include it
+  // in the pin list AND accept a thin wrapper that forwards
+  // `dataIo` verbatim.
+  for (const comp of ['PneumaticPortGlyph', 'M8ThreePinFace',
+                        'DigitalInputGlyph', 'DigitalOutputGlyph',
+                        'SafetyGlyph']) {
     assert.ok(
       new RegExp(`function ${comp}\\([^)]*dataIo[^)]*\\)`).test(pageSrc),
       v(`${comp} must accept a dataIo prop`))
-    // And render it via a data-io attribute.
     const compIdx = pageSrc.indexOf(`function ${comp}(`)
-    const block   = pageSrc.slice(compIdx, compIdx + 900)
-    assert.ok(/data-io=\{dataIo\}/.test(block),
-      v(`${comp} must render data-io={dataIo} on its outer span — `
-        + `it is the future live-state binding surface.`))
+    const block   = pageSrc.slice(compIdx, compIdx + 1500)
+    // Either the component renders `data-io={dataIo}` on its own
+    // outer span (leaf glyph), or it forwards `dataIo={dataIo}` to
+    // a child glyph component (thin wrapper — same effect on the
+    // DOM after the child renders).
+    const emits   = /data-io=\{dataIo\}/.test(block)
+    const forwards = /dataIo=\{dataIo\}/.test(block)
+    assert.ok(emits || forwards,
+      v(`${comp} must either render data-io={dataIo} directly or `
+        + `forward dataIo={dataIo} to a child glyph — the live-`
+        + `state binding surface stays intact either way.`))
   }
 })
 
@@ -409,4 +421,108 @@ test('inventory: IOPage had exactly ONE child, now hosted inside Synapse', () =>
   assert.ok(/from ['"]\.\.\/components\/IOPortMap['"]/.test(pageSrc),
     v('SynapsePage must import IOPortMap — the ONLY child of the '
       + 'retired IOPage — so functional parity is preserved.'))
+})
+
+
+// ── Glyph + font corrections (2026-09-21 operator screenshot) ───────
+
+test('output-glyph-equals-input-glyph-component (same face, color prop)', () => {
+  // Both DigitalInputGlyph and DigitalOutputGlyph must delegate to
+  // the SAME underlying face component (M8ThreePinFace) — inputs
+  // and outputs physically use the same M8 face-on 3-pin connector,
+  // only the accent color differs. This pin catches any regression
+  // that reintroduces a bespoke output shape (e.g. the previous
+  // triangle/arrow-pin design the operator flagged).
+  // Extract the wrapper bodies. Wrappers are tiny thin functions
+  // that delegate to M8ThreePinFace — extract up to the next
+  // top-level `\nfunction ` (or EOF) to capture the full body.
+  function _slice(name) {
+    const idx = pageSrc.indexOf(`function ${name}(`)
+    if (idx < 0) return null
+    const nextFn = pageSrc.indexOf('\nfunction ', idx + 1)
+    return pageSrc.slice(idx, nextFn > 0 ? nextFn : idx + 1200)
+  }
+  const inMatch  = _slice('DigitalInputGlyph')
+  const outMatch = _slice('DigitalOutputGlyph')
+  assert.ok(inMatch,  v('DigitalInputGlyph must exist'))
+  assert.ok(outMatch, v('DigitalOutputGlyph must exist'))
+  const shared = 'M8ThreePinFace'
+  assert.ok(new RegExp(`<${shared}\\b`).test(inMatch),
+    v(`DigitalInputGlyph must delegate to <${shared}> — the shared `
+      + `M8 face component`))
+  assert.ok(new RegExp(`<${shared}\\b`).test(outMatch),
+    v(`DigitalOutputGlyph must delegate to <${shared}> — same face `
+      + `as the input glyph, only the color differs`))
+  // And the wrappers must NOT declare inline SVG (circle/polygon/
+  // path) — that would be a fork of the shape.
+  for (const [name, block] of [
+    ['DigitalInputGlyph',  inMatch],
+    ['DigitalOutputGlyph', outMatch],
+  ]) {
+    for (const forbidden of ['<circle', '<polygon', '<path', '<svg']) {
+      assert.equal(block.includes(forbidden), false,
+        v(`${name} must NOT contain ${forbidden} — the M8 face is `
+          + `rendered by the shared M8ThreePinFace component. Any `
+          + `inline shape here forks the design.`))
+    }
+  }
+  // Color passthrough: input passes INPUT_ACCENT, output passes
+  // OUTPUT_ACCENT. Grep-pinned so a copy-paste bug can't send both
+  // to the same accent.
+  assert.ok(/accent=\{INPUT_ACCENT\}/.test(inMatch),
+    v('DigitalInputGlyph must pass accent={INPUT_ACCENT}'))
+  assert.ok(/accent=\{OUTPUT_ACCENT\}/.test(outMatch),
+    v('DigitalOutputGlyph must pass accent={OUTPUT_ACCENT}'))
+})
+
+test('safety-glyph-five-pins (M12 face with 5 pin circles)', () => {
+  // Extract the SafetyGlyph function body and count pin circles.
+  // The M12 5-pin layout is 4 outer pins (N/E/S/W) + 1 center
+  // (Common/GND) — five pin elements total. Extra decorative
+  // circles (the housing ring) are OK; the pin-count grep keys
+  // on `data-pin=` markers we tag onto each pin.
+  const idx = pageSrc.indexOf('function SafetyGlyph(')
+  assert.ok(idx > 0, v('SafetyGlyph must exist'))
+  const body = pageSrc.slice(idx, idx + 2500)
+  const pins = body.match(/data-pin="/g) || []
+  assert.equal(pins.length, 5,
+    v(`SafetyGlyph must contain EXACTLY 5 data-pin elements — `
+      + `found ${pins.length}. Layout: N / E / S / W + center C.`))
+  // The five distinct pin identifiers must be present.
+  for (const p of ['N', 'E', 'S', 'W', 'C']) {
+    assert.ok(new RegExp(`data-pin="${p}"`).test(body),
+      v(`SafetyGlyph must include data-pin="${p}" — standard M12 `
+        + `5-pin position marker.`))
+  }
+  // And the previous arrow-shape path must be gone.
+  assert.equal(/downward arrow|safety mark/i.test(body), false,
+    v('SafetyGlyph must not narrate an arrow/safety-mark shape — '
+      + 'the operator retired the arrow icon 2026-09-21; the glyph '
+      + 'reads as a physical M12 connector face.'))
+})
+
+test('font-token pin: only inherit / var(--font) fontFamily on Synapse page', () => {
+  // The app's font is set on <body> via global.css (Inter, system-ui,
+  // sans-serif via --font). SynapsePage must NOT declare a local
+  // fontFamily override — every fontFamily declaration must be
+  // `inherit` (which cascades from the body via the CSS token) or
+  // reference the app's --font variable. Any other stack (system-ui
+  // directly, Segoe UI, monospace, etc.) is a mock-artifact and
+  // must be retired.
+  const decls = pageSrc.match(/fontFamily:\s*['"`][^'"`]*['"`]/g) || []
+  assert.ok(decls.length > 0,
+    v('SynapsePage must have at least one explicit fontFamily=inherit '
+      + 'declaration on the page root to defeat the button/input '
+      + 'user-agent font default.'))
+  for (const decl of decls) {
+    // Accept: 'inherit', var(--font, ...), or a stack that STARTS
+    // with var(--font).
+    const ok =
+      /fontFamily:\s*['"`]inherit['"`]/.test(decl)
+      || /fontFamily:\s*['"`]var\(--font/.test(decl)
+    assert.ok(ok,
+      v(`SynapsePage fontFamily declaration ${decl} is not the app `
+        + `token. Use 'inherit' (recommended) or var(--font, …). No `
+        + `local system-ui / Segoe UI / Inter stacks on this page.`))
+  }
 })
