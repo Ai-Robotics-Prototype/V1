@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, Component } from 'react'
+import { useEffect, useMemo, useRef, useState, Component } from 'react'
 import { useStore } from './store/useStore'
 import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
 import DevicePairingWizard from './components/DevicePairingWizard'
@@ -119,6 +119,69 @@ function DevicePairingWizardOverlay({ needsPair, onDismiss, onPaired }) {
   if (!needsPair || !confirmed) return null
   return (
     <DevicePairingWizard onComplete={onPaired} onSkip={onDismiss} />
+  )
+}
+
+// TEMPORARY 2026-09-21 lag diagnostic. Fixed overlay top-right that
+// shows: App render count since mount, elapsed since last render,
+// long-task count from the Performance API, active setInterval
+// timers count (approx). Visible when URL has ?perf=1 OR when the
+// build was made with VITE_PERF_OVERLAY=1. Never enabled in
+// production — this block is deleted before shipping the fix.
+function PerfOverlay() {
+  const appRenderCount = useRef(0)
+  appRenderCount.current += 1
+  const lastRenderAtRef = useRef(performance.now())
+  const now = performance.now()
+  const sinceLast = Math.round(now - lastRenderAtRef.current)
+  lastRenderAtRef.current = now
+  const [longTasks, setLongTasks] = useState(0)
+  const [displayedRenders, setDisplayedRenders] = useState(0)
+  const [displayedSinceLast, setDisplayedSinceLast] = useState(0)
+  useEffect(() => {
+    // Redraw the overlay every 500 ms with the latest numbers
+    // WITHOUT causing extra App renders (we only re-render this
+    // component, not the parent).
+    const iv = setInterval(() => {
+      setDisplayedRenders(appRenderCount.current)
+      setDisplayedSinceLast(Math.round(performance.now()
+                                         - lastRenderAtRef.current))
+    }, 500)
+    return () => clearInterval(iv)
+  }, [])
+  useEffect(() => {
+    if (typeof PerformanceObserver === 'undefined') return undefined
+    let count = 0
+    try {
+      const obs = new PerformanceObserver((list) => {
+        count += list.getEntries().length
+        setLongTasks(count)
+      })
+      obs.observe({ entryTypes: ['longtask'] })
+      return () => { try { obs.disconnect() } catch (_) { /* nop */ } }
+    } catch (_) {
+      return undefined
+    }
+  }, [])
+  const enabled = (typeof window !== 'undefined'
+                    && /[?&]perf=1(&|$)/.test(window.location.search))
+  if (!enabled) return null
+  return (
+    <div
+      data-testid="perf-overlay"
+      style={{
+        position: 'fixed', top: 6, right: 6, zIndex: 999999,
+        padding: '6px 10px', borderRadius: 6,
+        background: 'rgba(0,0,0,0.85)', color: '#F0F0F2',
+        fontFamily: 'ui-monospace, monospace', fontSize: 11,
+        pointerEvents: 'none', lineHeight: 1.35,
+        border: '1px solid #444',
+      }}
+    >
+      <div>App renders: <b>{displayedRenders}</b></div>
+      <div>Since last: <b>{displayedSinceLast} ms</b></div>
+      <div>Long tasks (&gt;50ms): <b>{longTasks}</b></div>
+    </div>
   )
 }
 
@@ -451,6 +514,7 @@ export default function App() {
         <JogDebugPanel />
         <PairRequestModal />
         <LoginModal />
+        <PerfOverlay />
         {/* Device-pairing wizard as an OVERLAY (not a top-level
             return). Its own Screen wrapper positions fixed at
             zIndex 9999 and covers the viewport when mounted; when
