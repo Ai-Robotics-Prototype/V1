@@ -30,7 +30,6 @@ import SensorsLayout from './layouts/SensorsLayout'
 import ConfigureLayout from './layouts/ConfigureLayout'
 import AdaptivePicking from './pages/AdaptivePicking'
 import ProgramLibrary from './pages/ProgramLibrary'
-import IOPage from './pages/IOPage'
 import SafetyPage from './pages/SafetyPage'
 import EventLog from './pages/EventLog'
 import SynapsePage from './pages/SynapsePage'
@@ -228,8 +227,25 @@ export default function App() {
   const hydrateEdition  = useStore((s) => s.hydrateEdition)
   const edition         = useStore((s) => s.edition)
   const setTab          = useStore((s) => s.setTab)
+  const setSynapseIOSectionOpen = useStore(
+    (s) => s.setSynapseIOSectionOpen)
   const restoreOpenProgramOnMount = useStore(
     (s) => s.restoreOpenProgramOnMount)
+
+  // 2026-09-21 operator directive: the standalone `io` tab is
+  // retired. A stale persisted activeTab='io' (localStorage
+  // roboai-ui) OR a bookmark to the old I/O route must land on
+  // the Synapse page with the "Main Internal Robot Controller I/O"
+  // section auto-expanded. Old-route redirect is a MOUNT-ONCE
+  // effect that fires whenever activeTab flips to 'io' — the flag
+  // is cleared inside SynapsePage on mount so the next visit
+  // keeps the section collapsed-by-default.
+  useEffect(() => {
+    if (activeTab === 'io') {
+      setSynapseIOSectionOpen(true)
+      setTab('synapse')
+    }
+  }, [activeTab, setTab, setSynapseIOSectionOpen])
 
   useEffect(() => {
     connectWS()
@@ -285,11 +301,15 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab])
 
+  // 2026-09-21 operator directive: `io` tab retired. IOPage is no
+  // longer routed by the layoutMap; a stale persisted activeTab='io'
+  // is handled by the redirect effect below (setTab('synapse') +
+  // synapseIOSectionOpen=true). IOPortMap now mounts inside
+  // pages/SynapsePage's expandable section.
   const layoutMap = {
     monitor:          <MonitorDashboard />,
     programs:         <ProgramLibrary />,
     sensors:          <SensorsLayout />,
-    io:               <IOPage />,
     adaptive_picking: <AdaptivePicking />,
     configure:        <ConfigureLayout />,
     safety:           <SafetyPage />,

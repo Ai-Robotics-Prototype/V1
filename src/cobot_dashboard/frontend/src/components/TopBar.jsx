@@ -3,26 +3,33 @@ import Brand from './Brand'
 import { isFeatureEnabled, TAB_TO_FEATURE } from '../lib/edition'
 import UserChip from './UserChip'
 
+// 2026-09-21 operator directive: I/O tab RETIRED. Its content
+// (IOPortMap — manual overrides, DO2 confirm, refusal copy, live
+// 1 Hz poll) moved to the "Main Internal Robot Controller I/O"
+// expandable section at the bottom of the Synapse page. Old
+// bookmarks / stale persisted activeTab='io' are redirected in
+// App.jsx to synapse with the section auto-expanded.
+//
+// Tab order: Synapse sits immediately LEFT of Event Log; Event
+// Log is the LAST tab. On both editions.
 const TABS = [
   { id: 'monitor',          label: 'Monitor' },
   { id: 'programs',         label: 'Program Library' },
   { id: 'program',          label: 'Program' },
   { id: '3dview',           label: '3D View' },
+  // Full-only surfaces sit between the shared basic-friendly tabs
+  // and the Synapse / Event Log pair. Basic edition hides all four
+  // of these via the edition filter below — resulting visible order
+  // on basic: Monitor · Program Library · Program · 3D View ·
+  // Synapse · Event Log.
   { id: 'sensors',          label: 'Cameras & LiDAR' },
   { id: 'adaptive_picking', label: 'Part Recognition' },
-  { id: 'io',               label: 'I/O' },
   { id: 'safety',           label: 'Safety' },
-  // 2026-08-05 unified event log (fork registry: event_log).
-  // Persistent forensic record of every error/warning/info the
-  // platform surfaces. Sits under Safety in nav order so operators
-  // reach for it in the "something went wrong" mental sequence.
-  { id: 'event_log',        label: 'Event Log' },
-  // 2026-09-21 Synapse Connection Map — read-only wiring reference
-  // for the Synapse controller (pneumatic valves, digital IO, safety
-  // connectors). Static layout in this pass; hooks ready for a
-  // later "glow when energized" pass. VIEW-tier, both editions.
-  { id: 'synapse',          label: 'Synapse' },
   { id: 'configure',        label: 'Configure' },
+  // Synapse — hosts the connection map + IO section (post-2026-09-21).
+  { id: 'synapse',          label: 'Synapse' },
+  // Event Log — LAST tab, both editions.
+  { id: 'event_log',        label: 'Event Log' },
 ]
 
 const WS_DOT = {

@@ -119,6 +119,13 @@ export function isFeatureEnabled(featureKey, edition) {
 // renders unconditionally in both editions (see
 // SAFETY_INVARIANT_KEYS in edition.py — no key in that set may
 // appear in FEATURE_MAP).
+// 2026-09-21 operator directive: the standalone I/O tab is retired.
+// IOPortMap now lives inside the Synapse page's expandable section
+// (see pages/SynapsePage.jsx). The `io_panel` feature key is
+// preserved in FEATURE_MAP above — it still gates the IOPortMap
+// component itself — but there is no longer a `io` tab in
+// TAB_TO_FEATURE. App.jsx redirects any stale activeTab='io' to
+// synapse + auto-expands the section.
 export const TAB_TO_FEATURE = Object.freeze({
   monitor:          'monitor',
   programs:         'program_library',
@@ -126,7 +133,6 @@ export const TAB_TO_FEATURE = Object.freeze({
   '3dview':         '3d_view',
   sensors:          'cameras_lidar',
   adaptive_picking: 'part_recognition',
-  io:               'io_panel',
   safety:           'safety_page',
   event_log:        'event_log',
   synapse:          'synapse',

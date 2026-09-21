@@ -1,3 +1,7 @@
+import { useEffect, useState } from 'react'
+import { useStore } from '../store/useStore'
+import IOPortMap from '../components/IOPortMap'
+
 // Synapse — Connection Map (2026-09-21 operator directive).
 //
 // A static, read-only wiring reference for the Synapse controller:
@@ -347,6 +351,33 @@ function Grid5({ children }) {
 // ── Page ─────────────────────────────────────────────────────────────
 
 export default function SynapsePage() {
+  // 2026-09-21 operator directive: I/O tab retired. The IOPortMap
+  // (which owns the port map, manual override switches, DO2 confirm,
+  // refusal copy, and the 1 Hz /api/io/live poll) mounts inside the
+  // expandable section below. Rules:
+  //   * Collapsed by default (fresh visits).
+  //   * Auto-expanded when App.jsx redirected from a stale
+  //     activeTab='io' (setSynapseIOSectionOpen(true)); we clear
+  //     the flag on mount so the next fresh visit is collapsed.
+  //   * Mount-once: while collapsed we render NO IOPortMap — the
+  //     component simply isn't in the tree, and its 1 Hz fetch
+  //     doesn't run. On expand it mounts once. On collapse it
+  //     unmounts (stops the poll). No flash of the port map on
+  //     expand — the section is inside a stable parent.
+  const autoOpen = useStore((s) => s.synapseIOSectionOpen)
+  const setSynapseIOSectionOpen = useStore(
+    (s) => s.setSynapseIOSectionOpen)
+  const [ioExpanded, setIoExpanded] = useState(false)
+  useEffect(() => {
+    if (autoOpen) {
+      setIoExpanded(true)
+      setSynapseIOSectionOpen(false)
+    }
+    // Intentionally not re-running on setSynapseIOSectionOpen ref
+    // changes — the store action reference is stable across renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOpen])
+
   return (
     <div
       data-testid="synapse-page"
@@ -454,6 +485,81 @@ export default function SynapsePage() {
           ))}
         </div>
       </Section>
+
+      {/* Section 4 — Main Internal Robot Controller I/O (expandable) */}
+      <section
+        data-testid="synapse-section-internal-io"
+        data-expanded={String(ioExpanded)}
+        style={{
+          background: CARD_BG, border: `1px solid ${CARD_BORDER}`,
+          borderRadius: 12, marginBottom: 16, overflow: 'hidden',
+        }}
+      >
+        <button
+          type="button"
+          data-testid="synapse-internal-io-toggle"
+          onClick={() => setIoExpanded((v) => !v)}
+          aria-expanded={ioExpanded}
+          aria-controls="synapse-internal-io-body"
+          style={{
+            width: '100%', display: 'flex', alignItems: 'center',
+            gap: 12, padding: '16px 20px',
+            background: 'transparent', border: 'none',
+            cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit',
+            color: TEXT_PRIMARY,
+          }}
+        >
+          <span style={{
+            display: 'inline-block', width: 4, height: 18,
+            background: APP_BLUE, borderRadius: 2,
+          }} aria-hidden="true" />
+          <span style={{
+            fontSize: 12, fontWeight: 700, letterSpacing: 0.6,
+            textTransform: 'uppercase', flex: 1,
+          }}>
+            Main Internal Robot Controller I/O
+          </span>
+          <span style={{
+            fontSize: 11, fontWeight: 600, letterSpacing: 0.4,
+            color: TEXT_MUTED, textTransform: 'uppercase',
+          }}>
+            {ioExpanded ? 'Hide' : 'Show'}
+          </span>
+          {/* Chevron — rotates 180° on expand. SVG so it stays
+              crisp at any zoom + inherits the current text color. */}
+          <svg width={14} height={14} viewBox="0 0 14 14"
+               aria-hidden="true"
+               style={{
+                 transform: ioExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
+                 transition: 'transform 150ms ease',
+                 color: TEXT_SECONDARY,
+               }}>
+            <path d="M 2 4 L 7 10 L 12 4"
+                  stroke="currentColor" strokeWidth={2}
+                  fill="none" strokeLinecap="round"
+                  strokeLinejoin="round" />
+          </svg>
+        </button>
+        {ioExpanded && (
+          <div
+            id="synapse-internal-io-body"
+            data-testid="synapse-internal-io-body"
+            style={{
+              borderTop: `1px solid ${CARD_BORDER}`,
+              padding: 16,
+              background: '#FFFFFF',
+            }}
+          >
+            {/* IOPortMap is the ONLY child — owns port map viz +
+                manual overrides + DO2 confirm + refusal copy +
+                the 1 Hz /api/io/live poll. Rendering it here only
+                while `ioExpanded` guarantees the poll runs only
+                while the section is open. Same component, same
+                handlers, same testids. */}
+            <IOPortMap />
+          </div>
+        )}
+      </section>
 
       {/* Footer note */}
       <div style={{

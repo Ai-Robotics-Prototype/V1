@@ -364,6 +364,12 @@ const storeDefinition = (set, get) => ({
 
   // ---- UI state ----
   activeTab: 'monitor',
+  // Synapse IO section — set true by the App.jsx redirect for
+  // activeTab='io' (stale persisted tab / bookmarks). SynapsePage
+  // reads this on mount and, when true, starts the "Main Internal
+  // Robot Controller I/O" section expanded and clears the flag so
+  // subsequent visits keep collapsed-by-default.
+  synapseIOSectionOpen: false,
   activeView: 'split',
 
   // ── Edition (2026-09-04) ────────────────────────────────────
@@ -2639,6 +2645,9 @@ const storeDefinition = (set, get) => ({
 
   setTab(tab) {
     set({ activeTab: tab })
+  },
+  setSynapseIOSectionOpen(open) {
+    set({ synapseIOSectionOpen: !!open })
   },
   // Alias — matches the name external diagnostic scripts grep for.
   setActiveTab(tab) {

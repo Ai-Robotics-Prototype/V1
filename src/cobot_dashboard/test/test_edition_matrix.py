@@ -205,9 +205,13 @@ def test_tab_to_feature_map_present_and_covers_every_tab():
     # Every TopBar tab id must appear (TopBar's TABS list is the source
     # of truth for the id-set; extracting it here would need a JSX
     # parser, so we assert against the known set).
+    # 2026-09-21 nav restructure: `io` tab retired. IOPortMap now
+    # lives inside the Synapse page's expandable section; the
+    # `io_panel` FEATURE_MAP key stays (still gates the IOPortMap
+    # component). No `io` entry in TAB_TO_FEATURE.
     expected_tabs = {
         'monitor', 'programs', 'program', '3dview', 'sensors',
-        'adaptive_picking', 'io', 'safety', 'event_log', 'synapse',
+        'adaptive_picking', 'safety', 'event_log', 'synapse',
         'configure',
     }
     assert set(tab_map.keys()) == expected_tabs
