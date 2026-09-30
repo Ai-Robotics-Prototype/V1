@@ -391,7 +391,7 @@ function ToolChoice({ tool, onPick }) {
 
 // ── Guidance block — map + checklist + notes ────────────────────────
 
-function GuidanceBlock({ port }) {
+export function GuidanceBlock({ port }) {
   const [ticked, setTicked] = useState(() => new Set())
   const toggle = (key) => setTicked((prev) => {
     const next = new Set(prev)

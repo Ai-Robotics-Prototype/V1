@@ -9,6 +9,7 @@ import TeachLockBanner from './TeachLockBanner'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import HardwareSetupWizard from './HardwareSetupWizard'
+import ExternalFixtureWizard from './ExternalFixtureWizard'
 import { readPayload, PAYLOAD_UNSET_WARNING }
   from '../lib/payload'
 import { computePayloadTruth } from '../lib/payloadTruth'
@@ -4027,6 +4028,7 @@ export default function ProgramEditor() {
   const [showWizard, setShowWizard]         = useState(false)
   const [showPbd,    setShowPbd]            = useState(false)
   const [showHardwareSetup, setShowHardwareSetup] = useState(false)
+  const [showFixtures, setShowFixtures] = useState(false)
   const [editingId, setEditingId]           = useState(null)
   // True when the operator has opened the dedicated pallet config
   // editor for this program (entry point: Edit button on any
@@ -5741,6 +5743,17 @@ export default function ProgramEditor() {
           Hardware Setup
         </button>
 
+        <button onClick={() => setShowFixtures(true)}
+          data-testid="external-fixture-launcher"
+          title="Set up an external fixture — vice, indexer, feeder, blow-off, door."
+          style={{
+            padding: '6px 12px', fontSize: 12, fontWeight: 600,
+            background: '#0891B2', color: '#fff', border: 'none',
+            borderRadius: 6, cursor: 'pointer', flexShrink: 0,
+          }}>
+          External Fixtures
+        </button>
+
         <button onClick={() => setShowPbd(true)}
           title="Generate a draft program from a demonstration video + voice narration"
           style={{
@@ -6707,6 +6720,12 @@ export default function ProgramEditor() {
       {showHardwareSetup && (
         <HardwareSetupWizard
           onClose={() => setShowHardwareSetup(false)}
+        />
+      )}
+
+      {showFixtures && (
+        <ExternalFixtureWizard
+          onClose={() => setShowFixtures(false)}
         />
       )}
 
