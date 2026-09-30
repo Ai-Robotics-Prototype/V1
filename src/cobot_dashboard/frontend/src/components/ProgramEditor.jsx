@@ -8,7 +8,7 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 import TeachLockBanner from './TeachLockBanner'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
-import HardwareSetupWizard from './HardwareSetupWizard'
+import EOATSetupWizard from './EOATSetupWizard'
 import ExternalFixtureWizard from './ExternalFixtureWizard'
 import { readPayload, PAYLOAD_UNSET_WARNING }
   from '../lib/payload'
@@ -3627,7 +3627,7 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
         <span style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
                         transition: 'transform 150ms', color: '#6b7280', fontSize: 11 }}>▶</span>
         <span style={labelStyle}>Tool &amp; Payload</span>
-        {/* Reopen the Hardware Setup wizard read-only so operators
+        {/* Reopen the EOAT Setup wizard read-only so operators
             can see the Synapse wiring guide (glowing map + callouts)
             without leaving the editor. Gripper type comes from
             program.config. */}
@@ -3762,7 +3762,7 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
         </div>
       )}
       {_showHookup && createPortal(
-        <HardwareSetupWizard
+        <EOATSetupWizard
           onClose={() => _setShowHookup(false)}
           initialToolKey={
             _gripperType === 'custom' && program?.config?.tool_id
@@ -5733,14 +5733,15 @@ export default function ProgramEditor() {
         </button>
 
         <button onClick={() => setShowHardwareSetup(true)}
-          data-testid="hardware-setup-launcher"
-          title="Confirm the wiring for a tool. Persists per-tool; New programs read this state."
+          data-testid="eoat-setup-launcher"
+          data-legacy-testid="hardware-setup-launcher"
+          title="Confirm the wiring for the end-of-arm tool. Persists per-tool; New programs read this state."
           style={{
             padding: '6px 12px', fontSize: 12, fontWeight: 600,
             background: '#0EA5E9', color: '#fff', border: 'none',
             borderRadius: 6, cursor: 'pointer', flexShrink: 0,
           }}>
-          Hardware Setup
+          EOAT Setup
         </button>
 
         <button onClick={() => setShowFixtures(true)}
@@ -6718,7 +6719,7 @@ export default function ProgramEditor() {
       )}
 
       {showHardwareSetup && (
-        <HardwareSetupWizard
+        <EOATSetupWizard
           onClose={() => setShowHardwareSetup(false)}
         />
       )}

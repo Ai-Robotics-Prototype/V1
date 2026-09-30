@@ -6,7 +6,7 @@
 // branding, plain English, both editions.
 //
 // Not to be confused with `SetupWizard.jsx` (cell/environment wizard)
-// or `HardwareSetupWizard.jsx` (hookup guide). This is the DEVICE
+// or `EOATSetupWizard.jsx` (hookup guide). This is the DEVICE
 // pairing wizard — auth handshake between tablet and robot.
 //
 // Fork-registry `device_pairing_auth` — the ONE frontend surface that

@@ -10494,6 +10494,214 @@ if FASTAPI_AVAILABLE:
             _write_tool_hookup_all(records)
         return {'ok': True, 'tool_key': tool_key, 'record': rec}
 
+    # ── Cell registry (2026-09-22 operator directive "The Cell") ──
+    #
+    # Persistent inventory of the robot's cell: EOATs + external
+    # fixtures + allocation truth (single source: the wizards read
+    # and write here, so tools and fixtures can never collide on a
+    # port). Migration from prior sources happens at first read
+    # (tools_library rows → cell.eoats).
+    #
+    # Schema:
+    #   {
+    #     "eoats":    [ { id, name, type, actuation, valve, inputs[],
+    #                     tool_ref?, ... } ],
+    #     "fixtures": [ { id, name, type, power_mode, valve?, out?,
+    #                     in_done?, completion, wait_s?, ... } ],
+    #     "meta":     { "created_at", "updated_at",
+    #                   "migrations": [ ... ] }
+    #   }
+    _CELL_PATH = os.environ.get(
+        'COBOT_CELL', '/opt/cobot/cell.json')
+    _CELL_LOCK = threading.RLock()
+
+    def _empty_cell() -> dict:
+        now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        return {
+            'eoats': [], 'fixtures': [],
+            'meta': {
+                'created_at': now, 'updated_at': now,
+                'migrations': [],
+            },
+        }
+
+    def _read_cell() -> dict:
+        try:
+            with open(_CELL_PATH) as fh:
+                d = json.load(fh)
+            if isinstance(d, dict) and isinstance(d.get('eoats'), list) \
+                    and isinstance(d.get('fixtures'), list):
+                d.setdefault('meta', {})
+                return d
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            pass
+        return _empty_cell()
+
+    def _write_cell(cell: dict) -> None:
+        os.makedirs(os.path.dirname(_CELL_PATH), exist_ok=True)
+        cell.setdefault('meta', {})['updated_at'] = time.strftime(
+            '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        fd, tmp = tempfile.mkstemp(
+            prefix='.cell_', suffix='.tmp',
+            dir=os.path.dirname(_CELL_PATH))
+        try:
+            with os.fdopen(fd, 'w') as fh:
+                json.dump(cell, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, _CELL_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _migrate_cell_if_empty(cell: dict) -> dict:
+        """One-shot migration: if the cell has no eoats yet AND the
+        tools_library has confirmed rows, seed cell.eoats from them
+        with the operator-assigned ports. Idempotent — the migration
+        stamp in meta.migrations prevents re-running."""
+        stamps = set(cell.get('meta', {}).get('migrations') or [])
+        if 'tools_library_seed_v1' in stamps:
+            return cell
+        if cell['eoats']:
+            stamps.add('tools_library_seed_v1')
+            cell['meta']['migrations'] = sorted(stamps)
+            return cell
+        try:
+            from . import tools_library
+            rows = tools_library.list_tools() or []
+        except Exception:
+            rows = []
+        for t in rows:
+            if not t.get('confirmed'):
+                continue
+            if (t.get('conversion') or {}).get('state') != 'converted':
+                continue
+            cfg = t.get('config') or {}
+            cell['eoats'].append({
+                'id':        f"tool:{t.get('id')}",
+                'name':      t.get('name') or 'Tool',
+                'type':      'custom',
+                'tool_ref':  t.get('id'),
+                'valve':     cfg.get('assigned_valve'),
+                'inputs':    list(cfg.get('assigned_inputs') or []),
+                'outputs':   list(cfg.get('assigned_outputs') or []),
+                'created_at': time.strftime(
+                    '%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            })
+        stamps.add('tools_library_seed_v1')
+        cell['meta']['migrations'] = sorted(stamps)
+        return cell
+
+    def _cell_stable_id(prefix: str) -> str:
+        import uuid
+        return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+    @app.get("/api/cell")
+    async def api_cell_get():
+        with _CELL_LOCK:
+            cell = _migrate_cell_if_empty(_read_cell())
+            # Persist the migration stamp so subsequent reads skip it.
+            _write_cell(cell)
+        return {'ok': True, 'cell': cell}
+
+    @app.post("/api/cell/eoat")
+    async def api_cell_add_eoat(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict) or not body.get('name'):
+            return JSONResponse(
+                {'ok': False, 'reason_code': 'invalid_body',
+                 'detail': 'name is required'}, status_code=400)
+        with _CELL_LOCK:
+            cell = _read_cell()
+            eid = body.get('id') or _cell_stable_id('eoat')
+            entry = {
+                'id':       eid,
+                'name':     str(body['name']),
+                'type':     str(body.get('type') or 'custom'),
+                'actuation': body.get('actuation'),
+                'valve':    body.get('valve'),
+                'inputs':   list(body.get('inputs') or []),
+                'outputs':  list(body.get('outputs') or []),
+                'tool_ref': body.get('tool_ref'),
+                'created_at': time.strftime(
+                    '%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            }
+            existing = next((i for i, e in enumerate(cell['eoats'])
+                             if e.get('id') == eid), None)
+            if existing is not None:
+                cell['eoats'][existing] = entry
+            else:
+                cell['eoats'].append(entry)
+            _write_cell(cell)
+        return {'ok': True, 'entry': entry}
+
+    @app.post("/api/cell/fixture")
+    async def api_cell_add_fixture(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict) or not body.get('name'):
+            return JSONResponse(
+                {'ok': False, 'reason_code': 'invalid_body',
+                 'detail': 'name is required'}, status_code=400)
+        with _CELL_LOCK:
+            cell = _read_cell()
+            fid = body.get('id') or _cell_stable_id('fx')
+            entry = {
+                'id':          fid,
+                'name':        str(body['name']),
+                'type':        str(body.get('type') or 'other'),
+                'power_mode':  body.get('power_mode'),
+                'actuation':   body.get('actuation'),
+                'hold_on_loss': body.get('hold_on_loss'),
+                'valve':       body.get('valve'),
+                'out':         body.get('out'),
+                'in_done':     body.get('in_done'),
+                'completion':  body.get('completion'),
+                'wait_s':      body.get('wait_s'),
+                'valve_type':  body.get('valve_type'),
+                'valve_type_why': body.get('valve_type_why'),
+                'created_at':  time.strftime(
+                    '%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            }
+            existing = next((i for i, f in enumerate(cell['fixtures'])
+                             if f.get('id') == fid), None)
+            if existing is not None:
+                cell['fixtures'][existing] = entry
+            else:
+                cell['fixtures'].append(entry)
+            _write_cell(cell)
+        return {'ok': True, 'entry': entry}
+
+    @app.delete("/api/cell/eoat/{eoat_id}")
+    async def api_cell_delete_eoat(eoat_id: str):
+        with _CELL_LOCK:
+            cell = _read_cell()
+            before = len(cell['eoats'])
+            cell['eoats'] = [e for e in cell['eoats']
+                             if e.get('id') != eoat_id]
+            _write_cell(cell)
+        return {'ok': True, 'removed': before - len(cell['eoats'])}
+
+    @app.delete("/api/cell/fixture/{fixture_id}")
+    async def api_cell_delete_fixture(fixture_id: str):
+        with _CELL_LOCK:
+            cell = _read_cell()
+            before = len(cell['fixtures'])
+            cell['fixtures'] = [f for f in cell['fixtures']
+                                if f.get('id') != fixture_id]
+            _write_cell(cell)
+        return {'ok': True, 'removed': before - len(cell['fixtures'])}
+
     @app.post("/api/event_log/append")
     async def api_event_log_append(request: Request):
         """Append a frontend-originated event to the daily JSONL.

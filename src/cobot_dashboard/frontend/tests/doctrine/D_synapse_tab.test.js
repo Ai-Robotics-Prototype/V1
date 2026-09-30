@@ -712,7 +712,7 @@ test('ValveInfoPanel mount-once: gated on non-null `valve` prop', () => {
 
 // ── Hardware Setup × Synapse map integration (2026-09-21) ───────────
 
-const wizardSrc = readSrc('components/HardwareSetupWizard.jsx')
+const wizardSrc = readSrc('components/EOATSetupWizard.jsx')
 const portMapSrc = readSrc('lib/toolPortMap.js')
 
 test('SynapsePage exports the SynapseConnectionMap component', () => {
@@ -724,11 +724,11 @@ test('SynapsePage exports the SynapseConnectionMap component', () => {
       + 'the reusable map shell that the wizard imports.'))
 })
 
-test('HardwareSetupWizard imports SynapseConnectionMap from SynapsePage (no fork)', () => {
+test('EOATSetupWizard imports SynapseConnectionMap from SynapsePage (no fork)', () => {
   assert.ok(
     /import\s*\{[^}]*SynapseConnectionMap[^}]*\}\s*from\s*['"]\.\.\/pages\/SynapsePage['"]/
       .test(wizardSrc),
-    v('HardwareSetupWizard must import { SynapseConnectionMap } '
+    v('EOATSetupWizard must import { SynapseConnectionMap } '
       + 'from "../pages/SynapsePage". No fork of the map JSX — '
       + 'one component, two mount sites (page + wizard).'))
 })
@@ -817,9 +817,9 @@ test('lib/toolPortMap emits no /api or /cmd calls (VIEW-tier)', () => {
 
 // ── Wizard: cleanup + guidance + custom flow ────────────────────────
 
-test('HardwareSetupWizard BUILT_IN keeps ONLY real tools + custom_new', () => {
+test('EOATSetupWizard BUILT_IN keeps ONLY real tools + custom_new', () => {
   const m = wizardSrc.match(/const BUILT_IN = \[([\s\S]*?)\n\]/)
-  assert.ok(m, v('HardwareSetupWizard must define const BUILT_IN = [...]'))
+  assert.ok(m, v('EOATSetupWizard must define const BUILT_IN = [...]'))
   const body = m[1]
   const keys = [...body.matchAll(/key:\s*['"]([^'"]+)['"]/g)].map((x) => x[1])
   assert.deepEqual(keys.sort(),
@@ -831,19 +831,19 @@ test('HardwareSetupWizard BUILT_IN keeps ONLY real tools + custom_new', () => {
       + `at the picker via visibleCustoms.`))
 })
 
-test('HardwareSetupWizard filters customs on confirmed + converted', () => {
+test('EOATSetupWizard filters customs on confirmed + converted', () => {
   // Grep-pin the filter predicate — protects against a regression
   // where the picker starts showing every /api/tools row again.
   assert.ok(/conversion\?\.state === ['"]converted['"]/.test(wizardSrc),
-    v('HardwareSetupWizard visibleCustoms must gate on '
+    v('EOATSetupWizard visibleCustoms must gate on '
       + '`conversion.state === "converted"`'))
   assert.ok(/!!t\?\.confirmed/.test(wizardSrc),
-    v('HardwareSetupWizard visibleCustoms must gate on `confirmed`'))
+    v('EOATSetupWizard visibleCustoms must gate on `confirmed`'))
 })
 
-test('HardwareSetupWizard renders SynapseConnectionMap in guidance mode', () => {
+test('EOATSetupWizard renders SynapseConnectionMap in guidance mode', () => {
   assert.ok(/<SynapseConnectionMap[\s\S]*?mode="guidance"/.test(wizardSrc),
-    v('HardwareSetupWizard must render <SynapseConnectionMap '
+    v('EOATSetupWizard must render <SynapseConnectionMap '
       + 'mode="guidance" ... /> so highlighted ports pulse against '
       + 'dimmed non-required ports.'))
   // Guidance mode passes highlight from the tool port map.
@@ -852,7 +852,7 @@ test('HardwareSetupWizard renders SynapseConnectionMap in guidance mode', () => 
       + 'into the map so the highlight-driven glow works.'))
 })
 
-test('HardwareSetupWizard has a Custom EOAT flow with 4 steps (name → actuation → sensors → review)', () => {
+test('EOATSetupWizard has a Custom EOAT flow with 4 steps (name → actuation → sensors → review)', () => {
   // 2026-09-22 tool-mass retirement: step 0 is now Tool name only
   // (the retired Weight step contents merged its name field with a
   // mass field; mass is deleted, name stays as its own step so the
@@ -881,7 +881,7 @@ test('HardwareSetupWizard has a Custom EOAT flow with 4 steps (name → actuatio
       + 'same back-to-picker path.'))
 })
 
-test('no-mass-in-setup: no mass input, echo, warning, or gate anywhere in HardwareSetupWizard', () => {
+test('no-mass-in-setup: no mass input, echo, warning, or gate anywhere in EOATSetupWizard', () => {
   // Grep-pin every mass surface the retired Weight step used to
   // render. Any of these regressing means a mass field is back
   // in the setup flow.
@@ -899,7 +899,7 @@ test('no-mass-in-setup: no mass input, echo, warning, or gate anywhere in Hardwa
     'overCap',
   ]) {
     assert.equal(new RegExp(`\\b${forbidden}\\b`).test(wizardSrc), false,
-      v(`HardwareSetupWizard must NOT reference "${forbidden}" — `
+      v(`EOATSetupWizard must NOT reference "${forbidden}" — `
         + `tool mass is retired 2026-09-22 (dead-code disposition; `
         + `finish() never persisted it).`))
   }
@@ -937,7 +937,7 @@ test('Wizard is VIEW-tier for guidance — no /cmd/ writes', () => {
   // The NEW guidance code must not add any /cmd calls or new /api
   // writes; grep for those specifically.
   assert.equal(/\/cmd\//.test(wizardSrc), false,
-    v('HardwareSetupWizard must not contain any /cmd/ path — '
+    v('EOATSetupWizard must not contain any /cmd/ path — '
       + 'guidance mode is visual only.'))
 })
 
@@ -955,13 +955,13 @@ test('old-map-absent-from-hardware-setup: no HookupGuide import or mount', () =>
   // panel SVG assets. Any of these regressing means the old surface
   // is coming back.
   assert.equal(/from\s+['"]\.\/HookupGuide['"]/.test(wizardSrc), false,
-    v('HardwareSetupWizard must NOT import from ./HookupGuide — '
+    v('EOATSetupWizard must NOT import from ./HookupGuide — '
       + 'the component is retired 2026-09-22.'))
   assert.equal(/<HookupGuide\b/.test(wizardSrc), false,
-    v('HardwareSetupWizard must NOT mount <HookupGuide ... /> — '
+    v('EOATSetupWizard must NOT mount <HookupGuide ... /> — '
       + 'the Synapse glowing map is the sole wiring guide.'))
   assert.equal(/hookup_panel_/.test(wizardSrc), false,
-    v('HardwareSetupWizard must NOT reference hookup_panel_* SVG '
+    v('EOATSetupWizard must NOT reference hookup_panel_* SVG '
       + 'assets — the old panel graphics are retired.'))
 })
 
@@ -985,7 +985,7 @@ test('exactly-one wiring guide mounted in the built-in step', () => {
   // Grep-pin the count of guidance-mode mounts.
   const guidanceMounts = wizardSrc.match(/mode="guidance"/g) || []
   assert.equal(guidanceMounts.length, 1,
-    v(`HardwareSetupWizard must mount SynapseConnectionMap in guidance `
+    v(`EOATSetupWizard must mount SynapseConnectionMap in guidance `
       + `mode EXACTLY once — found ${guidanceMounts.length}. Multiple `
       + `mounts would double the wiring affordance.`))
   // Confirm the confirm surface lives on the map's block (single list).
@@ -1048,7 +1048,7 @@ test('per-tool glow set: custom EOAT resolves from persisted assignments', () =>
 
 test('custom-tool-incomplete renders the finish-your-tool notice', () => {
   assert.ok(/data-testid="hardware-setup-custom-incomplete"/.test(wizardSrc),
-    v('HardwareSetupWizard must render the incomplete notice with '
+    v('EOATSetupWizard must render the incomplete notice with '
       + 'data-testid="hardware-setup-custom-incomplete" when a '
       + 'saved custom tool has no assigned ports.'))
   assert.ok(/Finish this tool's definition/.test(wizardSrc),
@@ -1060,7 +1060,7 @@ test('wizard imports resolvePersistedCustomToolPortMap from lib/toolPortMap', ()
   assert.ok(
     /import\s*\{[^}]*resolvePersistedCustomToolPortMap[^}]*\}\s*from\s*['"]\.\.\/lib\/toolPortMap['"]/
       .test(wizardSrc),
-    v('HardwareSetupWizard must import resolvePersistedCustomToolPortMap '
+    v('EOATSetupWizard must import resolvePersistedCustomToolPortMap '
       + 'from ../lib/toolPortMap so the persisted-custom path derives '
       + 'its glow set from saved tool.config assignments.'))
 })

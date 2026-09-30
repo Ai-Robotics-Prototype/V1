@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
 import IOPortMap from '../components/IOPortMap'
+import MyCellSection from '../components/MyCellSection'
 
 // Synapse — Connection Map (2026-09-21 operator directive).
 //
@@ -662,7 +663,7 @@ function Grid5({ children }) {
 // One component, two modes, mounted from TWO sites:
 //   * pages/SynapsePage.jsx renders it as `mode="page"` (clickable
 //     valve cards → info panel, no highlight, no dim).
-//   * components/HardwareSetupWizard.jsx renders it as
+//   * components/EOATSetupWizard.jsx renders it as
 //     `mode="guidance"` with a `highlight` prop naming which ports
 //     the operator's chosen tool needs. Highlighted glyphs pulse;
 //     non-highlighted glyphs render dimmed. Card clicks are inert
@@ -949,6 +950,11 @@ export default function SynapsePage() {
         mode="page"
         onValveClick={setOpenValve}
       />
+
+      {/* My Cell — the read-only registry summary (2026-09-22 "The
+          Cell" directive: the cell at a glance). Sits between the
+          static wiring map and the internal-IO expandable. */}
+      <MyCellSection />
 
       {/* Section 4 — Main Internal Robot Controller I/O (expandable) */}
       <section

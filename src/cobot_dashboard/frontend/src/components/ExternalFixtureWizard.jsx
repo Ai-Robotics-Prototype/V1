@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { GuidanceBlock } from './HardwareSetupWizard'
+import { GuidanceBlock } from './EOATSetupWizard'
 import {
   FIXTURE_TYPES, FIXTURE_TYPE_KEYS,
   compileFixtureRecord, fixturePortMap,
@@ -8,6 +8,9 @@ import {
   listFixtures, saveFixture, removeFixture,
 } from '../lib/fixturesStore'
 import { listTools } from '../lib/toolsApi'
+import {
+  saveCellFixture, deleteCellFixture,
+} from '../lib/cellStore'
 import { useKeyboardInset, scrollFocusedIntoView } from '../lib/keyboardInset'
 
 // External Fixture Wizard (2026-09-22 operator directive).
@@ -125,6 +128,10 @@ export default function ExternalFixtureWizard({ onClose, initialId = null }) {
     try {
       const withEditing = { ...record, id: editingId || null }
       const persisted = await saveFixture(withEditing)
+      // Also write to the cell (single-source allocation truth).
+      // Backend failure here doesn't undo the local save — the cell
+      // will pick up the fixture on next reconcile.
+      try { await saveCellFixture(persisted) } catch { /* soft-fail */ }
       setSaved(persisted)
       setEditingId(persisted.id)
       const refreshed = await listFixtures()
@@ -141,6 +148,7 @@ export default function ExternalFixtureWizard({ onClose, initialId = null }) {
     setBusy(true); setError(null)
     try {
       await removeFixture(id)
+      try { await deleteCellFixture(id) } catch { /* soft-fail */ }
       const refreshed = await listFixtures()
       setFixtures(refreshed)
       setPicker(true)

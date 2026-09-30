@@ -155,7 +155,7 @@ export function toolMeshUrl(toolId) {
 
 // ── Tool-hookup confirmation (per-tool, not per-program) ────────
 // The Program Wizard used to walk hookup inline. It's now a
-// standalone Hardware Setup wizard; the record persists per-tool
+// standalone EOAT Setup wizard; the record persists per-tool
 // keyed by "vacuum" / "finger" / "custom:<tool_id>".
 //
 // Wire shape (server side):

@@ -11,7 +11,7 @@ import {
   resolvePersistedCustomToolPortMap,
 } from '../lib/toolPortMap'
 
-// Standalone Hardware Setup wizard.
+// Standalone EOAT Setup wizard.
 //
 // 2026-09-22 operator directive (hardware-setup cleanup): the OLD
 // per-panel hookup checklist (HookupGuide with its pre-Synapse port
@@ -60,7 +60,7 @@ const BUILT_IN = [
     desc: 'Walk through the setup for a tool that is not in this list — mass, actuation type, sensors.' },
 ]
 
-export default function HardwareSetupWizard({
+export default function EOATSetupWizard({
   onClose, initialToolKey = null, readOnly = false,
 }) {
   const [customs, setCustoms]     = useState([])
@@ -192,7 +192,7 @@ export default function HardwareSetupWizard({
           justifyContent: 'space-between',
         }}>
           <div style={titleStyle}>
-            {toolKey ? 'Hardware Setup' : 'Hardware Setup — pick a tool'}
+            {toolKey ? 'EOAT Setup' : 'EOAT Setup — pick a tool'}
           </div>
           <button style={btnGhost} onClick={onClose}
                   data-testid="hardware-setup-close">

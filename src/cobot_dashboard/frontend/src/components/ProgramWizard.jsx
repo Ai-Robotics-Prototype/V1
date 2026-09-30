@@ -2345,7 +2345,7 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
 // Inline hookup-status line for the gripper_type wizard page —
 // reads /api/tool_hookup/<key> and renders a quiet one-liner:
 // "Hardware for this tool was confirmed <date>" or "Hardware not
-// yet confirmed — run Hardware Setup from the Program Library".
+// yet confirmed — run EOAT Setup from the Program Library".
 // Informational only; never blocks program creation. Placed here
 // (near PAGES) so the page render body stays terse.
 function HookupThreadLine({ gripperType, toolId }) {
@@ -2380,11 +2380,11 @@ function HookupThreadLine({ gripperType, toolId }) {
       : at
     text = at
       ? `Hardware for this tool was confirmed ${nice}.`
-      : 'Hardware not yet confirmed — run Hardware Setup from the Program Library.'
+      : 'Hardware not yet confirmed — run EOAT Setup from the Program Library.'
   } catch {
     text = at
       ? `Hardware for this tool was confirmed ${at}.`
-      : 'Hardware not yet confirmed — run Hardware Setup from the Program Library.'
+      : 'Hardware not yet confirmed — run EOAT Setup from the Program Library.'
   }
   return (
     <div data-testid="wizard-hookup-thread"
@@ -2537,7 +2537,7 @@ const PAGES = [
   //
   // Hookup guidance moved OUT of this wizard (2026-09-10 operator
   // directive): the "Connect your hardware" page is retired here.
-  // Hookup is now per-tool via the standalone Hardware Setup
+  // Hookup is now per-tool via the standalone EOAT Setup
   // wizard launched from the Program Library header. This page
   // still records the gripper type (programs need to know the
   // tool) AND renders a quiet inline thread line reporting the
@@ -4102,7 +4102,7 @@ export default function ProgramWizard({ onClose, onSaved }) {
       delete config.custom_tool_id
 
       // 2026-09-10 hookup restructure: hookup guidance now lives in
-      // the standalone Hardware Setup wizard (per-tool, not per-
+      // the standalone EOAT Setup wizard (per-tool, not per-
       // program). Snapshot the tool's confirmation record onto
       // program.config so downstream codegen consumers (effectorVocab
       // `withBlowOff`, `hookup_no_sensor` invariant) stay unchanged.

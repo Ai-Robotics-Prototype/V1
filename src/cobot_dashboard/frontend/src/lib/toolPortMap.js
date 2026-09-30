@@ -1,4 +1,4 @@
-// Tool → ports mapping for the Hardware Setup wizard's guidance
+// Tool → ports mapping for the EOAT Setup wizard's guidance
 // map (2026-09-21 operator directive).
 //
 // One record per KIND of tool. Each record names which valves and

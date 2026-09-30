@@ -305,10 +305,10 @@ test('fixturePortMap projects the record → highlight sets 1:1', () => {
 })
 
 test('summary uses the shared GuidanceBlock (no fork of the map)', () => {
-  assert.ok(/import\s*\{\s*GuidanceBlock[^}]*\}\s*from\s*['"]\.\/HardwareSetupWizard['"]/
+  assert.ok(/import\s*\{\s*GuidanceBlock[^}]*\}\s*from\s*['"]\.\/EOATSetupWizard['"]/
               .test(wizardSrc),
     v('ExternalFixtureWizard must import { GuidanceBlock } from '
-      + '"./HardwareSetupWizard" — the map is a single shared surface.'))
+      + '"./EOATSetupWizard" — the map is a single shared surface.'))
   assert.ok(/<GuidanceBlock\s+port=\{port\}/.test(wizardSrc),
     v('SummaryStep must render <GuidanceBlock port={port} />.'))
 })
@@ -367,7 +367,7 @@ test('SynapseConnectionMap is NOT re-imported by the fixture wizard (no fork)', 
     /import\s+\{[^}]*SynapseConnectionMap[^}]*\}\s+from/.test(wizardSrc),
     false,
     v('ExternalFixtureWizard must NOT import SynapseConnectionMap directly '
-      + '— it reuses HardwareSetupWizard.GuidanceBlock, which owns the '
+      + '— it reuses EOATSetupWizard.GuidanceBlock, which owns the '
       + 'map mount.'))
 })
 
