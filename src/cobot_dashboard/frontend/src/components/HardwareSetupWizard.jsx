@@ -9,8 +9,6 @@ import {
   getToolPortMap,
   resolveCustomEOATRecord,
   resolvePersistedCustomToolPortMap,
-  S10_140_PAYLOAD_KG_MAX,
-  S10_140_PAYLOAD_ADVISORY_KG,
 } from '../lib/toolPortMap'
 
 // Standalone Hardware Setup wizard.
@@ -473,28 +471,23 @@ function GuidanceBlock({ port }) {
 }
 
 
-// ── Custom EOAT flow — mass → actuation → sensors → summary ─────────
+// ── Custom EOAT flow — name → actuation → sensors → summary ────────
+//
+// 2026-09-22: the Weight step is retired. Mass was local wizard
+// state (never persisted — finish() intentionally never POSTed to
+// /api/tools); its overcap/advisory warnings went with it. If a
+// per-tool payload correction is needed later, it lives on the
+// tool record (tools_library.update_payload), not in a setup step.
 
 function CustomEOATFlow({ customs, onBack, onClose }) {
   const [step, setStep]  = useState(0)
   const [name, setName]  = useState('')
-  const [massKg, setMassKg]        = useState('')
-  const [massUnit, setMassUnit]    = useState('kg')  // 'kg' | 'lb'
   const [actuation, setActuation]  = useState('')
   const [holdOnLoss, setHoldOnLoss] = useState(null) // null | true | false
   const [sensorCount, setSensorCount] = useState(0)
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState(null)
   const [savedName, setSavedName] = useState(null)
-
-  const kgValue = useMemo(() => {
-    const n = Number(massKg)
-    if (!Number.isFinite(n) || n <= 0) return null
-    return massUnit === 'lb' ? n * 0.45359237 : n
-  }, [massKg, massUnit])
-  const overCap = kgValue != null && kgValue > S10_140_PAYLOAD_KG_MAX
-  const advisory = kgValue != null && kgValue > S10_140_PAYLOAD_ADVISORY_KG
-                    && !overCap
 
   const resolved = useMemo(() => resolveCustomEOATRecord({
     toolName: name || 'Custom EOAT',
@@ -505,16 +498,13 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
   }), [name, actuation, holdOnLoss, sensorCount, customs])
 
   const canAdvance = (
-    step === 0 ? (name.trim().length > 0 && kgValue != null && !overCap)
+    step === 0 ? name.trim().length > 0
     : step === 1 ? (actuation
                      && (actuation !== 'double_acting' || holdOnLoss !== null))
     : step === 2 ? true
     : true
   )
 
-  // Save on final Finish. Non-blocking — a save failure surfaces
-  // inline; the summary still renders because the recommendations
-  // are computed locally and don't need the write to succeed.
   async function finish() {
     setSaving(true); setSaveErr(null)
     // FRONTEND-only ship: no /api/tools POST from this flow — the
@@ -527,7 +517,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
   }
 
   const stepTitle = [
-    '1. Weight',
+    '1. Tool name',
     '2. Actuation type',
     '3. Sensors',
     '4. Review',
@@ -566,7 +556,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
       </div>
 
       {step === 0 && (
-        <div data-testid="hardware-setup-custom-step-mass"
+        <div data-testid="hardware-setup-custom-step-name"
              style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div>
             <div style={label}>Tool name</div>
@@ -583,72 +573,9 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
                 fontFamily: 'inherit',
               }} />
           </div>
-          <div>
-            <div style={label}>Mass</div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center',
-                          marginTop: 4 }}>
-              <input
-                type="number" step="0.01" min="0"
-                value={massKg}
-                onChange={(e) => setMassKg(e.target.value)}
-                placeholder="0.00"
-                data-testid="custom-eoat-mass"
-                style={{
-                  padding: '8px 10px', fontSize: 14, width: 120,
-                  border: '1px solid #d1d5db', borderRadius: 6,
-                  fontFamily: 'inherit',
-                }} />
-              <select
-                value={massUnit}
-                onChange={(e) => setMassUnit(e.target.value)}
-                data-testid="custom-eoat-mass-unit"
-                style={{
-                  padding: '8px 10px', fontSize: 14,
-                  border: '1px solid #d1d5db', borderRadius: 6,
-                  fontFamily: 'inherit',
-                }}>
-                <option value="kg">kg</option>
-                <option value="lb">lb</option>
-              </select>
-              {kgValue != null && (
-                <span data-testid="custom-eoat-mass-kg-echo"
-                      style={{ fontSize: 12, color: '#6B7280' }}>
-                  {kgValue.toFixed(2)} kg
-                </span>
-              )}
-            </div>
-          </div>
-          {overCap && (
-            <div data-testid="custom-eoat-mass-overcap"
-                 style={{
-                   padding: '10px 12px', background: '#FEE2E2',
-                   border: '1px solid #FCA5A5', borderRadius: 6,
-                   color: '#7F1D1D', fontSize: 13,
-                 }}>
-              {kgValue.toFixed(2)} kg is heavier than the S10-140's
-              rated {S10_140_PAYLOAD_KG_MAX} kg payload. This tool
-              is too heavy for the arm — pick a lighter tool or a
-              larger arm.
-            </div>
-          )}
-          {advisory && (
-            <div data-testid="custom-eoat-mass-advisory"
-                 style={{
-                   padding: '10px 12px', background: '#FEF3C7',
-                   border: '1px solid #FDE68A', borderRadius: 6,
-                   color: '#92400E', fontSize: 13,
-                 }}>
-              {kgValue.toFixed(2)} kg leaves little room for the
-              part in the arm's {S10_140_PAYLOAD_KG_MAX} kg budget.
-              This tool may be too heavy for full-reach moves — plan
-              slower moves and shorter reaches.
-            </div>
-          )}
           <div style={{ fontSize: 12, color: '#6B7280' }}>
-            Mass is stored on the tool record. When you author a
-            program against this tool, it flows into the program's
-            payload_kg field (Program Wizard → Payload step), which
-            codegen consumes as the controller-side payload preset.
+            Pick a short, distinctive name — you'll see it in the
+            tool picker and in program references.
           </div>
         </div>
       )}
@@ -798,7 +725,6 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
             fontSize: 13, color: '#111827', lineHeight: 1.6,
           }}>
             <div><b>Tool:</b> {name || '(unnamed)'}</div>
-            <div><b>Mass:</b> {kgValue?.toFixed(2)} kg</div>
             <div><b>Actuation:</b> {actuation || '—'}
               {actuation === 'double_acting' && ` (hold-on-loss: ${
                 holdOnLoss ? 'yes' : 'no'})`}

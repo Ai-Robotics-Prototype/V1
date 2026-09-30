@@ -281,13 +281,3 @@ export function recommendValveType(actuation, holdOnLoss) {
 function sensorTypeCopy() {
   return 'PNP proximity, 24 VDC per the panel spec'
 }
-
-// S10-140 payload capacity — 10 kg at full reach per the arm's
-// datasheet + repeated confirmations across the ledger
-// (era-01, add-01, add-08a). The wizard warns plainly when the
-// operator enters a mass above this ceiling.
-export const S10_140_PAYLOAD_KG_MAX = 10.0
-
-// Rough guidance number: if the tool alone weighs > 70 % of the
-// budget, moving a part becomes marginal. Warn (not refuse).
-export const S10_140_PAYLOAD_ADVISORY_KG = 7.0

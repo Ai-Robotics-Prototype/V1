@@ -852,10 +852,14 @@ test('HardwareSetupWizard renders SynapseConnectionMap in guidance mode', () => 
       + 'into the map so the highlight-driven glow works.'))
 })
 
-test('HardwareSetupWizard has a Custom EOAT flow with 4 steps', () => {
+test('HardwareSetupWizard has a Custom EOAT flow with 4 steps (name → actuation → sensors → review)', () => {
+  // 2026-09-22 tool-mass retirement: step 0 is now Tool name only
+  // (the retired Weight step contents merged its name field with a
+  // mass field; mass is deleted, name stays as its own step so the
+  // flow's back-path count is preserved).
   for (const tid of [
     'hardware-setup-custom-flow',
-    'hardware-setup-custom-step-mass',
+    'hardware-setup-custom-step-name',
     'hardware-setup-custom-step-actuation',
     'hardware-setup-custom-step-sensors',
     'hardware-setup-custom-step-summary',
@@ -863,17 +867,68 @@ test('HardwareSetupWizard has a Custom EOAT flow with 4 steps', () => {
     assert.ok(new RegExp(`data-testid="${tid}"`).test(wizardSrc),
       v(`Custom EOAT flow must expose data-testid="${tid}"`))
   }
+  // Retired mass testid must be GONE — no legacy surface hiding
+  // behind the new step name.
+  assert.equal(/data-testid="hardware-setup-custom-step-mass"/.test(wizardSrc),
+    false,
+    v('Retired testid "hardware-setup-custom-step-mass" must not '
+      + 'appear — the Weight step is deleted 2026-09-22.'))
+  // Back-paths intact: step 0's Back closes the picker (onBack),
+  // otherwise setStep(step - 1). Same predicate as pre-retirement.
+  assert.ok(/step === 0 \? onBack\(\) : setStep\(step - 1\)/.test(wizardSrc),
+    v('Custom EOAT back button must remain `step === 0 ? onBack() : '
+      + 'setStep(step - 1)` — the renumbered step 0 still uses the '
+      + 'same back-to-picker path.'))
 })
 
-test('Custom EOAT mass step warns above the S10-140 payload cap', () => {
-  // Constants live in lib/toolPortMap so the sanity number has
-  // exactly one source. The wizard imports + branches on them.
-  assert.ok(/S10_140_PAYLOAD_KG_MAX/.test(wizardSrc),
-    v('Wizard must import S10_140_PAYLOAD_KG_MAX from '
-      + 'lib/toolPortMap for the overcap warning.'))
-  assert.ok(/S10_140_PAYLOAD_KG_MAX\s*=\s*10\.0/.test(portMapSrc),
-    v('S10_140_PAYLOAD_KG_MAX must be 10.0 kg — the arm datasheet '
-      + '+ ledger references (era-01, add-01, add-08a) agree.'))
+test('no-mass-in-setup: no mass input, echo, warning, or gate anywhere in HardwareSetupWizard', () => {
+  // Grep-pin every mass surface the retired Weight step used to
+  // render. Any of these regressing means a mass field is back
+  // in the setup flow.
+  for (const forbidden of [
+    'custom-eoat-mass',
+    'custom-eoat-mass-unit',
+    'custom-eoat-mass-kg-echo',
+    'custom-eoat-mass-overcap',
+    'custom-eoat-mass-advisory',
+    'S10_140_PAYLOAD_KG_MAX',
+    'S10_140_PAYLOAD_ADVISORY_KG',
+    'massKg',
+    'setMassKg',
+    'kgValue',
+    'overCap',
+  ]) {
+    assert.equal(new RegExp(`\\b${forbidden}\\b`).test(wizardSrc), false,
+      v(`HardwareSetupWizard must NOT reference "${forbidden}" — `
+        + `tool mass is retired 2026-09-22 (dead-code disposition; `
+        + `finish() never persisted it).`))
+  }
+  // The word "Weight" in the step-title array is also retired.
+  assert.equal(/['"]1\. Weight['"]/.test(wizardSrc), false,
+    v("Step title '1. Weight' must be retired — the step is now "
+      + "'1. Tool name'."))
+})
+
+test('no-mass-in-setup: retired constants deleted from lib/toolPortMap', () => {
+  // Dead-code disposition — the only consumer was the wizard's
+  // overcap/advisory warnings; both are gone, so the constants
+  // go with them (no orphan exports).
+  assert.equal(/S10_140_PAYLOAD_KG_MAX/.test(portMapSrc), false,
+    v('lib/toolPortMap must NOT export S10_140_PAYLOAD_KG_MAX — '
+      + 'it was only consumed by the retired mass step.'))
+  assert.equal(/S10_140_PAYLOAD_ADVISORY_KG/.test(portMapSrc), false,
+    v('lib/toolPortMap must NOT export S10_140_PAYLOAD_ADVISORY_KG — '
+      + 'it was only consumed by the retired advisory panel.'))
+})
+
+test('no-mass-in-setup: standard tool paths (finger + vacuum) render no mass input', () => {
+  // The built-in tool bodies use the GuidanceBlock only — a mass
+  // input in this file's tree at all would mean the retired
+  // question snuck back in via a built-in surface.
+  assert.equal(/<input[^>]*data-testid="custom-eoat-mass/.test(wizardSrc),
+    false,
+    v('No mass input may render in any Hardware Setup path — '
+      + 'standard tools (finger/vacuum) and Custom EOAT.'))
 })
 
 test('Wizard is VIEW-tier for guidance — no /cmd/ writes', () => {
