@@ -885,3 +885,131 @@ test('Wizard is VIEW-tier for guidance — no /cmd/ writes', () => {
     v('HardwareSetupWizard must not contain any /cmd/ path — '
       + 'guidance mode is visual only.'))
 })
+
+
+// ── Hardware Setup cleanup (2026-09-22 operator directive) ──────────
+//
+// The old per-panel HookupGuide (with its pre-Synapse port-panel
+// SVG + separate hookup checklist) is retired. The Synapse glowing
+// map is the SOLE wiring guide in the Connect-your-hardware step,
+// and its callout list carries the per-connection tick-offs.
+
+test('old-map-absent-from-hardware-setup: no HookupGuide import or mount', () => {
+  // Grep-pin: the wizard must not import from ./HookupGuide, must
+  // not render <HookupGuide ...>, and must not reference the retired
+  // panel SVG assets. Any of these regressing means the old surface
+  // is coming back.
+  assert.equal(/from\s+['"]\.\/HookupGuide['"]/.test(wizardSrc), false,
+    v('HardwareSetupWizard must NOT import from ./HookupGuide — '
+      + 'the component is retired 2026-09-22.'))
+  assert.equal(/<HookupGuide\b/.test(wizardSrc), false,
+    v('HardwareSetupWizard must NOT mount <HookupGuide ... /> — '
+      + 'the Synapse glowing map is the sole wiring guide.'))
+  assert.equal(/hookup_panel_/.test(wizardSrc), false,
+    v('HardwareSetupWizard must NOT reference hookup_panel_* SVG '
+      + 'assets — the old panel graphics are retired.'))
+})
+
+test('old-checklist-absent: HookupGuide component fully deleted (no orphan imports)', () => {
+  // The component + its imported SVGs must be gone from the tree.
+  const componentPath = join(FRONT_ROOT, 'src', 'components', 'HookupGuide.jsx')
+  assert.equal(_exists(componentPath), false,
+    v(`src/components/HookupGuide.jsx must be deleted (found: ${componentPath}). `
+      + 'Standing dead-code disposition: retired components leave no orphan.'))
+  const frontSvg = join(FRONT_ROOT, 'src', 'assets', 'hookup', 'hookup_panel_front.svg')
+  const isoSvg   = join(FRONT_ROOT, 'src', 'assets', 'hookup', 'hookup_panel_iso.svg')
+  assert.equal(_exists(frontSvg), false,
+    v('src/assets/hookup/hookup_panel_front.svg must be deleted with HookupGuide.'))
+  assert.equal(_exists(isoSvg), false,
+    v('src/assets/hookup/hookup_panel_iso.svg must be deleted with HookupGuide.'))
+})
+
+test('exactly-one wiring guide mounted in the built-in step', () => {
+  // Only ONE affordance in the built-in / persisted-custom body:
+  // <SynapseConnectionMap mode="guidance" ...> via GuidanceBlock.
+  // Grep-pin the count of guidance-mode mounts.
+  const guidanceMounts = wizardSrc.match(/mode="guidance"/g) || []
+  assert.equal(guidanceMounts.length, 1,
+    v(`HardwareSetupWizard must mount SynapseConnectionMap in guidance `
+      + `mode EXACTLY once — found ${guidanceMounts.length}. Multiple `
+      + `mounts would double the wiring affordance.`))
+  // Confirm the confirm surface lives on the map's block (single list).
+  assert.ok(/data-testid="hardware-setup-confirm"/.test(wizardSrc),
+    v('Guidance block must render a single Confirm button '
+      + '(data-testid="hardware-setup-confirm") — the tick-offs on '
+      + 'the callout list are the operator\'s confirmation surface.'))
+})
+
+test('per-tool glow set: finger → V01 + IN01/IN02', () => {
+  // The finger gripper's fixed table is the source of truth. V01
+  // is 5/2 SS in SynapsePage (spring-return, sensible default —
+  // on power loss the gripper releases rather than latching a
+  // partly-closed grip on whatever is between the fingers).
+  const finger = portMapSrc.match(/finger:\s*\{([\s\S]*?)\n\s*\},/)
+  assert.ok(finger, v('_FIXED.finger entry must exist'))
+  const body = finger[1]
+  assert.ok(/required_valves:\s*\[\s*['"]V01['"]/.test(body),
+    v('finger required_valves must be ["V01"] (5/2 SS — spring-return '
+      + 'default; release on power loss).'))
+  assert.ok(/required_inputs:\s*\[\s*['"]IN01['"]\s*,\s*['"]IN02['"]/.test(body),
+    v('finger required_inputs must be ["IN01","IN02"] (OPEN + CLOSED '
+      + 'limit-switches).'))
+  assert.ok(/V01:\s*"[^"]+"/.test(body) && /IN01:\s*'[^']+'/.test(body)
+              && /IN02:\s*'[^']+'/.test(body),
+    v('finger callouts must include V01 + IN01 + IN02 strings.'))
+})
+
+test('per-tool glow set: vacuum → V03 + IN04', () => {
+  const vacuum = portMapSrc.match(/vacuum:\s*\{([\s\S]*?)\n\s*\},/)
+  assert.ok(vacuum, v('_FIXED.vacuum entry must exist'))
+  const body = vacuum[1]
+  assert.ok(/required_valves:\s*\[\s*['"]V03['"]/.test(body),
+    v('vacuum required_valves must be ["V03"] (HI/LO 3/2 N/C).'))
+  assert.ok(/required_inputs:\s*\[\s*['"]IN04['"]/.test(body),
+    v('vacuum required_inputs must be ["IN04"] (vacuum switch).'))
+  assert.ok(/V03:\s*"[^"]+"/.test(body) && /IN04:\s*'[^']+'/.test(body),
+    v('vacuum callouts must include V03 + IN04 strings.'))
+})
+
+test('per-tool glow set: custom EOAT resolves from persisted assignments', () => {
+  assert.ok(/export function resolvePersistedCustomToolPortMap\(/.test(portMapSrc),
+    v('lib/toolPortMap must export resolvePersistedCustomToolPortMap '
+      + '(builds a highlight record from a saved tool.config).'))
+  assert.ok(/assigned_valve/.test(portMapSrc),
+    v('resolvePersistedCustomToolPortMap must read tool.config.assigned_valve'))
+  assert.ok(/assigned_inputs/.test(portMapSrc),
+    v('resolvePersistedCustomToolPortMap must read tool.config.assigned_inputs'))
+  // Empty assignments → null so the wizard falls into the
+  // finish-your-tool notice branch.
+  assert.ok(/return null/.test(portMapSrc),
+    v('resolvePersistedCustomToolPortMap must return null when both '
+      + 'assigned_valve and assigned_inputs are missing.'))
+  // Callouts must reference the tool NAME (per operator directive:
+  // "Connect <tool name>'s air line to Valve 05").
+  assert.ok(/callouts\[valve\]\s*=\s*`Connect \$\{name\}/.test(portMapSrc),
+    v('custom-tool callouts must name the tool (Connect <name>\'s '
+      + 'air line to <valve>).'))
+})
+
+test('custom-tool-incomplete renders the finish-your-tool notice', () => {
+  assert.ok(/data-testid="hardware-setup-custom-incomplete"/.test(wizardSrc),
+    v('HardwareSetupWizard must render the incomplete notice with '
+      + 'data-testid="hardware-setup-custom-incomplete" when a '
+      + 'saved custom tool has no assigned ports.'))
+  assert.ok(/Finish this tool's definition/.test(wizardSrc),
+    v('Incomplete notice copy must plainly say to finish the tool '
+      + 'definition — never a blank map.'))
+})
+
+test('wizard imports resolvePersistedCustomToolPortMap from lib/toolPortMap', () => {
+  assert.ok(
+    /import\s*\{[^}]*resolvePersistedCustomToolPortMap[^}]*\}\s*from\s*['"]\.\.\/lib\/toolPortMap['"]/
+      .test(wizardSrc),
+    v('HardwareSetupWizard must import resolvePersistedCustomToolPortMap '
+      + 'from ../lib/toolPortMap so the persisted-custom path derives '
+      + 'its glow set from saved tool.config assignments.'))
+})
+
+function _exists(p) {
+  try { readFileSync(p); return true } catch { return false }
+}

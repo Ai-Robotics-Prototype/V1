@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from 'react'
-import HookupGuide from './HookupGuide'
 import {
   listTools, getToolHookup, confirmToolHookup,
 } from '../lib/toolsApi'
@@ -9,31 +8,41 @@ import {
 import {
   getToolPortMap,
   resolveCustomEOATRecord,
+  resolvePersistedCustomToolPortMap,
   S10_140_PAYLOAD_KG_MAX,
   S10_140_PAYLOAD_ADVISORY_KG,
 } from '../lib/toolPortMap'
 
 // Standalone Hardware Setup wizard.
 //
-// 2026-09-21 operator directive: the wizard now embeds the shared
-// Synapse connection map (via <SynapseConnectionMap mode="guidance"
-// ...>) so the operator can SEE which ports light up for their
-// chosen tool. The map is the SAME component pages/SynapsePage
-// renders — import-identity pin in D_synapse_tab.test.js locks in
-// the no-fork invariant.
+// 2026-09-22 operator directive (hardware-setup cleanup): the OLD
+// per-panel hookup checklist (HookupGuide with its pre-Synapse port
+// map graphics) is RETIRED. The Synapse glowing map is the ONLY
+// wiring guide in this step, and its per-port callout list carries
+// the tick-offs — no doubled affordances.
 //
-// Tool list cleanup (Part 2 of the directive):
+// Three tool paths, each with its own glow set:
+//   * Finger gripper → getToolPortMap('finger') (5/2 valve + 2 IN)
+//   * Vacuum suction → getToolPortMap('vacuum') (3/2 N/C + 1 IN)
+//   * Custom EOAT   → resolvePersistedCustomToolPortMap() from the
+//                     saved tool.config.assigned_valve / _inputs.
+//                     When the custom flow hasn't finished those
+//                     assignments the step renders a "finish your
+//                     tool definition" notice with a link back to
+//                     the picker rather than a blank map.
+//
+// Import-identity pin: the wizard reuses the SynapseConnectionMap
+// export from pages/SynapsePage — no fork. D_synapse_tab.test.js
+// pins it at the source level.
+//
+// Tool list cleanup:
 //   * BUILT_IN keeps only Finger Gripper + Vacuum Suction (real
 //     wireable hardware the S10-140 ships to support) + a NEW
 //     "Custom EOAT" tile that opens the 4-step custom flow.
 //   * Legacy /api/tools rows show ONLY when they are `confirmed`
 //     AND have completed conversion (`conversion.state === 'converted'`).
-//     Everything else — the "junk / trash-me / sample / no-payload
-//     / no-tcp / complete / mt / referred" test fixtures from a
-//     prior session — is filtered out at the picker layer. The
-//     report lists them for operator veto.
 //
-// Custom EOAT (Part 3): mass → actuation → sensors → summary.
+// Custom EOAT flow: mass → actuation → sensors → summary.
 // Recommendations reuse the valve-info-panel copy (VALVE_TYPE_INFO
 // from SynapsePage) so a single edit to the valve explainers
 // updates the wizard, the panel, and the summary at the same time.
@@ -116,14 +125,35 @@ export default function HardwareSetupWizard({
     return null
   }, [toolKey, customs])
 
-  async function handleConfirm(_allChecked, noSensorMap, optionalMap) {
+  // Guidance highlight per tool path:
+  //   finger / vacuum → fixed built-in port map
+  //   custom:<id>     → derived from the saved tool's assigned_valve
+  //                     + assigned_inputs (persisted by the Custom
+  //                     EOAT flow at completion). When those are
+  //                     missing/empty the block renders an incomplete
+  //                     notice instead of a blank map.
+  //   custom_new      → handled by CustomEOATFlow (its own render)
+  const guidancePortMap = useMemo(() => {
+    if (!activeTool) return null
+    if (activeTool.key === 'custom_new') return null
+    if (activeTool.key === 'finger') return getToolPortMap('finger')
+    if (activeTool.key === 'vacuum') return getToolPortMap('vacuum')
+    if (activeTool.key.startsWith('custom:')) {
+      const tool = customs.find((c) => c.id === activeTool.tool_id)
+      return resolvePersistedCustomToolPortMap(tool)
+    }
+    return null
+  }, [activeTool, customs])
+
+  // Empty confirm — the tick-offs live on the map's callout list,
+  // no per-input no-sensor/optional detail collected here anymore
+  // (the retired HookupGuide owned those maps).
+  async function handleGuidanceConfirm() {
     if (!toolKey || toolKey === 'custom_new') return
     setBusy(true); setError(null)
     try {
-      const rec = await confirmToolHookup(toolKey, {
-        noSensor: noSensorMap || {},
-        optional: optionalMap || {},
-      })
+      const rec = await confirmToolHookup(toolKey,
+        { noSensor: {}, optional: {} })
       setRecord(rec)
       setSavedAt(rec && rec.confirmed_at)
     } catch (e) {
@@ -132,17 +162,6 @@ export default function HardwareSetupWizard({
       setBusy(false)
     }
   }
-
-  // Guidance highlight for the fixed built-in tools. Custom-EOAT
-  // has its own flow (below) that computes highlight from the
-  // operator's answers.
-  const guidancePortMap = useMemo(() => {
-    if (!activeTool) return null
-    if (activeTool.key === 'custom_new') return null
-    if (activeTool.key === 'finger') return getToolPortMap('finger')
-    if (activeTool.key === 'vacuum') return getToolPortMap('vacuum')
-    return null
-  }, [activeTool])
 
   const backdrop = {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
@@ -227,7 +246,7 @@ export default function HardwareSetupWizard({
         )}
 
         {/* Existing (built-in or already-configured custom) tool
-            path — HookupGuide + guidance map. */}
+            path — Synapse glowing map is the sole wiring guide. */}
         {toolKey && toolKey !== 'custom_new' && activeTool && (
           <div data-testid="hardware-setup-body">
             <div style={{
@@ -258,24 +277,62 @@ export default function HardwareSetupWizard({
               )}
             </div>
 
-            {/* Guidance map — glows the ports this tool needs. */}
             {guidancePortMap && (
-              <GuidanceBlock port={guidancePortMap} />
+              <>
+                <GuidanceBlock port={guidancePortMap} />
+                {!readOnly && (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+                    <button style={btnGhost} onClick={onClose}
+                            data-testid="hardware-setup-skip">
+                      Skip — already connected
+                    </button>
+                    <button
+                      data-testid="hardware-setup-confirm"
+                      onClick={handleGuidanceConfirm}
+                      disabled={busy}
+                      style={{
+                        padding: '10px 16px', fontSize: 14, fontWeight: 700,
+                        background: '#16A34A', color: '#fff',
+                        border: '1px solid #15803d', borderRadius: 8,
+                        cursor: busy ? 'not-allowed' : 'pointer',
+                        opacity: busy ? 0.55 : 1,
+                        fontFamily: 'inherit',
+                      }}>
+                      {busy ? 'Saving…' : 'All connected — Confirm'}
+                    </button>
+                  </div>
+                )}
+              </>
             )}
-
-            <HookupGuide
-              gripperType={activeTool.gripper_type}
-              mode={readOnly ? 'editor' : 'wizard'}
-              confirmed={!!record?.confirmed_at}
-              noSensor={record?.no_sensor || {}}
-              optionalAnswers={record?.optional || {}}
-              program={activeTool.tool_id
-                ? { config: { tool_id: activeTool.tool_id } }
-                : null}
-              onSkip={onClose}
-              onConfirm={handleConfirm}
-              onClose={onClose}
-            />
+            {!guidancePortMap && activeTool.key.startsWith('custom:') && (
+              <div data-testid="hardware-setup-custom-incomplete"
+                   style={{
+                     padding: 14, borderRadius: 8,
+                     background: '#FEF3C7', color: '#92400E',
+                     border: '1px solid #FDE68A',
+                     fontSize: 13, lineHeight: 1.5,
+                   }}>
+                <b>Finish this tool's definition before wiring it up.</b>
+                {' '}The Custom EOAT flow didn't record which valve or
+                sensor inputs this tool uses, so there's nothing to
+                glow on the map yet.
+                {!initialToolKey && (
+                  <div style={{ marginTop: 10 }}>
+                    <button
+                      data-testid="hardware-setup-custom-incomplete-back"
+                      onClick={() => setToolKey('custom_new')}
+                      style={{
+                        padding: '8px 14px', fontSize: 13, fontWeight: 700,
+                        background: '#fff', color: '#92400E',
+                        border: '1px solid #F59E0B', borderRadius: 6,
+                        cursor: 'pointer', fontFamily: 'inherit',
+                      }}>
+                      Open the Custom EOAT flow →
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
             {savedAt && (
               <div data-testid="hardware-setup-saved"
                    style={{

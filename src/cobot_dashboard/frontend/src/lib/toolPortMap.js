@@ -77,6 +77,42 @@ export function getToolPortMap(toolKey) {
   return null
 }
 
+// Persisted-custom-tool guidance: build a port record from a saved
+// tool row's operator-assigned valve + input ports.
+//
+// A tool that finished the Custom EOAT flow carries
+// `config.assigned_valve` (string like 'V05') and
+// `config.assigned_inputs` (array of 'IN01'…'IN10'). Missing or
+// empty fields → return null so the wizard renders the
+// "finish your tool definition" notice instead of a blank map.
+export function resolvePersistedCustomToolPortMap(tool) {
+  if (!tool || !tool.config) return null
+  const name = tool.name || 'Custom EOAT'
+  const valve = tool.config.assigned_valve
+  const inputs = Array.isArray(tool.config.assigned_inputs)
+    ? tool.config.assigned_inputs.filter((s) => typeof s === 'string' && s)
+    : []
+  const valveOk = typeof valve === 'string' && valve.length > 0
+  if (!valveOk && inputs.length === 0) return null
+  const callouts = {}
+  if (valveOk) callouts[valve] = `Connect ${name}'s air line to ${valve}`
+  inputs.forEach((id, i) => {
+    callouts[id] = `Wire ${name}'s sensor #${i + 1} to ${id}`
+  })
+  return {
+    key: `custom:${tool.id}`,
+    label: name,
+    required_valves:  valveOk ? [valve] : [],
+    required_inputs:  inputs,
+    required_outputs: [],
+    notes:
+      `Wire ${name} per the assignments recorded when it was set `
+      + 'up in the Custom EOAT flow.',
+    callouts,
+    label_overrides: valveOk ? { [valve]: name } : {},
+  }
+}
+
 // Given a live customs list from /api/tools, return the set of
 // VALVE ids already claimed by other custom tools (so the Custom
 // EOAT flow can avoid recommending an already-assigned slot).

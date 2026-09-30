@@ -3626,12 +3626,10 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
         <span style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
                         transition: 'transform 150ms', color: '#6b7280', fontSize: 11 }}>▶</span>
         <span style={labelStyle}>Tool &amp; Payload</span>
-        {/* 2026-09-08 hookup guide: read-only reopen button for
-            the wizard's peripheral-hookup instructions. Same
-            HookupGuide component, mode="editor" (checkboxes
-            disabled). Gripper type comes from program.config.
-            Placed next to the label so operators can reach the
-            wiring reference without leaving the editor. */}
+        {/* Reopen the Hardware Setup wizard read-only so operators
+            can see the Synapse wiring guide (glowing map + callouts)
+            without leaving the editor. Gripper type comes from
+            program.config. */}
         <button
           data-testid="view-hookup-button"
           onClick={(e) => {
