@@ -467,3 +467,173 @@ test('ExternalFixtureWizard writes to the cell on save/delete', () => {
   assert.ok(/deleteCellFixture\s*\(/.test(fixWizSrc),
     v('ExternalFixtureWizard must call deleteCellFixture in commitDelete'))
 })
+
+
+// ── (12) Program-wizard tool step reads cell.eoats only ────────────
+//
+// 2026-09-22 operator directive (tool step): the wizard's tool
+// choice is a CARDS-FROM-CELL step. No tool-type / gripper-type /
+// actuation question survives in ANY program-creation flow.
+
+const toolStepSrc = readSrc('components/ToolFromCellStep.jsx')
+const wizardSrc   = readSrc('components/ProgramWizard.jsx')
+
+test('ToolFromCellStep exists + reads cell.eoats via getCell', () => {
+  assert.ok(/export default function ToolFromCellStep\(/.test(toolStepSrc),
+    v('ToolFromCellStep must be a default export'))
+  assert.ok(/import\s*\{\s*getCell\s*\}\s*from\s*['"]\.\.\/lib\/cellStore['"]/
+              .test(toolStepSrc),
+    v('ToolFromCellStep must import getCell from lib/cellStore'))
+})
+
+test('tool-step-renders-cell-cards-only: no ChoiceButton for gripper types in wizard', () => {
+  // The old step rendered ChoiceButton entries for finger / vacuum
+  // / custom in the SAME body as the "What type of gripper?"
+  // question. Grep the wizard's CODE (comments narrating the retire
+  // are exempt — they're historical narrative, not surfaces).
+  const codeOnly = wizardSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/([^:'"`])\/\/.*$/gm, '$1')
+  assert.equal(/What type of gripper/.test(codeOnly), false,
+    v('ProgramWizard must NOT ask "What type of gripper?" — retired.'))
+  assert.equal(/label:\s*['"]Finger Gripper['"]/.test(codeOnly), false,
+    v('ProgramWizard must NOT list "Finger Gripper" as a type option'))
+  assert.equal(/label:\s*['"]Vacuum Suction['"]/.test(codeOnly), false,
+    v('ProgramWizard must NOT list "Vacuum Suction" as a type option'))
+  assert.equal(/label:\s*['"]Custom Gripper['"]/.test(codeOnly), false,
+    v('ProgramWizard must NOT list "Custom Gripper" as a type option'))
+})
+
+test('gripper_settings STEP-upload step and CustomGripperPanel are retired', () => {
+  assert.equal(/id:\s*['"]gripper_settings['"]/.test(wizardSrc), false,
+    v('ProgramWizard must NOT declare a gripper_settings step — '
+      + 'custom-tool creation lives in EOAT Setup now.'))
+  assert.equal(/function CustomGripperPanel\(/.test(wizardSrc), false,
+    v('CustomGripperPanel function must be deleted (dead-code disposition).'))
+  assert.equal(/function GripperStlModel\(/.test(wizardSrc), false,
+    v('GripperStlModel helper must be deleted with CustomGripperPanel.'))
+  assert.equal(/function GripperPreviewCanvas\(/.test(wizardSrc), false,
+    v('GripperPreviewCanvas helper must be deleted with CustomGripperPanel.'))
+  assert.equal(/function IOPortDropdown\(/.test(wizardSrc), false,
+    v('IOPortDropdown helper must be deleted with CustomGripperPanel.'))
+  // And the orphaned imports too.
+  assert.equal(/from\s+['"]three\/examples\/jsm\/loaders\/STLLoader['"]/
+                .test(wizardSrc), false,
+    v('STLLoader import must be pruned — used only by the retired '
+      + 'GripperStlModel.'))
+  assert.equal(/from\s+['"]@react-three\/fiber['"]/.test(wizardSrc), false,
+    v('@react-three/fiber import must be pruned — used only by the '
+      + 'retired GripperPreviewCanvas.'))
+})
+
+test('ProgramWizard tool step render is ToolFromCellStep (shared component)', () => {
+  assert.ok(/import ToolFromCellStep from '\.\/ToolFromCellStep'/
+              .test(wizardSrc),
+    v('ProgramWizard must import ToolFromCellStep'))
+  // The gripper_type page's render is now the imported component
+  // itself, not an inline function.
+  assert.ok(/id:\s*['"]gripper_type['"],\s*\n\s*render:\s*ToolFromCellStep/
+              .test(wizardSrc),
+    v('gripper_type step render must be `ToolFromCellStep` (shared '
+      + 'component) — one mount serves every program-creation path '
+      + '(palletize + machine-tend + pick-and-place ride the same '
+      + 'PAGES list).'))
+})
+
+test('single-EOAT preselect + zero-EOAT empty state present in ToolFromCellStep', () => {
+  assert.ok(/data-testid="tool-from-cell-empty"/.test(toolStepSrc),
+    v('Zero-EOAT state must render data-testid="tool-from-cell-empty"'))
+  assert.ok(/data-testid="tool-from-cell-empty-setup"/.test(toolStepSrc),
+    v('Zero-EOAT state must expose a "Set up a tool" button'))
+  assert.ok(/data-testid="tool-from-cell-confirm"/.test(toolStepSrc),
+    v('Single-EOAT preselect must expose a one-tap Confirm button'))
+  // The preselect logic: exactly one eoat + nothing already chosen.
+  assert.ok(/eoats\.length === 1 && !answers\?\.cell_eoat_id/.test(toolStepSrc),
+    v('Auto-preselect must trigger only when eoats.length===1 AND '
+      + 'answers.cell_eoat_id is unset.'))
+  // Data-state values expose the three UI states for DOM assertions.
+  assert.ok(/data-state=\{eoats\.length === 0 \? 'empty'\s*\n?\s*:\s*eoats\.length === 1 \? 'single' : 'multi'\}/
+              .test(toolStepSrc),
+    v('ToolFromCellStep root must expose data-state="empty|single|multi".'))
+})
+
+test('setup-roundtrip-preserves-wizard-state: nested EOATSetupWizard + refetch', () => {
+  // The "+ Set up a new tool" affordance opens EOATSetupWizard as a
+  // nested modal. On close, ToolFromCellStep refetches the cell and
+  // preselects the newest entry — ProgramWizard state around it is
+  // preserved by construction (no unmount).
+  assert.ok(/import EOATSetupWizard from '\.\/EOATSetupWizard'/
+              .test(toolStepSrc),
+    v('ToolFromCellStep must import EOATSetupWizard for the nested '
+      + 'round-trip.'))
+  assert.ok(/<EOATSetupWizard onClose=\{closeSetupAndRefresh\}/.test(toolStepSrc),
+    v('The nested EOATSetupWizard onClose must trigger the refresh '
+      + '(closeSetupAndRefresh)'))
+  assert.ok(/preSetupEoatIds/.test(toolStepSrc),
+    v('Round-trip must snapshot the pre-setup eoat ids so the newly-'
+      + 'added entry can be preselected on close.'))
+  // Empty-state also opens the same setup modal.
+  assert.ok(/data-testid="tool-from-cell-empty-setup"[\s\S]*?onClick=\{openSetup\}/
+              .test(toolStepSrc),
+    v('Empty-state Setup button must call openSetup.'))
+})
+
+test('bind-by-id: commit writes cell_eoat_id and derives gripper_type + custom_tool_id', () => {
+  // The commit path sets THREE keys on the wizard answers so
+  // downstream (buildSteps, toolHookupKey, codegen) still gets its
+  // legacy fields. Grep-pin the writes.
+  for (const key of ['cell_eoat_id', 'gripper_type', 'custom_tool_id']) {
+    assert.ok(new RegExp(`setAnswer\\(['"]${key}['"]`).test(toolStepSrc),
+      v(`commit must setAnswer("${key}", ...)`))
+  }
+  // The commit's goNext override must carry the fresh values so
+  // downstream skip predicates see them.
+  assert.ok(/goNext\(\{\s*\n?\s*cell_eoat_id:/.test(toolStepSrc),
+    v('commit goNext must pass an override object with cell_eoat_id + '
+      + 'gripper_type + custom_tool_id so downstream skip predicates '
+      + 'read fresh values (the wizard\'s advance-with-value rule).'))
+})
+
+test('palletizing rides the same tool step (single PAGES mount, no fork)', () => {
+  // The gripper_type step has NO skip predicate — palletize +
+  // machine_tend + pick_and_place all pass through it.
+  const stepBlock = wizardSrc.match(
+    /\{\s*\n?\s*id:\s*['"]gripper_type['"],[\s\S]*?render:\s*ToolFromCellStep[\s\S]*?\}/)
+  assert.ok(stepBlock, v('gripper_type step block must exist'))
+  assert.equal(/skip:/.test(stepBlock[0]), false,
+    v('gripper_type step must have NO skip predicate — every '
+      + 'program-creation path (palletize / machine-tend / '
+      + 'pick-and-place) shares this ONE tool step.'))
+  // And there's exactly ONE mount site — grep for the render binding.
+  const mounts = wizardSrc.match(/render:\s*ToolFromCellStep/g) || []
+  assert.equal(mounts.length, 1,
+    v(`ToolFromCellStep must be mounted EXACTLY once in the PAGES `
+      + `list — found ${mounts.length}.`))
+})
+
+test('type-question absent everywhere in program-creation flows (grep pin)', () => {
+  // Scan every program-creation wizard for the retired question copy.
+  // Comments narrating the retire are exempt (historical narrative).
+  const searched = [
+    'components/ProgramWizard.jsx',
+    'components/ProgramFromDemonstration.jsx',
+    'components/SetupWizard.jsx',
+  ]
+  for (const rel of searched) {
+    let src
+    try { src = readSrc(rel) } catch { continue }
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+      .replace(/([^:'"`])\/\/.*$/gm, '$1')
+    for (const pat of [
+      /What type of gripper/i,
+      /Choose the end-of-arm tool type/i,
+      /Finger Gripper.*Vacuum Suction.*Custom Gripper/s,
+    ]) {
+      assert.equal(pat.test(codeOnly), false,
+        v(`${rel} still contains a tool-type question — retire it.`))
+    }
+  }
+})
