@@ -7,6 +7,7 @@ import { getToolHookup, toolHookupKey } from '../lib/toolsApi'
 import ToolFromCellStep from './ToolFromCellStep'
 import { QuestionCard } from './WizardStepCard'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
+import { useSynapsePortmap, displayNameForRaw } from '../lib/synapsePortmap'
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
          clampWorkpiece, unclampWorkpiece,
@@ -1596,8 +1597,21 @@ function WhichPartBody({ answers, setAnswer, goNext }) {
 
 function MachineIOBody({ answers, setAnswer, goNext }) {
   const portmap = useIOPortmap()
+  const synapsePortmap = useSynapsePortmap()
   const doOptions = portmapToOptions(portmap, 'output')
   const diOptions = portmapToOptions(portmap, 'input')
+  // 2026-10-01 Synapse Addressing Doctrine: dropdown rows render the
+  // Synapse name primarily ("Valve 03 (DO3) — Vacuum On") so operators
+  // pick slots by their panel labels, not by raw controller channels.
+  const synDisplay = (o) => {
+    if (!synapsePortmap) return o.display
+    const syn = displayNameForRaw(synapsePortmap, o.id)
+    const base = `${syn} (${o.id})`
+    const suffix = o.label
+      ? ` — ${o.label}${o.flange ? ' (flange)' : ''}`
+      : (o.flange ? ' (flange)' : '')
+    return `${base}${suffix}`
+  }
   return (
     <QuestionCard
       question="Which I/O signals control the machine?"
@@ -1610,7 +1624,7 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
         <select value={answers.io_cycle_start || 'DO4'}
           onChange={e => setAnswer('io_cycle_start', e.target.value)}
           style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-          {doOptions.map(o => <option key={o.id} value={o.id}>{o.display}</option>)}
+          {doOptions.map(o => <option key={o.id} value={o.id}>{synDisplay(o)}</option>)}
         </select>
       </div>
       <div style={{ marginBottom: 16 }}>
@@ -1620,7 +1634,7 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
         <select value={answers.io_cycle_done || 'DI3'}
           onChange={e => setAnswer('io_cycle_done', e.target.value)}
           style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-          {diOptions.map(o => <option key={o.id} value={o.id}>{o.display}</option>)}
+          {diOptions.map(o => <option key={o.id} value={o.id}>{synDisplay(o)}</option>)}
         </select>
       </div>
       <SliderQuestion label="Cycle timeout" value={answers.cycle_timeout || 30}

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react'
+import { useSynapsePortmap, synapseForRaw } from '../lib/synapsePortmap'
 
 // Live-state + write context — 2026-07-22 I/O bridge (Task 30/31).
 // The dashboard polls /api/io/live at 1 Hz and threads the merged
@@ -992,6 +993,17 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
   const fnTag = row?.function
   const port  = row?.port
   const defaultName = row?.default_name
+  // 2026-10-01 Synapse Addressing Doctrine honest-exception column:
+  // this view stays controller-native (raw DO/DI is the row id) BUT
+  // adds a Synapse-name badge so the operator can see "DO3 → Valve 03"
+  // in the one place where both sides of the translation are visible.
+  // Only shown for channels the portmap maps to a Synapse name;
+  // unmapped channels get no badge (not a bug — many raw channels
+  // genuinely don't correspond to a Synapse port).
+  const synapsePortmap = useSynapsePortmap()
+  const synapseName = synapsePortmap && (kind === 'DO' || kind === 'DI')
+    ? synapseForRaw(synapsePortmap, id)
+    : null
   // pair_tag = the terminal the operator physically lands the return
   // wire on for this row (0V for DI-A / DO-A, 24V for DI-B / DO-B,
   // AGNDn for analog rows). Rendered as a small right-side chip so
@@ -1045,6 +1057,23 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
             minWidth: 64, textAlign: 'left',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           }}>{id}</span>
+        {synapseName && (
+          <span
+            data-testid="io-channel-synapse-badge"
+            data-raw={id}
+            data-synapse={synapseName}
+            title={`Synapse name for ${id} per /opt/cobot/synapse_portmap.json`}
+            style={{
+              fontSize: 9, fontWeight: 700, fontFamily: 'monospace',
+              color: '#1E3A8A', background: '#EFF6FF',
+              border: '1px solid #BFDBFE',
+              padding: '0 4px', borderRadius: 3,
+              marginRight: 4, letterSpacing: '0.02em',
+              flexShrink: 0,
+            }}>
+            → {synapseName}
+          </span>
+        )}
         {editable && (
           <input
             type="checkbox"

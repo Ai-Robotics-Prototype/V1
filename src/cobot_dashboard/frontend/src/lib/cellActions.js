@@ -28,30 +28,53 @@ const DEFAULT_CLAMP_TIMEOUT_MS = 5000
 // ── Port helpers ────────────────────────────────────────────────────
 //
 // Cell entries store port IDs as 'V05', 'IN04', 'OUT03'. The codegen
-// primitives take io_id like 'DO<N>' and 'DI<N>'. The mapping:
-//   * V<NN>  → DO<N>  (valves fire DO channels — one N per valve,
-//                       chosen by the Synapse wiring convention)
-//   * OUT<NN> → DO<N>
-//   * IN<NN>  → DI<N>
-// The <NN> zero-pad drops when compiled — DO5 not DO05.
+// primitives take io_id like 'DO<N>' and 'DI<N>'. Translation now
+// routes through the single-source synapsePortmap module
+// (2026-10-01 Synapse Addressing Doctrine). The seeded portmap
+// matches the current convention — V<NN>→DO<N>, OUT<NN>→DO<N>,
+// IN<NN>→DI<N> — so emitted io_ids are byte-identical with the
+// pre-directive helpers. When the operator audits the seeded map
+// (/opt/cobot/synapse_portmap.json) and corrects a row, that fix
+// flows through every caller automatically.
+//
+// The fallback (cachedPortmap() === null, before the hook has
+// fetched) uses the convention mapping directly so cell-sourced
+// primitives in server-side codegen tests stay deterministic.
+
+import {
+  cachedPortmap, rawForSynapse,
+} from './synapsePortmap.js'
+
+function _rawFromPortmap(synId) {
+  const pm = cachedPortmap()
+  if (pm) {
+    const r = rawForSynapse(pm, synId)
+    if (r) return r
+  }
+  // Fallback: convention mapping. Preserves byte-identical emission
+  // when the portmap hasn't been fetched yet (server-side tests +
+  // cold-boot wizard renders before the hook mounts).
+  if (typeof synId !== 'string') return null
+  const v = synId.match(/^V(\d+)$/)
+  if (v) return `DO${Number(v[1])}`
+  const o = synId.match(/^OUT(\d+)$/)
+  if (o) return `DO${Number(o[1])}`
+  const i = synId.match(/^IN(\d+)$/)
+  if (i) return `DI${Number(i[1])}`
+  return null
+}
 
 function _valveToDo(valveId) {
-  if (typeof valveId !== 'string') return null
-  const m = valveId.match(/^V(\d+)$/)
-  if (!m) return null
-  return `DO${Number(m[1])}`
+  if (typeof valveId !== 'string' || !valveId.match(/^V\d+$/)) return null
+  return _rawFromPortmap(valveId)
 }
 function _outToDo(outId) {
-  if (typeof outId !== 'string') return null
-  const m = outId.match(/^OUT(\d+)$/)
-  if (!m) return null
-  return `DO${Number(m[1])}`
+  if (typeof outId !== 'string' || !outId.match(/^OUT\d+$/)) return null
+  return _rawFromPortmap(outId)
 }
 function _inToDi(inId) {
-  if (typeof inId !== 'string') return null
-  const m = inId.match(/^IN(\d+)$/)
-  if (!m) return null
-  return `DI${Number(m[1])}`
+  if (typeof inId !== 'string' || !inId.match(/^IN\d+$/)) return null
+  return _rawFromPortmap(inId)
 }
 
 // ── Named actions for a fixture entry ──────────────────────────────

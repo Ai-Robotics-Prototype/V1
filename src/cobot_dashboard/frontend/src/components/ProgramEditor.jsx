@@ -15,6 +15,8 @@ import { readPayload, PAYLOAD_UNSET_WARNING }
 import { computePayloadTruth } from '../lib/payloadTruth'
 import { useIOPortmap, portmapLabels, portmapToOptions }
   from '../lib/ioPortmap'
+import { useSynapsePortmap, displayNameForRaw }
+  from '../lib/synapsePortmap'
 import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
          palletFrameStatus, firstUntaughtPalletRole, PALLET_ROLE_ORDER,
          TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove }
@@ -379,13 +381,20 @@ function actionFor(step) {
 // Raw position data (taught_joints, taught_tcp, joints, position) is
 // intentionally NOT included here — that lives in the collapsible
 // "position data" block triggered by the "View position data" link.
-function detailLine(step, ioLabels) {
-  // Match the main I/O page + dropdown format: "DO2 — Vacuum On" when
-  // the operator has renamed the port, plain "DO2" otherwise.
+function detailLine(step, ioLabels, synapsePortmap) {
+  // 2026-10-01 Synapse Addressing Doctrine: operator-facing step
+  // detail renders Synapse names ("Valve 03", "IN 06"), with the
+  // operator-assigned nickname appended when present. Raw channel
+  // ids survive only in the diagnostic/exception surfaces (the
+  // Main Internal Robot Controller I/O panel). Unmapped raw
+  // channels render as "Unmapped channel DOx" via displayNameForRaw.
   const ioName = (id) => {
     if (!id) return id
+    const syn = synapsePortmap
+      ? displayNameForRaw(synapsePortmap, id)
+      : id
     const lab = ioLabels && ioLabels[id]
-    return lab ? `${id} — ${lab}` : id
+    return lab ? `${syn} — ${lab}` : syn
   }
   const bits = [step.action || step.type]
   if (step.target)      bits.push('target: ' + step.target)
@@ -472,7 +481,22 @@ function useIOLabels() {
 // with a "(flange)" suffix.
 function IOPortSelector({ label, value, onChange, direction, analog }) {
   const portmap = useIOPortmap()
+  const synapsePortmap = useSynapsePortmap()
   const options = portmapToOptions(portmap, direction, { analog: Boolean(analog) })
+  // 2026-10-01 Synapse Addressing Doctrine: dropdown rows render the
+  // Synapse name first ("Valve 03 (DO3) — Vacuum On"), with the raw
+  // channel in parentheses for traceability. Raw channels that
+  // aren't in the portmap render as "Unmapped channel DOx" via the
+  // same helper so no silent invention of a Synapse name.
+  const displayFor = (opt) => {
+    if (!synapsePortmap) return opt.display
+    const syn = displayNameForRaw(synapsePortmap, opt.id)
+    const base = `${syn} (${opt.id})`
+    const suffix = opt.label
+      ? ` — ${opt.label}${opt.flange ? ' (flange)' : ''}`
+      : (opt.flange ? ' (flange)' : '')
+    return `${base}${suffix}`
+  }
   return (
     <div style={{ marginBottom: 8 }}>
       <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 3 }}>{label}</div>
@@ -480,7 +504,7 @@ function IOPortSelector({ label, value, onChange, direction, analog }) {
         style={{ ...selectStyle }}>
         <option value="">Not assigned</option>
         {options.map((p) => (
-          <option key={p.id} value={p.id}>{p.display}</option>
+          <option key={p.id} value={p.id}>{displayFor(p)}</option>
         ))}
       </select>
     </div>
@@ -3944,6 +3968,9 @@ export default function ProgramEditor() {
   // Operator-renamed I/O labels for the detail line + IOPortSelector
   // dropdowns. Fetched once per editor mount.
   const ioLabels           = useIOLabels()
+  // Synapse portmap for operator-facing name translation
+  // (2026-10-01 Synapse Addressing Doctrine).
+  const synapsePortmap     = useSynapsePortmap()
 
   // Editor identity / steps / unsaved all live in the store now so a
   // tab swap unmount-and-remount doesn't reset them.
@@ -6353,7 +6380,7 @@ export default function ProgramEditor() {
                     fontSize: 13, color: '#6b7280',
                     wordBreak: 'break-word', whiteSpace: 'normal',
                   }}>
-                    {detailLine(step, ioLabels)}
+                    {detailLine(step, ioLabels, synapsePortmap)}
                   </span>
                   {isTeachable(step, currentProgram) && hasPositionData(step) && (() => {
                     const open = openPosData.has(step.id)

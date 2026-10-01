@@ -10783,6 +10783,144 @@ if FASTAPI_AVAILABLE:
             _write_cell(cell)
         return {'ok': True, 'removed': before - len(cell['fixtures'])}
 
+
+    # ── Synapse port map (2026-10-01 operator directive) ──────────
+    #
+    # Single source of truth for Synapse-name → controller-channel
+    # translation (V01 → DO1, IN01 → DI1, ...). Allocation, cell
+    # profiles, guidance glow, codegen reverse-lookup, and operator-
+    # facing display all read this one map. Seed on first read from
+    # the current convention + HARDWARE.md facts; operator can edit
+    # /opt/cobot/synapse_portmap.json to flip rows to verified or
+    # correct an incorrect wiring row.
+    #
+    # The seed marks every row with `verified` boolean + a `source`
+    # tag so the session that assembled the map is explicit about
+    # which rows are HARDWARE.md facts, which are convention defaults,
+    # and which are UNVERIFIED awaiting operator audit.
+    _SYNAPSE_PORTMAP_PATH = os.environ.get(
+        'COBOT_SYNAPSE_PORTMAP', '/opt/cobot/synapse_portmap.json')
+    _SYNAPSE_PORTMAP_LOCK = threading.RLock()
+
+    def _synapse_portmap_seed() -> dict:
+        """Seed dict with the current implicit convention + verified
+        facts from HARDWARE.md. Byte-identical codegen is preserved
+        because the mapping is the same as cellActions.js was doing
+        inline (V<n>→DO<n>, IN<n>→DI<n>, OUT<n>→DO<n>) — this file
+        just makes that convention explicit and auditable."""
+        rows = []
+        # Valves 01..10 → DO1..DO10 (convention). V03 is HARDWARE.md
+        # verified as blow-off / vacuum ejector valve.
+        verified_valves = {3: ('blow-off valve', 'HARDWARE.md §—')}
+        for n in range(1, 11):
+            vid = f'V{n:02d}'
+            raw = f'DO{n}'
+            verified, source, note = False, 'convention', ''
+            if n in verified_valves:
+                note, source = verified_valves[n]
+                verified, source = True, 'HARDWARE.md'
+            rows.append({
+                'synapse':  vid,
+                'kind':     'valve',
+                'raw':      raw,
+                'verified': verified,
+                'source':   source,
+                'note':     note,
+            })
+        # Inputs 01..10 → DI1..DI10 (convention)
+        for n in range(1, 11):
+            rows.append({
+                'synapse':  f'IN{n:02d}',
+                'kind':     'input',
+                'raw':      f'DI{n}',
+                'verified': False,
+                'source':   'convention',
+                'note':     '',
+            })
+        # Outputs 01..10 → DO1..DO10 (convention — collides with
+        # valves in channel space; the real Synapse cabinet likely
+        # routes OUTs to DO11..DO20 or similar. Operator MUST verify.)
+        for n in range(1, 11):
+            rows.append({
+                'synapse':  f'OUT{n:02d}',
+                'kind':     'output',
+                'raw':      f'DO{n}',
+                'verified': False,
+                'source':   'convention',
+                'note':     ('COLLIDES with Valve ' + f'{n:02d}'
+                             + ' in channel space — operator must verify'
+                             + ' the real cabinet routing before using'
+                             + ' OUT slots in a program.'),
+            })
+        # Safety 01..04 — no controller channel mapping yet; operator
+        # fills in the real DI/DO (likely safety-dedicated inputs on
+        # the SAFETY block).
+        for n in range(1, 5):
+            rows.append({
+                'synapse':  f'SAFETY{n:02d}',
+                'kind':     'safety',
+                'raw':      None,
+                'verified': False,
+                'source':   'unverified',
+                'note':     'Safety routing not yet verified against'
+                            ' the real cabinet — operator must fill.',
+            })
+        # Reserved DI aliases (operator-facing name for raw DI the
+        # controller owns). These are read-only informational rows so
+        # the reverse-lookup can render honest copy instead of
+        # "Unmapped channel DI16".
+        reserved = [
+            ('DI16', 'modeSwitch (HC interface, reserved)'),
+            ('DI17', 'enableButton (HC interface, reserved)'),
+            ('DI18', 'robotDrag (flange aviation plug, reserved)'),
+        ]
+        for raw, label in reserved:
+            rows.append({
+                'synapse':  raw,  # no Synapse name — raw IS the name
+                'kind':     'reserved',
+                'raw':      raw,
+                'verified': True,
+                'source':   'HARDWARE.md',
+                'note':     label,
+            })
+        return {
+            'version': 1,
+            'seeded_at': time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                       time.gmtime()),
+            'rows': rows,
+        }
+
+    def _read_synapse_portmap() -> dict:
+        try:
+            with open(_SYNAPSE_PORTMAP_PATH) as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get('rows'), list):
+                return data
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        # Seed on first use + persist so the operator can edit it.
+        seed = _synapse_portmap_seed()
+        try:
+            os.makedirs(os.path.dirname(_SYNAPSE_PORTMAP_PATH),
+                        exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                prefix='.synapse_portmap.', suffix='.json',
+                dir=os.path.dirname(_SYNAPSE_PORTMAP_PATH))
+            with os.fdopen(fd, 'w') as fh:
+                json.dump(seed, fh, indent=2, sort_keys=False)
+            os.replace(tmp, _SYNAPSE_PORTMAP_PATH)
+        except Exception:
+            pass
+        return seed
+
+    @app.get("/api/synapse/portmap")
+    async def api_synapse_portmap_get():
+        with _SYNAPSE_PORTMAP_LOCK:
+            pm = _read_synapse_portmap()
+        return {'ok': True, 'portmap': pm}
+
     @app.post("/api/event_log/append")
     async def api_event_log_append(request: Request):
         """Append a frontend-originated event to the daily JSONL.
