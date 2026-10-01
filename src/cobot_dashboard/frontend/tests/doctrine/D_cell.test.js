@@ -637,3 +637,144 @@ test('type-question absent everywhere in program-creation flows (grep pin)', () 
     }
   }
 })
+
+
+// ── (13) Tool step uses the canonical wizard container ────────────
+//
+// 2026-10-01 operator field report: the tool step rendered in a
+// bespoke prompt wrapper, so its window chrome diverged from every
+// other PAGES entry. Fix: ToolFromCellStep imports the canonical
+// QuestionCard from components/WizardStepCard and wraps its body in
+// it; the inline <QuestionCard> definition in ProgramWizard.jsx is
+// retired in favour of the same named import so the canonical chrome
+// is single-sourced. Grep both facts here.
+
+const stepCardSrc = readSrc('components/WizardStepCard.jsx')
+
+test('tool-step-uses-canonical-container: ToolFromCellStep imports and renders QuestionCard', () => {
+  assert.ok(
+    /import\s*\{\s*QuestionCard\s*\}\s*from\s*['"]\.\/WizardStepCard['"]/
+      .test(toolStepSrc),
+    v('ToolFromCellStep must `import { QuestionCard } from "./WizardStepCard"` — canonical chrome, no fork.'))
+  // The step body renders inside the imported QuestionCard — the
+  // loading / error / main returns all open a <QuestionCard ...>
+  // element. Count ≥ 3 to cover the three states.
+  const uses = toolStepSrc.match(/<QuestionCard\b/g) || []
+  assert.ok(uses.length >= 3,
+    v(`ToolFromCellStep must render <QuestionCard> in every state `
+      + `(loading / error / main) — found ${uses.length} uses.`))
+  // The retired bespoke prompt wrapper (`_Question` helper + its
+  // hand-rolled fontSize:18 heading) must be gone.
+  assert.equal(/function\s+_Question\s*\(/.test(toolStepSrc), false,
+    v('ToolFromCellStep must NOT define its own `_Question` prompt '
+      + 'wrapper — the canonical QuestionCard replaces it.'))
+})
+
+test('canonical QuestionCard is single-sourced in WizardStepCard.jsx', () => {
+  assert.ok(/export function QuestionCard\(/.test(stepCardSrc),
+    v('WizardStepCard.jsx must export the named `QuestionCard` component.'))
+  // ProgramWizard imports the same canonical named export AND does
+  // NOT redefine it locally — one definition in the tree.
+  assert.ok(
+    /import\s*\{\s*QuestionCard\s*\}\s*from\s*['"]\.\/WizardStepCard['"]/
+      .test(wizardSrc),
+    v('ProgramWizard must import QuestionCard from WizardStepCard — '
+      + 'no inline fork.'))
+  assert.equal(/\n\s*function\s+QuestionCard\s*\(/.test(wizardSrc), false,
+    v('ProgramWizard must NOT define a local `function QuestionCard(` '
+      + '— the canonical container lives in WizardStepCard.jsx.'))
+})
+
+test('no bespoke wizard-page window wrappers (grep pin)', () => {
+  // Any file that houses a ProgramWizard step is screened for a
+  // hand-rolled fixed-overlay / full-modal window wrapper. The
+  // outer modal chrome belongs to ProgramWizard itself; a step
+  // that renders its own fixed/absolute overlay or its own card
+  // backdrop is the exact class the 2026-10-01 field report called
+  // out. ProgramWizard's own outer overlay + TeachSequence's
+  // intentional fullscreen jog pendant are the sanctioned
+  // exceptions and are grep-skipped by filename.
+  const stepFiles = [
+    'components/ToolFromCellStep.jsx',
+  ]
+  for (const rel of stepFiles) {
+    const src = readSrc(rel)
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+      .replace(/([^:'"`])\/\/.*$/gm, '$1')
+    for (const pat of [
+      /position:\s*['"]fixed['"]/,
+      /zIndex\s*:\s*\d{3,}/,
+      /inset:\s*0/,
+    ]) {
+      assert.equal(pat.test(codeOnly), false,
+        v(`${rel} must NOT define its own modal/window chrome `
+          + `(${pat}) — render inside the canonical QuestionCard.`))
+    }
+  }
+})
+
+test('ProgramWizard PAGES entries all route through the canonical container', () => {
+  // Grep pin: every page in the PAGES list either (a) renders
+  // <QuestionCard> inline, (b) uses one of the shared body helpers
+  // that themselves wrap in <QuestionCard>, or (c) is the sanctioned
+  // fullscreen teach_sequence (TeachSequence). No other inline
+  // bespoke window wrappers are allowed to creep in.
+  const SANCTIONED_FULLSCREEN = new Set(['teach_sequence'])
+  // Grab the PAGES array body.
+  const pagesStart = wizardSrc.indexOf('const PAGES = [')
+  assert.ok(pagesStart >= 0, v('PAGES array must exist in ProgramWizard'))
+  let depth = 1
+  let i = pagesStart + 'const PAGES = ['.length
+  while (i < wizardSrc.length && depth > 0) {
+    if (wizardSrc[i] === '[') depth++
+    else if (wizardSrc[i] === ']') depth--
+    i++
+  }
+  const pagesBody = wizardSrc.slice(
+    pagesStart + 'const PAGES = ['.length, i - 1)
+  // Find each top-level `{ ... }` entry (same depth-walk).
+  const entries = []
+  let j = 0
+  while (j < pagesBody.length) {
+    const brace = pagesBody.indexOf('{', j)
+    if (brace < 0) break
+    let d = 1; let k = brace + 1
+    while (k < pagesBody.length && d > 0) {
+      if (pagesBody[k] === '{') d++
+      else if (pagesBody[k] === '}') d--
+      k++
+    }
+    entries.push(pagesBody.slice(brace, k))
+    j = k
+  }
+  for (const body of entries) {
+    const idMatch = body.match(/\n\s*id:\s*['"]([^'"]+)['"]/)
+    if (!idMatch) continue
+    const id = idMatch[1]
+    if (SANCTIONED_FULLSCREEN.has(id)) continue
+    const renderMatch = body.match(/render:\s*([A-Za-z_][A-Za-z0-9_]*)/)
+    // Inline arrow render: body must mention QuestionCard directly.
+    if (!renderMatch) {
+      assert.ok(body.includes('QuestionCard'),
+        v(`PAGES entry "${id}" inline render must wrap in QuestionCard`))
+      continue
+    }
+    const target = renderMatch[1]
+    // Allowed named renders: ToolFromCellStep (imports QuestionCard
+    // from WizardStepCard), plus the inline body helpers in this
+    // same file. Verify each body helper's own definition uses
+    // QuestionCard.
+    if (target === 'ToolFromCellStep') continue
+    const defRe = new RegExp(
+      `function\\s+${target}\\s*\\([\\s\\S]*?\\n\\}`, 'g')
+    const defs = wizardSrc.match(defRe) || []
+    assert.ok(defs.length > 0,
+      v(`PAGES entry "${id}" references ${target} but no definition `
+        + `found in ProgramWizard.jsx`))
+    assert.ok(defs[0].includes('QuestionCard'),
+      v(`PAGES entry "${id}" renders ${target}, which must itself `
+        + `wrap in <QuestionCard>`))
+  }
+})

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { getCell } from '../lib/cellStore'
+import { QuestionCard } from './WizardStepCard'
 import EOATSetupWizard from './EOATSetupWizard'
 
 // ToolFromCellStep — the program wizard's "Which tool will this
@@ -23,6 +24,12 @@ import EOATSetupWizard from './EOATSetupWizard'
 // Shared component: this file is the ONE tool step both the new-
 // program wizard AND the palletizing sub-flow render. Import-
 // identity pin in D_cell.test.js locks in the no-fork invariant.
+//
+// Chrome: this step renders inside the canonical <QuestionCard>
+// imported from ./WizardStepCard — same header/padding/width as
+// every other PAGES entry so the window chrome is identical across
+// the wizard (2026-10-01 operator field report — the tool step was
+// previously forking its own prompt header + no outer card).
 
 export default function ToolFromCellStep({
   answers, setAnswer, goNext,
@@ -100,13 +107,21 @@ export default function ToolFromCellStep({
     })
   }
 
+  const QUESTION = 'Which tool will this program use?'
+  const DESCRIPTION = (
+    "Pick from the end-of-arm tools set up in your cell. "
+    + "The program remembers the choice by id, so if the tool's "
+    + 'ports change later, the program follows automatically.'
+  )
+
   if (loading) {
     return (
       <div data-testid="tool-from-cell-step" data-state="loading">
-        <_Question />
-        <div style={{ padding: 12, color: '#6b7280', fontSize: 13 }}>
-          Loading tools…
-        </div>
+        <QuestionCard question={QUESTION} description={DESCRIPTION}>
+          <div style={{ padding: 12, color: '#6b7280', fontSize: 13 }}>
+            Loading tools…
+          </div>
+        </QuestionCard>
       </div>
     )
   }
@@ -114,8 +129,9 @@ export default function ToolFromCellStep({
   if (err) {
     return (
       <div data-testid="tool-from-cell-step" data-state="error">
-        <_Question />
-        <div style={_errStyle}>Tool library unavailable: {err}</div>
+        <QuestionCard question={QUESTION} description={DESCRIPTION}>
+          <div style={_errStyle}>Tool library unavailable: {err}</div>
+        </QuestionCard>
       </div>
     )
   }
@@ -124,128 +140,115 @@ export default function ToolFromCellStep({
     <div data-testid="tool-from-cell-step"
          data-state={eoats.length === 0 ? 'empty'
                     : eoats.length === 1 ? 'single' : 'multi'}>
-      <_Question />
+      <QuestionCard question={QUESTION} description={DESCRIPTION}>
 
-      {eoats.length === 0 && (
-        <div data-testid="tool-from-cell-empty"
-             style={{
-               padding: 14, borderRadius: 8, background: '#FEF3C7',
-               border: '1px solid #FDE68A', color: '#92400E',
-               fontSize: 13, lineHeight: 1.5,
-             }}>
-          <b>You haven't set up a tool yet.</b> Open EOAT Setup to
-          register the end-of-arm tool your robot will use, then
-          come back to this step.
-          <div style={{ marginTop: 10 }}>
+        {eoats.length === 0 && (
+          <div data-testid="tool-from-cell-empty"
+               style={{
+                 padding: 14, borderRadius: 8, background: '#FEF3C7',
+                 border: '1px solid #FDE68A', color: '#92400E',
+                 fontSize: 13, lineHeight: 1.5,
+               }}>
+            <b>You haven't set up a tool yet.</b> Open EOAT Setup to
+            register the end-of-arm tool your robot will use, then
+            come back to this step.
+            <div style={{ marginTop: 10 }}>
+              <button
+                data-testid="tool-from-cell-empty-setup"
+                onClick={openSetup}
+                style={_btnPrim}>
+                Set up a tool
+              </button>
+            </div>
+          </div>
+        )}
+
+        {eoats.length > 0 && (
+          <div style={{
+            display: 'grid', gap: 10,
+            gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
+          }}>
+            {eoats.map((e) => {
+              const on = selectedId === e.id
+              return (
+                <button
+                  key={e.id}
+                  data-testid="tool-from-cell-card"
+                  data-cell-id={e.id}
+                  data-selected={String(on)}
+                  onClick={() => commit(e)}
+                  style={{
+                    textAlign: 'left', padding: '12px 14px',
+                    background: on ? '#EFF6FF' : '#fff',
+                    border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
+                    borderRadius: 8, cursor: 'pointer',
+                    fontFamily: 'inherit',
+                  }}>
+                  <div style={{
+                    display: 'flex', gap: 8, alignItems: 'baseline',
+                  }}>
+                    <div style={{ fontSize: 14, fontWeight: 700,
+                                  color: '#111', flex: 1 }}>
+                      {e.name}
+                    </div>
+                    <span data-testid="tool-from-cell-card-type-badge"
+                          style={_typeBadge}>
+                      {e.type}
+                    </span>
+                  </div>
+                  <div style={{ marginTop: 6, display: 'flex', gap: 6,
+                                flexWrap: 'wrap' }}>
+                    {e.valve && (
+                      <span data-testid="tool-from-cell-card-port"
+                            style={_portChip}>{e.valve}</span>
+                    )}
+                    {(e.inputs || []).map((i) => (
+                      <span key={i}
+                            data-testid="tool-from-cell-card-port"
+                            style={_portChip}>{i}</span>
+                    ))}
+                  </div>
+                </button>
+              )
+            })}
             <button
-              data-testid="tool-from-cell-empty-setup"
+              data-testid="tool-from-cell-setup-new"
               onClick={openSetup}
-              style={_btnPrim}>
-              Set up a tool
+              style={{
+                textAlign: 'left', padding: '12px 14px',
+                background: '#F9FAFB',
+                border: '1px dashed #9CA3AF',
+                borderRadius: 8, cursor: 'pointer',
+                color: '#374151', fontFamily: 'inherit',
+              }}>
+              <div style={{ fontSize: 14, fontWeight: 700 }}>
+                + Set up a new tool
+              </div>
+              <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
+                Open EOAT Setup. You'll come back here when you finish.
+              </div>
             </button>
           </div>
-        </div>
-      )}
+        )}
 
-      {eoats.length > 0 && (
-        <div style={{
-          display: 'grid', gap: 10,
-          gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
-        }}>
-          {eoats.map((e) => {
-            const on = selectedId === e.id
-            return (
-              <button
-                key={e.id}
-                data-testid="tool-from-cell-card"
-                data-cell-id={e.id}
-                data-selected={String(on)}
-                onClick={() => commit(e)}
-                style={{
-                  textAlign: 'left', padding: '12px 14px',
-                  background: on ? '#EFF6FF' : '#fff',
-                  border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
-                  borderRadius: 8, cursor: 'pointer',
-                  fontFamily: 'inherit',
-                }}>
-                <div style={{
-                  display: 'flex', gap: 8, alignItems: 'baseline',
-                }}>
-                  <div style={{ fontSize: 14, fontWeight: 700,
-                                color: '#111', flex: 1 }}>
-                    {e.name}
-                  </div>
-                  <span data-testid="tool-from-cell-card-type-badge"
-                        style={_typeBadge}>
-                    {e.type}
-                  </span>
-                </div>
-                <div style={{ marginTop: 6, display: 'flex', gap: 6,
-                              flexWrap: 'wrap' }}>
-                  {e.valve && (
-                    <span data-testid="tool-from-cell-card-port"
-                          style={_portChip}>{e.valve}</span>
-                  )}
-                  {(e.inputs || []).map((i) => (
-                    <span key={i}
-                          data-testid="tool-from-cell-card-port"
-                          style={_portChip}>{i}</span>
-                  ))}
-                </div>
-              </button>
-            )
-          })}
-          <button
-            data-testid="tool-from-cell-setup-new"
-            onClick={openSetup}
-            style={{
-              textAlign: 'left', padding: '12px 14px',
-              background: '#F9FAFB',
-              border: '1px dashed #9CA3AF',
-              borderRadius: 8, cursor: 'pointer',
-              color: '#374151', fontFamily: 'inherit',
-            }}>
-            <div style={{ fontSize: 14, fontWeight: 700 }}>
-              + Set up a new tool
-            </div>
-            <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
-              Open EOAT Setup. You'll come back here when you finish.
-            </div>
-          </button>
-        </div>
-      )}
+        {eoats.length === 1 && selected && (
+          <div style={{
+            marginTop: 12, display: 'flex', gap: 8,
+          }}>
+            <button
+              data-testid="tool-from-cell-confirm"
+              onClick={() => commit(selected)}
+              style={_btnPrim}>
+              Use {selected.name} — Next →
+            </button>
+          </div>
+        )}
 
-      {eoats.length === 1 && selected && (
-        <div style={{
-          marginTop: 12, display: 'flex', gap: 8,
-        }}>
-          <button
-            data-testid="tool-from-cell-confirm"
-            onClick={() => commit(selected)}
-            style={_btnPrim}>
-            Use {selected.name} — Next →
-          </button>
-        </div>
-      )}
+      </QuestionCard>
 
       {showSetup && (
         <EOATSetupWizard onClose={closeSetupAndRefresh} />
       )}
-    </div>
-  )
-}
-
-function _Question() {
-  return (
-    <div style={{ marginBottom: 12 }}>
-      <div style={{ fontSize: 18, fontWeight: 700, color: '#111' }}>
-        Which tool will this program use?
-      </div>
-      <div style={{ fontSize: 13, color: '#6b7280', marginTop: 4 }}>
-        Pick from the end-of-arm tools set up in your cell.
-        The program remembers the choice by id, so if the tool's
-        ports change later, the program follows automatically.
-      </div>
     </div>
   )
 }

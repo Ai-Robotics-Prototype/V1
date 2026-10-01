@@ -5,6 +5,7 @@ import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import { getToolHookup, toolHookupKey } from '../lib/toolsApi'
 import ToolFromCellStep from './ToolFromCellStep'
+import { QuestionCard } from './WizardStepCard'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
@@ -23,21 +24,10 @@ import { effectorReady, effectorEngage, effectorDisengage,
 // Question definitions
 // ────────────────────────────────────────────────────────
 
-function QuestionCard({ question, description, children }) {
-  return (
-    <div style={{ padding: 32, maxWidth: 600, margin: '0 auto' }}>
-      <div style={{ fontSize: 22, fontWeight: 700, color: '#111', marginBottom: 8, lineHeight: 1.3 }}>
-        {question}
-      </div>
-      {description && (
-        <div style={{ fontSize: 14, color: '#6b7280', marginBottom: 28, lineHeight: 1.5 }}>
-          {description}
-        </div>
-      )}
-      {children}
-    </div>
-  )
-}
+// QuestionCard (canonical wizard-step container) moved to
+// ./WizardStepCard.jsx so steps imported from their own files
+// (ToolFromCellStep + any future per-file step) render inside the
+// SAME chrome as inline PAGES entries. Import, don't fork.
 
 function ChoiceButton({ label, description, selected, onClick, icon }) {
   return (
