@@ -778,3 +778,128 @@ test('ProgramWizard PAGES entries all route through the canonical container', ()
         + `wrap in <QuestionCard>`))
   }
 })
+
+
+// ── (14) Multi-actuator cell schema + end-to-end roundtrip ─────────
+//
+// 2026-10-01 operator directive extensions:
+//   * cellClaimedPorts must union EVERY valve in actuators[]
+//     (otherwise a dual-actuator tool silently frees a port it
+//     actually consumes, and the next allocation collides).
+//   * The backend accepts actuators + sensor_count on
+//     /api/cell/eoat POST and persists them, so a tool saved by
+//     the EOAT Setup wizard is readable by the Program Wizard
+//     tool-step on its next getCell.
+//   * The migration _migrate_actuators_v1 backfills legacy
+//     single-valve entries with actuators[0] so every reader sees
+//     one shape.
+
+test('cellClaimedPorts unions multi-actuator valves (no silent drops)', () => {
+  const cell = {
+    eoats: [{
+      id: 'e1', name: 'Dual',
+      valve: 'V05',
+      actuators: [
+        { type: 'single_acting', valve: 'V05' },
+        { type: 'vacuum',        valve: 'V10' },
+      ],
+      inputs: ['IN01'],
+    }],
+    fixtures: [],
+  }
+  const c = cellClaimedPorts(cell)
+  assert.deepEqual([...c.valves].sort(), ['V05', 'V10'],
+    v('cellClaimedPorts must claim EVERY actuators[*].valve — a '
+      + 'dual-actuator tool had valves [V05, V10], got '
+      + `[${[...c.valves].sort().join(', ')}].`))
+})
+
+test('backend /api/cell/eoat accepts actuators + sensor_count fields', () => {
+  // Grep the handler body — it must thread actuators through to the
+  // persisted entry (operator-controlled payload fields need
+  // explicit allow-listing in the handler).
+  assert.ok(/body\.get\(['"]actuators['"]\)/.test(backendSrc),
+    v('/api/cell/eoat handler must read body["actuators"] from the '
+      + 'POST payload — the multi-actuator schema is operator-driven.'))
+  assert.ok(/body\.get\(['"]sensor_count['"]\)/.test(backendSrc),
+    v('/api/cell/eoat handler must read body["sensor_count"] from '
+      + 'the POST payload.'))
+  // Entry constructed with actuators (list) + sensor_count fields.
+  assert.ok(/'actuators':\s*actuators,/.test(backendSrc),
+    v("Persisted cell entry must include 'actuators': actuators"))
+  assert.ok(/'sensor_count':\s*body\.get\(['"]sensor_count['"]\)/
+              .test(backendSrc),
+    v("Persisted cell entry must include 'sensor_count'"))
+})
+
+test('migration cell_actuators_v1 backfills legacy single-valve entries', () => {
+  assert.ok(/def _migrate_actuators_v1\(/.test(backendSrc),
+    v('Backend must define _migrate_actuators_v1 — the backfill '
+      + 'that upgrades legacy single-valve cell entries to carry '
+      + 'actuators[0] so every reader sees one shape.'))
+  assert.ok(/'cell_actuators_v1' in stamps/.test(backendSrc),
+    v('Migration must consult the cell_actuators_v1 stamp for '
+      + 'idempotence (never re-run against an already-migrated cell).'))
+  assert.ok(/'migrated_from':\s*'single_valve_v0'/.test(backendSrc),
+    v("Migrated actuator entries must carry "
+      + "'migrated_from': 'single_valve_v0' as a provenance tag — "
+      + 'a session that later audits the migration can distinguish '
+      + 'operator-written actuators from auto-filled ones.'))
+})
+
+test('new-profile-appears-in-program-wizard: save + getCell roundtrip', async () => {
+  // Simulate the end-to-end chain IN-MEMORY by mocking fetch:
+  //   1. EOATSetupWizard.CustomEOATFlow.finish() → saveCellEoat()
+  //      POST /api/cell/eoat with { name, actuators, sensor_count }
+  //   2. ProgramWizard tool step calls getCell() → GET /api/cell
+  //      → the entry we just posted is in cell.eoats.
+  const { saveCellEoat, getCell } = await import('../../src/lib/cellStore.js')
+
+  const stored = []
+  const originalFetch = global.fetch
+  global.fetch = async (url, opts) => {
+    if (url === '/api/cell/eoat' && opts && opts.method === 'POST') {
+      const entry = { ...JSON.parse(opts.body), id: 'eoat_t1',
+                      created_at: '2026-10-01T00:00:00Z' }
+      stored.push(entry)
+      return new Response(JSON.stringify({ ok: true, entry }),
+                          { status: 200 })
+    }
+    if (url === '/api/cell') {
+      return new Response(JSON.stringify({
+        ok: true, cell: { eoats: stored, fixtures: [], meta: {} },
+      }), { status: 200 })
+    }
+    throw new Error(`unmocked fetch: ${url}`)
+  }
+  try {
+    const payload = {
+      name: 'Dual Tool',
+      type: 'custom',
+      valve: 'V05',
+      inputs: ['IN01', 'IN02'],
+      actuators: [
+        { type: 'single_acting', hold_on_loss: false, valve: 'V05',
+          label: 'gripper' },
+        { type: 'vacuum',        hold_on_loss: false, valve: 'V10',
+          label: 'vacuum' },
+      ],
+      sensor_count: 2,
+    }
+    const saved = await saveCellEoat(payload)
+    assert.equal(saved.name, 'Dual Tool',
+      v('saveCellEoat must echo the saved entry back'))
+
+    // Program Wizard tool step would call getCell on mount.
+    const cell = await getCell()
+    const found = cell.eoats.find((e) => e.id === 'eoat_t1')
+    assert.ok(found,
+      v('Program Wizard getCell must see the EOAT the wizard just saved'))
+    assert.equal(found.actuators.length, 2,
+      v('Round-tripped entry must preserve all actuators'))
+    assert.deepEqual(found.actuators.map((a) => a.valve), ['V05', 'V10'],
+      v('Round-tripped entry must preserve per-actuator valves in order'))
+  } finally {
+    global.fetch = originalFetch
+  }
+})

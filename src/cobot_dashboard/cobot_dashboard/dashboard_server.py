@@ -10566,10 +10566,15 @@ if FASTAPI_AVAILABLE:
         stamp in meta.migrations prevents re-running."""
         stamps = set(cell.get('meta', {}).get('migrations') or [])
         if 'tools_library_seed_v1' in stamps:
+            # Even if the first-pass seed ran before actuators[]
+            # landed, backfill existing single-valve entries so the
+            # cell is actuators-shaped for every reader.
+            _migrate_actuators_v1(cell, stamps)
             return cell
         if cell['eoats']:
             stamps.add('tools_library_seed_v1')
             cell['meta']['migrations'] = sorted(stamps)
+            _migrate_actuators_v1(cell, stamps)
             return cell
         try:
             from . import tools_library
@@ -10595,7 +10600,49 @@ if FASTAPI_AVAILABLE:
             })
         stamps.add('tools_library_seed_v1')
         cell['meta']['migrations'] = sorted(stamps)
+        _migrate_actuators_v1(cell, stamps)
         return cell
+
+    def _migrate_actuators_v1(cell: dict, stamps: set) -> None:
+        """Backfill actuators[] on legacy single-valve entries.
+        Pre-2026-10-01 cell entries carried only `valve`; the
+        multi-actuator directive requires every entry carry an
+        actuators[] array so programs and the glow set can read the
+        same shape. Idempotent (stamp + per-entry no-op when the
+        field already exists)."""
+        if 'cell_actuators_v1' in stamps:
+            return
+        migrated = 0
+        for e in cell.get('eoats') or []:
+            if isinstance(e.get('actuators'), list) and e['actuators']:
+                continue
+            valve = e.get('valve')
+            t = str(e.get('type') or '').lower()
+            if not valve:
+                e['actuators'] = []
+                continue
+            # Vacuum type → vacuum actuator; everything else defaults
+            # to single-acting (spring-return) so the glow set stays
+            # legible without inventing a hold-on-loss answer the
+            # operator never gave.
+            act_type = 'vacuum' if t == 'vacuum' else 'single_acting'
+            label    = 'vacuum' if t == 'vacuum' else 'actuator'
+            e['actuators'] = [{
+                'type':         act_type,
+                'hold_on_loss': False,
+                'valve':        valve,
+                'label':        label,
+                'migrated_from': 'single_valve_v0',
+            }]
+            migrated += 1
+        stamps.add('cell_actuators_v1')
+        cell.setdefault('meta', {})['migrations'] = sorted(stamps)
+        if migrated:
+            cell['meta']['last_actuators_migration'] = {
+                'at':      time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                         time.gmtime()),
+                'migrated': migrated,
+            }
 
     def _cell_stable_id(prefix: str) -> str:
         import uuid
@@ -10622,16 +10669,50 @@ if FASTAPI_AVAILABLE:
         with _CELL_LOCK:
             cell = _read_cell()
             eid = body.get('id') or _cell_stable_id('eoat')
+            # Normalize actuators[] — each entry carries type +
+            # hold_on_loss + valve + optional label. Keep legacy
+            # `valve` field in sync with the first actuator for any
+            # reader that still consults the single-valve shape.
+            raw_acts = body.get('actuators') or []
+            actuators = []
+            if isinstance(raw_acts, list):
+                for a in raw_acts:
+                    if not isinstance(a, dict):
+                        continue
+                    actuators.append({
+                        'type':         a.get('type'),
+                        'hold_on_loss': bool(a.get('hold_on_loss'))
+                            if a.get('hold_on_loss') is not None else None,
+                        'valve':        a.get('valve'),
+                        'label':        a.get('label'),
+                    })
+            # Legacy single-valve body (no actuators[]): synthesize
+            # one actuator so cell readers see a single shape.
+            if not actuators and body.get('valve'):
+                t = str(body.get('type') or 'custom').lower()
+                actuators = [{
+                    'type':         ('vacuum' if t == 'vacuum'
+                                     else 'single_acting'),
+                    'hold_on_loss': False,
+                    'valve':        body.get('valve'),
+                    'label':        ('vacuum' if t == 'vacuum'
+                                     else 'actuator'),
+                }]
+            primary_valve = (
+                body.get('valve')
+                or (actuators[0].get('valve') if actuators else None))
             entry = {
-                'id':       eid,
-                'name':     str(body['name']),
-                'type':     str(body.get('type') or 'custom'),
-                'actuation': body.get('actuation'),
-                'valve':    body.get('valve'),
-                'inputs':   list(body.get('inputs') or []),
-                'outputs':  list(body.get('outputs') or []),
-                'tool_ref': body.get('tool_ref'),
-                'created_at': time.strftime(
+                'id':           eid,
+                'name':         str(body['name']),
+                'type':         str(body.get('type') or 'custom'),
+                'actuation':    body.get('actuation'),
+                'valve':        primary_valve,
+                'inputs':       list(body.get('inputs') or []),
+                'outputs':      list(body.get('outputs') or []),
+                'actuators':    actuators,
+                'sensor_count': body.get('sensor_count'),
+                'tool_ref':     body.get('tool_ref'),
+                'created_at':   time.strftime(
                     '%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             }
             existing = next((i for i, e in enumerate(cell['eoats'])

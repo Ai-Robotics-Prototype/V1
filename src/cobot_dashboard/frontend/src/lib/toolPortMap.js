@@ -85,32 +85,68 @@ export function getToolPortMap(toolKey) {
 // `config.assigned_inputs` (array of 'IN01'…'IN10'). Missing or
 // empty fields → return null so the wizard renders the
 // "finish your tool definition" notice instead of a blank map.
+//
+// Multi-actuator extension (2026-10-01 operator directive): a tool
+// may carry `config.actuators = [{ type, hold_on_loss, valve, label? }]`.
+// When present, EACH actuator contributes a valve to required_valves;
+// callouts name the actuator so the operator knows which coil they
+// are wiring. Legacy single-valve records are STILL honoured — their
+// `assigned_valve` field flows through unchanged for backward compat.
 export function resolvePersistedCustomToolPortMap(tool) {
   if (!tool || !tool.config) return null
   const name = tool.name || 'Custom EOAT'
-  const valve = tool.config.assigned_valve
-  const inputs = Array.isArray(tool.config.assigned_inputs)
-    ? tool.config.assigned_inputs.filter((s) => typeof s === 'string' && s)
+  const cfg = tool.config
+  const actuators = Array.isArray(cfg.actuators)
+    ? cfg.actuators.filter((a) => a && typeof a.valve === 'string' && a.valve)
     : []
-  const valveOk = typeof valve === 'string' && valve.length > 0
-  if (!valveOk && inputs.length === 0) return null
+  const inputs = Array.isArray(cfg.assigned_inputs)
+    ? cfg.assigned_inputs.filter((s) => typeof s === 'string' && s)
+    : []
+  // Legacy fallback: no actuators[] but assigned_valve set.
+  let valves = actuators.map((a) => a.valve)
+  if (valves.length === 0 && typeof cfg.assigned_valve === 'string'
+      && cfg.assigned_valve.length > 0) {
+    valves = [cfg.assigned_valve]
+  }
+  if (valves.length === 0 && inputs.length === 0) return null
   const callouts = {}
-  if (valveOk) callouts[valve] = `Connect ${name}'s air line to ${valve}`
+  const labelOverrides = {}
+  if (actuators.length > 0) {
+    actuators.forEach((a, i) => {
+      const actLabel = a.label
+        || _defaultActuatorLabel(a.type, i, actuators.length)
+      callouts[a.valve] =
+        `Connect ${name}'s ${actLabel} air line to ${a.valve}`
+      labelOverrides[a.valve] = actuators.length > 1
+        ? `${name} — ${actLabel}` : name
+    })
+  } else if (valves.length === 1) {
+    callouts[valves[0]] = `Connect ${name}'s air line to ${valves[0]}`
+    labelOverrides[valves[0]] = name
+  }
   inputs.forEach((id, i) => {
     callouts[id] = `Wire ${name}'s sensor #${i + 1} to ${id}`
   })
   return {
     key: `custom:${tool.id}`,
     label: name,
-    required_valves:  valveOk ? [valve] : [],
+    required_valves:  valves,
     required_inputs:  inputs,
     required_outputs: [],
     notes:
       `Wire ${name} per the assignments recorded when it was set `
       + 'up in the Custom EOAT flow.',
     callouts,
-    label_overrides: valveOk ? { [valve]: name } : {},
+    label_overrides: labelOverrides,
   }
+}
+
+function _defaultActuatorLabel(type, idx, total) {
+  if (total === 1) return 'actuator'
+  if (type === 'vacuum') return 'vacuum'
+  if (type === 'single_acting') return `actuator ${idx + 1} (single-acting)`
+  if (type === 'double_acting') return `actuator ${idx + 1} (double-acting)`
+  return `actuator ${idx + 1}`
 }
 
 // Given a live customs list from /api/tools, return the set of
@@ -118,13 +154,22 @@ export function resolvePersistedCustomToolPortMap(tool) {
 // EOAT flow can avoid recommending an already-assigned slot).
 // Each tool.config.assigned_valve holds the VALVE id it was
 // wired to at Custom-EOAT completion time; empty when the tool
-// hasn't been through the flow.
+// hasn't been through the flow. Multi-actuator tools contribute
+// EVERY valve in config.actuators[*].valve.
 export function assignedValveIds(customs) {
   const s = new Set()
   if (!Array.isArray(customs)) return s
   for (const t of customs) {
-    const v = t && t.config && t.config.assigned_valve
-    if (typeof v === 'string' && v) s.add(v)
+    const cfg = t && t.config
+    if (!cfg) continue
+    if (typeof cfg.assigned_valve === 'string' && cfg.assigned_valve) {
+      s.add(cfg.assigned_valve)
+    }
+    if (Array.isArray(cfg.actuators)) {
+      for (const a of cfg.actuators) {
+        if (a && typeof a.valve === 'string' && a.valve) s.add(a.valve)
+      }
+    }
   }
   return s
 }
@@ -142,10 +187,20 @@ export function assignedInputIds(customs) {
 
 // Runtime resolver for the Custom EOAT flow.
 //
-// Given the operator's answers (actuation type, hold-on-loss,
-// sensor count) + the current customs list, pick the first free
-// SPARE valve slot and the first N free IN ports; return a
-// full port record shaped like _FIXED entries.
+// Multi-actuator extension (2026-10-01 operator directive): the
+// `actuators` parameter is an array of { type, holdOnLoss?, label? }.
+// Each actuator gets its OWN free SPARE valve; recommend type lookup
+// runs per-actuator. The map callouts name the actuator so the
+// operator sees "Connect <tool>'s blow-off air line to V10", etc.
+//
+// Legacy single-actuation callers (actuation + holdOnLoss at top
+// level) still work — they collapse to actuators=[{type: actuation,
+// holdOnLoss}]. The returned record exposes both shapes:
+//   * required_valves (N ids) — union across all actuators
+//   * actuators[]        — [{ type, hold_on_loss, valve, label,
+//                            recommended_valve_type, why }]
+//   * recommended_valve_type / recommended_valve_why — FIRST
+//     actuator's values, kept for legacy single-actuator surfaces.
 //
 // Actuation → valve type recommendation:
 //   single_acting  → 5/2 SS   (spring-return; snaps home on power loss)
@@ -162,34 +217,48 @@ export function resolveCustomEOATRecord({
   toolName,
   actuation,
   holdOnLoss,
+  actuators,
   sensorCount = 0,
   customs = [],
 }) {
   const claimedValves = assignedValveIds(customs)
   const claimedInputs = assignedInputIds(customs)
 
-  // Recommended valve TYPE (from VALVE_TYPE_INFO copy — reuse the
-  // valve-info-panel language rather than duplicating it here).
-  const rec = recommendValveType(actuation, holdOnLoss)
+  // Normalize to actuators[] shape. Legacy callers pass a single
+  // actuation + holdOnLoss; new callers pass actuators[].
+  let acts = Array.isArray(actuators) && actuators.length > 0
+    ? actuators
+    : (actuation
+         ? [{ type: actuation, holdOnLoss }]
+         : [])
 
-  // Find the first SPARE slot that matches the recommended type
-  // AND isn't already claimed by another custom tool. SPARE slots
-  // are 'SPARE 1' + 'SPARE 2' in the shipped configuration; a
-  // future SPARE reallocation only edits SynapsePage data.
-  //
-  // Note: we look up SPARE-typed slots by iterating an in-file
-  // copy of the type map instead of pulling the whole VALVES
-  // array into this module (avoids a JSX-load side effect).
-  const spareTypes = new Set(['SPARE 1', 'SPARE 2'])
+  // Valves available for new allocation — SPARE slots that no OTHER
+  // custom tool has claimed. The flow walks actuators in order and
+  // assigns the next free SPARE to each electric-less actuator.
   const spareValveIds = ['V05', 'V10']
-  let assignedValve = null
-  if (rec) {
-    for (const v of spareValveIds) {
-      if (claimedValves.has(v)) continue
-      assignedValve = v
-      break
+  const freeSpares = spareValveIds.filter((v) => !claimedValves.has(v))
+
+  let spareCursor = 0
+  const resolvedActuators = acts.map((a, i) => {
+    const type = a.type
+    const hold = a.holdOnLoss ?? a.hold_on_loss
+    const rec = recommendValveType(type, hold)
+    const valve = rec ? (freeSpares[spareCursor++] || null) : null
+    const label = a.label
+      || _defaultActuatorLabel(type, i, acts.length)
+    return {
+      type,
+      hold_on_loss: hold ?? null,
+      valve,
+      label,
+      recommended_valve_type: rec ? rec.type : null,
+      recommended_valve_why:  rec ? rec.why  : null,
+      notes: rec ? rec.notes : null,
     }
-  }
+  })
+
+  const required_valves = resolvedActuators
+    .map((a) => a.valve).filter(Boolean)
 
   // First N free IN ports (IN01..IN10). Skip anything already
   // claimed by another custom tool.
@@ -201,39 +270,46 @@ export function resolveCustomEOATRecord({
   }
 
   const callouts = {}
-  if (assignedValve) {
-    callouts[assignedValve] =
-      `Connect the ${toolName || 'tool'}'s air line here`
-  }
+  const labelOverrides = {}
+  const typeOverrides  = {}
+  resolvedActuators.forEach((a) => {
+    if (!a.valve) return
+    callouts[a.valve] = acts.length > 1
+      ? `Connect the ${toolName || 'tool'}'s ${a.label} air line here`
+      : `Connect the ${toolName || 'tool'}'s air line here`
+    labelOverrides[a.valve] = acts.length > 1
+      ? `${toolName || 'Custom EOAT'} — ${a.label}`
+      : (toolName || 'Custom EOAT')
+    if (a.recommended_valve_type) {
+      typeOverrides[a.valve] = a.recommended_valve_type
+    }
+  })
   assignedInputs.forEach((id, i) => {
     callouts[id] = `Wire sensor #${i + 1} here (${sensorTypeCopy()})`
   })
+
+  // Legacy single-actuator surface (first actuator's values).
+  const first = resolvedActuators[0] || null
 
   return {
     key: 'custom',
     label: toolName || 'Custom EOAT',
     actuation,
     holdOnLoss,
+    actuators: resolvedActuators,
     sensorCount,
-    recommended_valve_type: rec ? rec.type : null,
-    recommended_valve_why: rec ? rec.why : null,
-    required_valves:  assignedValve ? [assignedValve] : [],
+    recommended_valve_type: first ? first.recommended_valve_type : null,
+    recommended_valve_why:  first ? first.recommended_valve_why  : null,
+    required_valves,
     required_inputs:  assignedInputs,
     required_outputs: [],
-    notes: rec
-      ? rec.notes
+    notes: first && first.notes
+      ? first.notes
       : 'Electric or no actuation — no valve required. Wire only '
         + 'the feedback sensors your controller reads directly.',
     callouts,
-    // Label overrides for the map: rename the SPARE slot to the
-    // tool's name so the map reads honestly after assignment.
-    label_overrides: assignedValve
-      ? { [assignedValve]: toolName || 'Custom EOAT' }
-      : {},
-    // And swap the SPARE type subtitle to the recommended type.
-    type_overrides: (assignedValve && rec)
-      ? { [assignedValve]: rec.type }
-      : {},
+    label_overrides: labelOverrides,
+    type_overrides: typeOverrides,
   }
 }
 

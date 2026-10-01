@@ -852,33 +852,39 @@ test('EOATSetupWizard renders SynapseConnectionMap in guidance mode', () => {
       + 'into the map so the highlight-driven glow works.'))
 })
 
-test('EOATSetupWizard has a Custom EOAT flow with 4 steps (name → actuation → sensors → review)', () => {
-  // 2026-09-22 tool-mass retirement: step 0 is now Tool name only
-  // (the retired Weight step contents merged its name field with a
-  // mass field; mass is deleted, name stays as its own step so the
-  // flow's back-path count is preserved).
+test('EOATSetupWizard has a Custom EOAT flow with 5 steps (name → actuator-count → per-actuator → sensors → review)', () => {
+  // 2026-10-01 multi-actuator extension: the single actuation step
+  // is split into an actuator-count step + a per-actuator walk. The
+  // retired `hardware-setup-custom-step-actuation` testid is replaced
+  // with step-actuator-count + step-actuators.
   for (const tid of [
     'hardware-setup-custom-flow',
     'hardware-setup-custom-step-name',
-    'hardware-setup-custom-step-actuation',
+    'hardware-setup-custom-step-actuator-count',
+    'hardware-setup-custom-step-actuators',
     'hardware-setup-custom-step-sensors',
     'hardware-setup-custom-step-summary',
   ]) {
     assert.ok(new RegExp(`data-testid="${tid}"`).test(wizardSrc),
       v(`Custom EOAT flow must expose data-testid="${tid}"`))
   }
-  // Retired mass testid must be GONE — no legacy surface hiding
-  // behind the new step name.
+  // Retired single-actuation testid is GONE — the directive splits
+  // actuation into count + per-actuator walk.
+  assert.equal(/data-testid="hardware-setup-custom-step-actuation"/
+                .test(wizardSrc), false,
+    v('Retired testid "hardware-setup-custom-step-actuation" must '
+      + 'not appear — the actuation question is split into '
+      + 'actuator-count + per-actuator steps 2026-10-01.'))
+  // Retired mass testid still gone.
   assert.equal(/data-testid="hardware-setup-custom-step-mass"/.test(wizardSrc),
     false,
     v('Retired testid "hardware-setup-custom-step-mass" must not '
       + 'appear — the Weight step is deleted 2026-09-22.'))
   // Back-paths intact: step 0's Back closes the picker (onBack),
-  // otherwise setStep(step - 1). Same predicate as pre-retirement.
+  // otherwise setStep(step - 1).
   assert.ok(/step === 0 \? onBack\(\) : setStep\(step - 1\)/.test(wizardSrc),
     v('Custom EOAT back button must remain `step === 0 ? onBack() : '
-      + 'setStep(step - 1)` — the renumbered step 0 still uses the '
-      + 'same back-to-picker path.'))
+      + 'setStep(step - 1)` — step 0 still back-paths to the picker.'))
 })
 
 test('no-mass-in-setup: no mass input, echo, warning, or gate anywhere in EOATSetupWizard', () => {
@@ -979,6 +985,38 @@ test('old-checklist-absent: HookupGuide component fully deleted (no orphan impor
     v('src/assets/hookup/hookup_panel_iso.svg must be deleted with HookupGuide.'))
 })
 
+test('old-checklist-absent-extended: GuidanceBlock renders no items-list "Hookup checklist"', () => {
+  // 2026-10-01 operator directive — the surviving mount inside
+  // GuidanceBlock (a per-port checkbox list under the map) is the
+  // "old checklist" the operator saw and wanted gone. The glowing
+  // map's callouts (labelOverrides on highlighted ports) are the
+  // sole wiring surface; a single confirm button in the parent is
+  // the only confirmation affordance. Grep CODE only — comments
+  // narrating the retire are allowed (historical narrative).
+  const codeOnly = wizardSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/([^:'"`])\/\/.*$/gm, '$1')
+  for (const forbidden of [
+    'hardware-setup-checklist',
+    'hardware-setup-checklist-item',
+    /Hookup checklist/,
+  ]) {
+    const pat = forbidden instanceof RegExp
+      ? forbidden
+      : new RegExp(`data-testid="${forbidden}"`)
+    assert.equal(pat.test(codeOnly), false,
+      v(`EOATSetupWizard code must NOT render ${forbidden} — the per-`
+        + `port checkbox list below the map was retired 2026-10-01 `
+        + `(directive: glowing map's per-connection callouts are the `
+        + `ONLY confirmation surface).`))
+  }
+  // Positive assertion: a single confirm button still exists.
+  assert.ok(/data-testid="hardware-setup-confirm"/.test(wizardSrc),
+    v('Guidance block must still expose ONE confirm button after the '
+      + 'checklist retirement — it is now the sole confirmation surface.'))
+})
+
 test('exactly-one wiring guide mounted in the built-in step', () => {
   // Only ONE affordance in the built-in / persisted-custom body:
   // <SynapseConnectionMap mode="guidance" ...> via GuidanceBlock.
@@ -1040,9 +1078,12 @@ test('per-tool glow set: custom EOAT resolves from persisted assignments', () =>
     v('resolvePersistedCustomToolPortMap must return null when both '
       + 'assigned_valve and assigned_inputs are missing.'))
   // Callouts must reference the tool NAME (per operator directive:
-  // "Connect <tool name>'s air line to Valve 05").
-  assert.ok(/callouts\[valve\]\s*=\s*`Connect \$\{name\}/.test(portMapSrc),
-    v('custom-tool callouts must name the tool (Connect <name>\'s '
+  // "Connect <tool name>'s air line to Valve 05"). The 2026-10-01
+  // multi-actuator refactor renamed `valve` → `a.valve` / `valves[0]`
+  // so the pin keyes on the backtick-template body, not the LHS var.
+  assert.ok(/`Connect \$\{name\}['`]s[^`]*air line to \$\{[^}]+\}`/
+              .test(portMapSrc),
+    v("custom-tool callouts must name the tool (Connect <name>'s "
       + 'air line to <valve>).'))
 })
 
@@ -1064,6 +1105,114 @@ test('wizard imports resolvePersistedCustomToolPortMap from lib/toolPortMap', ()
       + 'from ../lib/toolPortMap so the persisted-custom path derives '
       + 'its glow set from saved tool.config assignments.'))
 })
+
+
+// ── (2026-10-01) Actuator count + multi-valve ───────────────────────
+
+test('actuator-count-drives-n-valves: resolveCustomEOATRecord assigns one SPARE per actuator (grep pin)', () => {
+  // Static grep pin — lib/toolPortMap imports from pages/SynapsePage
+  // (JSX) so it can't be dynamically imported under node --test
+  // without a loader. Pin the invariants in source instead.
+  //
+  // 1) The function accepts `actuators` as a top-level parameter.
+  assert.ok(/export function resolveCustomEOATRecord\(\{[^}]*actuators/
+              .test(portMapSrc),
+    v('resolveCustomEOATRecord must accept an `actuators` parameter '
+      + '— the multi-actuator extension entry point.'))
+  // 2) Each actuator gets its OWN assigned valve.
+  assert.ok(/const\s+resolvedActuators\s*=\s*acts\.map/.test(portMapSrc),
+    v('resolveCustomEOATRecord must walk actuators via acts.map so each '
+      + 'actuator receives its own valve assignment.'))
+  // 3) required_valves unions every actuator valve.
+  assert.ok(/required_valves\s*=\s*resolvedActuators\s*\n?\s*\.map\(\(a\)\s*=>\s*a\.valve\)\.filter\(Boolean\)/
+              .test(portMapSrc),
+    v('required_valves must be built from resolvedActuators.map(a => a.valve) '
+      + '— the N-valve union with no silent drops.'))
+  // 4) spareCursor advances per allocation — no two actuators share a slot.
+  assert.ok(/freeSpares\[spareCursor\+\+\]/.test(portMapSrc),
+    v('Per-actuator allocation must cursor through freeSpares so each '
+      + 'actuator claims a DIFFERENT free SPARE.'))
+  // 5) assignedValveIds unions actuators[*].valve so a prior tool's
+  //    multi-valve claim is visible to the next allocation.
+  assert.ok(/if\s*\(Array\.isArray\(cfg\.actuators\)\)/.test(portMapSrc),
+    v('assignedValveIds must union actuators[*].valve claims — otherwise '
+      + 'multi-actuator tools silently collide with new allocations.'))
+})
+
+test('actuator-count UI: step exposes 1..4 buttons + contact-us copy', () => {
+  // Grep the mapper source — the N buttons are rendered from a map
+  // over the choices array, so there's one literal data-testid /
+  // data-count expression; verify the choices array covers 1..4 and
+  // the testid + data-count attributes are threaded through.
+  assert.ok(/\[1,\s*2,\s*3,\s*4\]\.map\(\(n\)/.test(wizardSrc),
+    v('Actuator-count step must iterate [1, 2, 3, 4] — the sane '
+      + 'bounds per operator directive (more → contact us copy).'))
+  assert.ok(/data-testid="custom-eoat-actuator-count"\s*\n\s*data-count=\{String\(n\)\}/
+              .test(wizardSrc),
+    v('Each count button must expose data-testid="custom-eoat-'
+      + 'actuator-count" + data-count={String(n)}.'))
+  assert.ok(/_ACTUATOR_MAX\s*=\s*4/.test(wizardSrc),
+    v('_ACTUATOR_MAX must be 4 (sane upper bound).'))
+  assert.ok(/data-testid="custom-eoat-actuator-count-contact"/.test(wizardSrc),
+    v('Actuator-count step must render the contact-us affordance '
+      + '(data-testid="custom-eoat-actuator-count-contact") when the '
+      + 'operator needs more than the max.'))
+  // Each actuator step renders a per-actuator card.
+  assert.ok(/data-testid="custom-eoat-actuator-card"/.test(wizardSrc),
+    v('Per-actuator step must render actuator cards '
+      + '(data-testid="custom-eoat-actuator-card").'))
+})
+
+
+// ── (2026-10-01) Standard-path sensor count ─────────────────────────
+
+test('standard-path-sensors: finger + vacuum render editable sensor count', () => {
+  assert.ok(/data-testid="hardware-setup-standard-sensors"/.test(wizardSrc),
+    v('Standard tool body must render the editable sensor-count '
+      + 'chooser (data-testid="hardware-setup-standard-sensors").'))
+  assert.ok(/_STANDARD_SENSOR_DEFAULTS\s*=\s*\{\s*finger:\s*2,\s*vacuum:\s*1\s*\}/
+              .test(wizardSrc),
+    v('Standard sensor defaults must be finger: 2, vacuum: 1 — the '
+      + 'typical glow set so tap-through workflows do not regress.'))
+  // The port-map derivation must consume the active count.
+  assert.ok(/_buildStandardPortMap\(\s*activeTool\.key/.test(wizardSrc),
+    v('guidancePortMap for finger/vacuum must call _buildStandardPortMap '
+      + 'with the active sensor count — not getToolPortMap directly.'))
+})
+
+
+// ── (2026-10-01) Confirm triggers save (standard + custom) ──────────
+
+test('confirm-triggers-save: standard confirm mirrors into the cell', () => {
+  assert.ok(/import\s*\{[^}]*saveCellEoat[^}]*\}\s*from\s*['"]\.\.\/lib\/cellStore['"]/
+              .test(wizardSrc),
+    v('EOATSetupWizard must import saveCellEoat from ../lib/cellStore '
+      + '— standard confirm is now a cell-mirror operation.'))
+  // Confirm handler calls saveCellEoat for the standard paths.
+  assert.ok(/toolKey === ['"]finger['"] \|\| toolKey === ['"]vacuum['"]/
+              .test(wizardSrc),
+    v('handleGuidanceConfirm must branch on finger/vacuum to call the '
+      + 'cell-mirror save.'))
+  assert.ok(/await\s+saveCellEoat\(/.test(wizardSrc),
+    v('handleGuidanceConfirm must await saveCellEoat so the cell is '
+      + 'written before the UI reports success.'))
+})
+
+test('confirm-triggers-save: CustomEOATFlow.finish writes a cell entry', () => {
+  // The CustomEOATFlow finish function must call saveCellEoat with
+  // actuators[] + sensor_count fields, not the retired no-op stub.
+  const flow = wizardSrc.match(
+    /function CustomEOATFlow\([\s\S]*?\n\}(?=\n\n)/)
+  assert.ok(flow, v('CustomEOATFlow function must exist in EOATSetupWizard'))
+  const body = flow[0]
+  assert.ok(/await\s+saveCellEoat\(/.test(body),
+    v('CustomEOATFlow.finish must await saveCellEoat(entry) — the '
+      + '"FRONTEND-only, no POST" stub is retired 2026-10-01.'))
+  assert.ok(/actuators:/.test(body) && /sensor_count:/.test(body),
+    v('Saved cell entry payload must include actuators + sensor_count '
+      + '— the schema the backend persists.'))
+})
+
 
 function _exists(p) {
   try { readFileSync(p); return true } catch { return false }

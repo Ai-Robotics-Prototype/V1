@@ -10,6 +10,9 @@ import {
   resolveCustomEOATRecord,
   resolvePersistedCustomToolPortMap,
 } from '../lib/toolPortMap'
+import {
+  getCell, saveCellEoat,
+} from '../lib/cellStore'
 
 // Standalone EOAT Setup wizard.
 //
@@ -60,6 +63,12 @@ const BUILT_IN = [
     desc: 'Walk through the setup for a tool that is not in this list — mass, actuation type, sensors.' },
 ]
 
+// Sensible defaults for the built-in paths (operator can lower
+// toward 0 or raise toward the max). Keeps the pre-directive glow
+// set unchanged for operators who tap through without editing.
+const _STANDARD_SENSOR_DEFAULTS = { finger: 2, vacuum: 1 }
+const _STANDARD_SENSOR_MAX      = { finger: 3, vacuum: 3 }
+
 export default function EOATSetupWizard({
   onClose, initialToolKey = null, readOnly = false,
 }) {
@@ -71,6 +80,12 @@ export default function EOATSetupWizard({
   const [busy, setBusy]           = useState(false)
   const [error, setError]         = useState(null)
   const [savedAt, setSavedAt]     = useState(null)
+  // Standard-path sensor count — editable 0..max per tool key; the
+  // directive asks the standard gripper/vacuum paths to let the
+  // operator change the sensor count instead of hard-coding it.
+  // Keyed by toolKey so flipping between finger and vacuum retains
+  // their own answer.
+  const [standardSensors, setStandardSensors] = useState({})
 
   useEffect(() => {
     let alive = true
@@ -131,21 +146,38 @@ export default function EOATSetupWizard({
   //                     missing/empty the block renders an incomplete
   //                     notice instead of a blank map.
   //   custom_new      → handled by CustomEOATFlow (its own render)
+  const activeStandardSensorCount = useMemo(() => {
+    if (!activeTool) return null
+    const key = activeTool.key
+    if (key !== 'finger' && key !== 'vacuum') return null
+    const override = standardSensors[key]
+    if (typeof override === 'number' && override >= 0) return override
+    return _STANDARD_SENSOR_DEFAULTS[key] ?? 0
+  }, [activeTool, standardSensors])
+
   const guidancePortMap = useMemo(() => {
     if (!activeTool) return null
     if (activeTool.key === 'custom_new') return null
-    if (activeTool.key === 'finger') return getToolPortMap('finger')
-    if (activeTool.key === 'vacuum') return getToolPortMap('vacuum')
+    if (activeTool.key === 'finger' || activeTool.key === 'vacuum') {
+      return _buildStandardPortMap(activeTool.key,
+        activeStandardSensorCount)
+    }
     if (activeTool.key.startsWith('custom:')) {
       const tool = customs.find((c) => c.id === activeTool.tool_id)
       return resolvePersistedCustomToolPortMap(tool)
     }
     return null
-  }, [activeTool, customs])
+  }, [activeTool, customs, activeStandardSensorCount])
 
   // Empty confirm — the tick-offs live on the map's callout list,
   // no per-input no-sensor/optional detail collected here anymore
   // (the retired HookupGuide owned those maps).
+  //
+  // Standard-path confirmation now ALSO writes a cell entry so the
+  // program wizard's tool picker shows this tool as a card. Custom-
+  // persisted paths (toolKey = 'custom:<id>') keep writing the
+  // legacy /api/tools confirmToolHookup record; the Custom EOAT
+  // flow writes its own cell entry at finish().
   async function handleGuidanceConfirm() {
     if (!toolKey || toolKey === 'custom_new') return
     setBusy(true); setError(null)
@@ -154,6 +186,23 @@ export default function EOATSetupWizard({
         { noSensor: {}, optional: {} })
       setRecord(rec)
       setSavedAt(rec && rec.confirmed_at)
+      // Mirror the confirmation into the cell for finger/vacuum
+      // so the Program Wizard's tool-step shows this tool as a
+      // card immediately after confirmation.
+      if (toolKey === 'finger' || toolKey === 'vacuum') {
+        try {
+          const sensors = activeStandardSensorCount ?? 0
+          const port = _buildStandardPortMap(toolKey, sensors)
+          const entry = _standardCellEntry({
+            toolKey, port, sensorCount: sensors,
+          })
+          await saveCellEoat(entry)
+        } catch (ce) {
+          // Soft failure — the legacy confirm already succeeded.
+          setError(`Saved tool, but cell mirror failed: ${
+            String(ce && ce.message || ce)}`)
+        }
+      }
     } catch (e) {
       setError(String(e && e.message || e))
     } finally {
@@ -277,6 +326,18 @@ export default function EOATSetupWizard({
 
             {guidancePortMap && (
               <>
+                {(activeTool.key === 'finger'
+                    || activeTool.key === 'vacuum') && (
+                  <StandardSensorCount
+                    toolKey={activeTool.key}
+                    value={activeStandardSensorCount ?? 0}
+                    max={_STANDARD_SENSOR_MAX[activeTool.key] || 3}
+                    disabled={readOnly}
+                    onChange={(n) => setStandardSensors((prev) => ({
+                      ...prev, [activeTool.key]: n,
+                    }))}
+                  />
+                )}
                 <GuidanceBlock port={guidancePortMap} />
                 {!readOnly && (
                   <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
@@ -389,20 +450,16 @@ function ToolChoice({ tool, onPick }) {
   )
 }
 
-// ── Guidance block — map + checklist + notes ────────────────────────
+// ── Guidance block — map + notes ────────────────────────────────────
+//
+// 2026-10-01 operator directive: the duplicate "Hookup checklist"
+// (checkbox items[] list that used to render below the map) is
+// RETIRED. The glowing map carries the per-connection callouts via
+// labelOverrides + the type pill — one surface, one confirmation
+// button in the parent. See old-checklist-absent pin in
+// D_synapse_tab.test.js for the no-regression grep.
 
 export function GuidanceBlock({ port }) {
-  const [ticked, setTicked] = useState(() => new Set())
-  const toggle = (key) => setTicked((prev) => {
-    const next = new Set(prev)
-    if (next.has(key)) next.delete(key); else next.add(key)
-    return next
-  })
-  const items = [
-    ...(port.required_valves  || []).map((id) => ({ id, kind: 'valve' })),
-    ...(port.required_inputs  || []).map((id) => ({ id, kind: 'input' })),
-    ...(port.required_outputs || []).map((id) => ({ id, kind: 'output' })),
-  ]
   const highlight = {
     valves:  port.required_valves  || [],
     inputs:  port.required_inputs  || [],
@@ -427,45 +484,55 @@ export function GuidanceBlock({ port }) {
         labelOverrides={port.label_overrides || {}}
         typeOverrides={port.type_overrides || {}}
       />
-      {items.length > 0 && (
-        <div data-testid="hardware-setup-checklist" style={{
-          marginTop: 12, padding: 12,
-          border: '1px solid #E5E7EB', borderRadius: 8,
-          background: '#FAFAFA',
-        }}>
-          <div style={{
-            fontSize: 11, fontWeight: 700, letterSpacing: 0.5,
-            textTransform: 'uppercase', color: '#6B7280',
-            marginBottom: 8,
-          }}>
-            Hookup checklist
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {items.map((it) => {
-              const on = ticked.has(it.id)
-              const callout = (port.callouts && port.callouts[it.id])
-                || `Wire ${it.id}`
-              return (
-                <label key={it.id}
-                       data-testid="hardware-setup-checklist-item"
-                       data-port-id={it.id}
-                       data-checked={String(on)}
-                       style={{
-                         display: 'flex', alignItems: 'center',
-                         gap: 10, cursor: 'pointer',
-                         fontSize: 13, color: '#374151',
-                       }}>
-                  <input type="checkbox" checked={on}
-                         onChange={() => toggle(it.id)} />
-                  <span style={{ fontFamily: 'inherit' }}>
-                    <b>{it.id}</b> — {callout}
-                  </span>
-                </label>
-              )
-            })}
-          </div>
-        </div>
-      )}
+    </div>
+  )
+}
+
+// Standard-path sensor-count chooser (2026-10-01 directive). The
+// built-in finger + vacuum paths now let the operator pick a sensor
+// count instead of hard-coding one. Defaults are preselected
+// (finger: 2 limit switches, vacuum: 1 vacuum switch) so a tap-
+// through workflow lands on the same glow set as before.
+function StandardSensorCount({ toolKey, value, max, disabled, onChange }) {
+  const choices = []
+  for (let n = 0; n <= Math.min(max, 3); n++) choices.push(n)
+  return (
+    <div data-testid="hardware-setup-standard-sensors"
+         data-tool-key={toolKey}
+         data-count={String(value)}
+         style={{
+           padding: '10px 12px', marginBottom: 12,
+           background: '#F9FAFB', border: '1px solid #E5E7EB',
+           borderRadius: 6, color: '#374151',
+         }}>
+      <div style={{ fontSize: 13, marginBottom: 6 }}>
+        How many feedback sensors does this tool have?{' '}
+        <span style={{ color: '#6B7280' }}>
+          (default {_STANDARD_SENSOR_DEFAULTS[toolKey] ?? 0} —
+          typical for this tool)
+        </span>
+      </div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        {choices.map((n) => (
+          <button
+            key={n}
+            data-testid="hardware-setup-standard-sensor-count"
+            data-count={String(n)}
+            disabled={disabled}
+            onClick={() => onChange(n)}
+            style={{
+              padding: '6px 12px', fontSize: 13, fontWeight: 700,
+              background: value === n ? '#DBEAFE' : '#fff',
+              color:      value === n ? '#1E40AF' : '#374151',
+              border: `1px solid ${value === n ? '#2563EB' : '#d1d5db'}`,
+              borderRadius: 6,
+              cursor: disabled ? 'not-allowed' : 'pointer',
+              fontFamily: 'inherit', opacity: disabled ? 0.55 : 1,
+            }}>
+            {n}
+          </button>
+        ))}
+      </div>
     </div>
   )
 }
@@ -479,48 +546,97 @@ export function GuidanceBlock({ port }) {
 // per-tool payload correction is needed later, it lives on the
 // tool record (tools_library.update_payload), not in a setup step.
 
+// Flow steps (2026-10-01 operator directive — actuator count +
+// per-actuator walkthrough):
+//   0 — Tool name
+//   1 — Actuator count ("How many air-driven actions does this
+//                        tool have?", 1-4; more → contact us copy)
+//   2 — Per-actuator loop (type + hold-on-loss where relevant);
+//        rendered as a single step with N inline sub-cards so the
+//        operator sees every actuator at once instead of a
+//        setStep flicker.
+//   3 — Sensors
+//   4 — Review (summary + save to cell)
+const _ACTUATOR_MAX = 4
+
 function CustomEOATFlow({ customs, onBack, onClose }) {
   const [step, setStep]  = useState(0)
   const [name, setName]  = useState('')
-  const [actuation, setActuation]  = useState('')
-  const [holdOnLoss, setHoldOnLoss] = useState(null) // null | true | false
+  const [actuatorCount, setActuatorCount] = useState(1)
+  // actuators[i] = { type, holdOnLoss | null }. Length always
+  // matches actuatorCount — we resize on count change so index
+  // stability is preserved.
+  const [actuators, setActuators] = useState([{ type: '', holdOnLoss: null }])
   const [sensorCount, setSensorCount] = useState(0)
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState(null)
   const [savedName, setSavedName] = useState(null)
 
+  function _setActuatorCount(n) {
+    const bounded = Math.max(1, Math.min(_ACTUATOR_MAX, n))
+    setActuatorCount(bounded)
+    setActuators((prev) => {
+      const next = [...prev]
+      while (next.length < bounded) next.push({ type: '', holdOnLoss: null })
+      next.length = bounded
+      return next
+    })
+  }
+  function _patchActuator(i, patch) {
+    setActuators((prev) => prev.map((a, j) =>
+      (i === j ? { ...a, ...patch } : a)))
+  }
+
   const resolved = useMemo(() => resolveCustomEOATRecord({
     toolName: name || 'Custom EOAT',
-    actuation,
-    holdOnLoss: !!holdOnLoss,
+    actuators,
     sensorCount,
     customs,
-  }), [name, actuation, holdOnLoss, sensorCount, customs])
+  }), [name, actuators, sensorCount, customs])
+
+  const perActuatorReady = actuators.every((a) =>
+    a.type && (a.type !== 'double_acting' || a.holdOnLoss !== null))
 
   const canAdvance = (
     step === 0 ? name.trim().length > 0
-    : step === 1 ? (actuation
-                     && (actuation !== 'double_acting' || holdOnLoss !== null))
-    : step === 2 ? true
+    : step === 1 ? actuatorCount >= 1 && actuatorCount <= _ACTUATOR_MAX
+    : step === 2 ? perActuatorReady
+    : step === 3 ? true
     : true
   )
 
   async function finish() {
     setSaving(true); setSaveErr(null)
-    // FRONTEND-only ship: no /api/tools POST from this flow — the
-    // operator directive requires "wizard data only". Persisting
-    // to the backend catalog is a follow-on directive; here we
-    // return a locally-complete tool record for downstream reads
-    // once the persist wire lands. The summary renders regardless.
-    setSaving(false)
-    setSavedName(name)
+    try {
+      const entry = {
+        name: name.trim(),
+        type: 'custom',
+        valve: resolved.required_valves[0] || null,
+        inputs: resolved.required_inputs || [],
+        outputs: [],
+        actuators: (resolved.actuators || []).map((a) => ({
+          type: a.type,
+          hold_on_loss: a.hold_on_loss,
+          valve: a.valve,
+          label: a.label,
+        })),
+        sensor_count: sensorCount,
+      }
+      await saveCellEoat(entry)
+      setSavedName(name)
+    } catch (e) {
+      setSaveErr(String(e && e.message || e))
+    } finally {
+      setSaving(false)
+    }
   }
 
   const stepTitle = [
     '1. Tool name',
-    '2. Actuation type',
-    '3. Sensors',
-    '4. Review',
+    '2. How many actuators?',
+    '3. Set up each actuator',
+    '4. Sensors',
+    '5. Review',
   ][step]
 
   const wrap = { display: 'flex', flexDirection: 'column', gap: 14 }
@@ -581,98 +697,66 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
       )}
 
       {step === 1 && (
-        <div data-testid="hardware-setup-custom-step-actuation"
+        <div data-testid="hardware-setup-custom-step-actuator-count"
              style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ fontSize: 13, color: '#374151' }}>
-            How does the tool actuate?
+            How many air-driven actions does this tool have?{' '}
+            <span style={{ color: '#6B7280' }}>
+              (A gripper that also has a blow-off = 2.
+              A gripper with no extras = 1.)
+            </span>
           </div>
-          <ActuationChoice
-            value={actuation} onChange={setActuation}
-            options={[
-              { key: 'single_acting',
-                label: 'Pneumatic — single-acting (spring return)',
-                desc: 'One coil + spring; snaps to home on power loss.' },
-              { key: 'double_acting',
-                label: 'Pneumatic — double-acting (two coils)',
-                desc: 'Two coils; holds last position or snaps home '
-                      + 'depending on which valve you pick.' },
-              { key: 'vacuum',
-                label: 'Vacuum',
-                desc: 'Uses a 3/2 Normally Closed valve; default off, '
-                      + 'pulse to draw vacuum.' },
-              { key: 'electric_none',
-                label: 'Electric / no actuation',
-                desc: 'No pneumatic valve required (motor-driven, '
-                      + 'sensor-only, or passive tool).' },
-            ]}
-          />
-          {actuation === 'double_acting' && (
-            <div data-testid="custom-eoat-hold-question"
-                 style={{
-                   padding: 12,
-                   background: '#F9FAFB',
-                   border: '1px solid #E5E7EB', borderRadius: 8,
-                 }}>
-              <div style={{ fontSize: 13, fontWeight: 600,
-                            color: '#111827', marginBottom: 6 }}>
-                Should the tool HOLD its grip if power or air is lost?
-              </div>
-              <div style={{ fontSize: 12, color: '#6B7280',
-                            marginBottom: 10 }}>
-                Choose "Yes" if letting go would drop a part or
-                damage something. Choose "No" if you want the tool
-                to release automatically when power drops (safer for
-                anything grabbing a person or a fragile item).
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button
-                  data-testid="custom-eoat-hold-yes"
-                  onClick={() => setHoldOnLoss(true)}
-                  style={{
-                    ...btnGhost,
-                    background: holdOnLoss === true ? '#DCFCE7' : '#fff',
-                    borderColor: holdOnLoss === true ? '#22C55E' : '#d1d5db',
-                  }}>
-                  Yes — hold last position (5/2 DS)
-                </button>
-                <button
-                  data-testid="custom-eoat-hold-no"
-                  onClick={() => setHoldOnLoss(false)}
-                  style={{
-                    ...btnGhost,
-                    background: holdOnLoss === false ? '#DBEAFE' : '#fff',
-                    borderColor: holdOnLoss === false ? '#2563EB' : '#d1d5db',
-                  }}>
-                  No — snap home on loss (5/2 SS)
-                </button>
-              </div>
-            </div>
-          )}
-          {resolved && resolved.recommended_valve_type && (
-            <div data-testid="custom-eoat-actuation-rec"
-                 style={{
-                   padding: '10px 12px', background: '#EFF6FF',
-                   border: '1px solid #BFDBFE', borderRadius: 6,
-                   color: '#1E3A8A', fontSize: 13, lineHeight: 1.5,
-                 }}>
-              <b>Recommended valve:</b> {resolved.recommended_valve_type}.
-              <br />
-              <span style={{ color: '#374151' }}>
-                Why: {resolved.recommended_valve_why}
-              </span>
-              {resolved.required_valves.length > 0 && (
-                <div style={{ marginTop: 6 }}>
-                  Free SPARE slot on your map: <b>
-                    {resolved.required_valves[0]}
-                  </b>.
-                </div>
-              )}
-            </div>
-          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            {[1, 2, 3, 4].map((n) => (
+              <button
+                key={n}
+                data-testid="custom-eoat-actuator-count"
+                data-count={String(n)}
+                onClick={() => _setActuatorCount(n)}
+                style={{
+                  padding: '10px 16px', fontSize: 14, fontWeight: 700,
+                  background: actuatorCount === n ? '#DBEAFE' : '#fff',
+                  color: actuatorCount === n ? '#1E40AF' : '#374151',
+                  border: `1px solid ${actuatorCount === n ? '#2563EB' : '#d1d5db'}`,
+                  borderRadius: 8, cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}>
+                {n}
+              </button>
+            ))}
+          </div>
+          <div data-testid="custom-eoat-actuator-count-contact"
+               style={{ fontSize: 12, color: '#6B7280' }}>
+            Need more than {_ACTUATOR_MAX}? Contact us — we'll
+            help route the extra valves off a bigger manifold.
+          </div>
         </div>
       )}
 
       {step === 2 && (
+        <div data-testid="hardware-setup-custom-step-actuators"
+             style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ fontSize: 13, color: '#374151' }}>
+            Walk through each air-driven action — pick its type
+            (and, if it's double-acting, whether it should hold on
+            power loss). We'll assign each one its own valve from
+            the free SPARE slots on your Synapse map.
+          </div>
+          {actuators.map((a, i) => (
+            <ActuatorCard
+              key={i}
+              index={i}
+              total={actuators.length}
+              value={a}
+              resolved={resolved.actuators?.[i] || null}
+              onChange={(patch) => _patchActuator(i, patch)}
+              btnGhost={btnGhost}
+            />
+          ))}
+        </div>
+      )}
+
+      {step === 3 && (
         <div data-testid="hardware-setup-custom-step-sensors"
              style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ fontSize: 13, color: '#374151' }}>
@@ -716,7 +800,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
         </div>
       )}
 
-      {step === 3 && (
+      {step === 4 && (
         <div data-testid="hardware-setup-custom-step-summary"
              style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div style={{
@@ -725,16 +809,16 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
             fontSize: 13, color: '#111827', lineHeight: 1.6,
           }}>
             <div><b>Tool:</b> {name || '(unnamed)'}</div>
-            <div><b>Actuation:</b> {actuation || '—'}
-              {actuation === 'double_acting' && ` (hold-on-loss: ${
-                holdOnLoss ? 'yes' : 'no'})`}
-            </div>
-            <div><b>Valve:</b>{' '}
-              {resolved.recommended_valve_type
-                ? `${resolved.recommended_valve_type}` : 'none required'}
-              {resolved.required_valves.length > 0
-                && ` on ${resolved.required_valves[0]}`}
-            </div>
+            <div><b>Actuators:</b> {actuators.length}</div>
+            {(resolved.actuators || []).map((a, i) => (
+              <div key={i} data-testid="custom-eoat-summary-actuator"
+                   style={{ marginLeft: 12 }}>
+                • {a.label}: {a.recommended_valve_type || 'no valve'}
+                {a.valve ? ` on ${a.valve}` : ''}
+                {a.type === 'double_acting'
+                  && ` (hold-on-loss: ${a.hold_on_loss ? 'yes' : 'no'})`}
+              </div>
+            ))}
             <div><b>Sensors:</b> {sensorCount}
               {resolved.required_inputs.length > 0
                 && ` on ${resolved.required_inputs.join(', ')}`}
@@ -748,8 +832,9 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
                    border: '1px solid #6EE7B7', borderRadius: 6,
                    color: '#065F46', fontSize: 12,
                  }}>
-              Custom EOAT "{savedName}" saved. Persistence to the
-              tool catalog will land in a follow-on session.
+              Custom EOAT "{savedName}" saved to the cell. It will
+              appear in the Program Wizard's tool picker on the
+              next step.
             </div>
           )}
           {saveErr && (
@@ -768,7 +853,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
         display: 'flex', gap: 8, justifyContent: 'flex-end',
         marginTop: 10,
       }}>
-        {step < 3 && (
+        {step < 4 && (
           <button
             data-testid="hardware-setup-custom-next"
             style={{
@@ -781,7 +866,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
             Next →
           </button>
         )}
-        {step === 3 && !savedName && (
+        {step === 4 && !savedName && (
           <button
             data-testid="hardware-setup-custom-finish"
             style={btnPrim}
@@ -790,12 +875,122 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
             {saving ? 'Saving…' : 'Finish'}
           </button>
         )}
-        {step === 3 && savedName && (
+        {step === 4 && savedName && (
           <button style={btnPrim} onClick={onClose}>
             Done
           </button>
         )}
       </div>
+    </div>
+  )
+}
+
+function ActuatorCard({
+  index, total, value, resolved, onChange, btnGhost,
+}) {
+  const options = [
+    { key: 'single_acting',
+      label: 'Pneumatic — single-acting (spring return)',
+      desc: 'One coil + spring; snaps to home on power loss.' },
+    { key: 'double_acting',
+      label: 'Pneumatic — double-acting (two coils)',
+      desc: 'Two coils; holds last position or snaps home '
+            + 'depending on which valve you pick.' },
+    { key: 'vacuum',
+      label: 'Vacuum',
+      desc: 'Uses a 3/2 Normally Closed valve; default off, '
+            + 'pulse to draw vacuum.' },
+    { key: 'electric_none',
+      label: 'Electric / no actuation',
+      desc: 'No pneumatic valve required (motor-driven, '
+            + 'sensor-only, or passive tool).' },
+  ]
+  return (
+    <div data-testid="custom-eoat-actuator-card"
+         data-actuator-index={String(index)}
+         style={{
+           padding: 12, background: '#fff',
+           border: '1px solid #E5E7EB', borderRadius: 8,
+         }}>
+      <div style={{
+        fontSize: 12, fontWeight: 700, letterSpacing: 0.4,
+        textTransform: 'uppercase', color: '#6B7280',
+        marginBottom: 8,
+      }}>
+        Actuator {index + 1} of {total}
+      </div>
+      <ActuationChoice
+        value={value.type}
+        onChange={(t) => onChange({ type: t,
+          holdOnLoss: t === 'double_acting' ? value.holdOnLoss : null })}
+        options={options}
+      />
+      {value.type === 'double_acting' && (
+        <div data-testid="custom-eoat-hold-question"
+             data-actuator-index={String(index)}
+             style={{
+               marginTop: 10, padding: 12,
+               background: '#F9FAFB',
+               border: '1px solid #E5E7EB', borderRadius: 8,
+             }}>
+          <div style={{ fontSize: 13, fontWeight: 600,
+                        color: '#111827', marginBottom: 6 }}>
+            Should this actuator HOLD its position if power or air
+            is lost?
+          </div>
+          <div style={{ fontSize: 12, color: '#6B7280',
+                        marginBottom: 10 }}>
+            Choose "Yes" if letting go would drop a part or damage
+            something. Choose "No" if you want it to release
+            automatically when power drops.
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              data-testid="custom-eoat-hold-yes"
+              data-actuator-index={String(index)}
+              onClick={() => onChange({ holdOnLoss: true })}
+              style={{
+                ...btnGhost,
+                background: value.holdOnLoss === true ? '#DCFCE7' : '#fff',
+                borderColor: value.holdOnLoss === true ? '#22C55E' : '#d1d5db',
+              }}>
+              Yes — hold last position (5/2 DS)
+            </button>
+            <button
+              data-testid="custom-eoat-hold-no"
+              data-actuator-index={String(index)}
+              onClick={() => onChange({ holdOnLoss: false })}
+              style={{
+                ...btnGhost,
+                background: value.holdOnLoss === false ? '#DBEAFE' : '#fff',
+                borderColor: value.holdOnLoss === false ? '#2563EB' : '#d1d5db',
+              }}>
+              No — snap home on loss (5/2 SS)
+            </button>
+          </div>
+        </div>
+      )}
+      {resolved && resolved.recommended_valve_type && (
+        <div data-testid="custom-eoat-actuation-rec"
+             data-actuator-index={String(index)}
+             style={{
+               marginTop: 10,
+               padding: '10px 12px', background: '#EFF6FF',
+               border: '1px solid #BFDBFE', borderRadius: 6,
+               color: '#1E3A8A', fontSize: 13, lineHeight: 1.5,
+             }}>
+          <b>Recommended valve:</b> {resolved.recommended_valve_type}.
+          <br />
+          <span style={{ color: '#374151' }}>
+            Why: {resolved.recommended_valve_why}
+          </span>
+          {resolved.valve && (
+            <div style={{ marginTop: 6 }}>
+              Free SPARE slot on your map: <b>{resolved.valve}</b>.
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -836,4 +1031,78 @@ function _formatDate(iso) {
     return d.toLocaleDateString(undefined,
       { year: 'numeric', month: 'short', day: 'numeric' })
   } catch { return iso }
+}
+
+// Build the standard-path glow set with an editable sensor count.
+// Trims / extends the fixed table's required_inputs list to match
+// the operator's chosen count, keeping call-outs for the inputs
+// that remain. The valve + its callout are unchanged.
+function _buildStandardPortMap(toolKey, sensorCount) {
+  const base = getToolPortMap(toolKey)
+  if (!base) return null
+  const n = Math.max(0, Math.min(sensorCount || 0,
+    _STANDARD_SENSOR_MAX[toolKey] || 3))
+  const baseInputs = base.required_inputs || []
+  let inputs
+  if (n <= baseInputs.length) {
+    inputs = baseInputs.slice(0, n)
+  } else {
+    // Extend from the first free IN not already in the list.
+    inputs = [...baseInputs]
+    for (let i = 1; i <= 10 && inputs.length < n; i++) {
+      const id = `IN${String(i).padStart(2, '0')}`
+      if (!inputs.includes(id)) inputs.push(id)
+    }
+  }
+  const callouts = {}
+  // Preserve the valve callout from the fixed table.
+  for (const [k, v] of Object.entries(base.callouts || {})) {
+    if (inputs.includes(k) || (base.required_valves || []).includes(k)) {
+      callouts[k] = v
+    }
+  }
+  // Any extended inputs get a generic callout so the map still
+  // reads cleanly below the fixed-table rows.
+  for (const id of inputs) {
+    if (!callouts[id]) callouts[id] = `Wire sensor on ${id}`
+  }
+  return {
+    ...base,
+    required_inputs: inputs,
+    callouts,
+  }
+}
+
+// Project a standard-path confirmation into a cell.eoats entry. The
+// stable id lets re-confirmation update in place instead of adding
+// a duplicate card. Legacy single-valve shape preserved alongside
+// the new actuators[] array so cellStore and the program wizard
+// can read either.
+function _standardCellEntry({ toolKey, port, sensorCount }) {
+  const name = toolKey === 'finger'
+    ? 'Finger Gripper'
+    : toolKey === 'vacuum'
+      ? 'Vacuum Suction'
+      : 'EOAT'
+  const valve = (port.required_valves || [])[0] || null
+  const inputs = Array.from(port.required_inputs || [])
+  const actuators = valve
+    ? [{
+        type: toolKey === 'vacuum' ? 'vacuum' : 'single_acting',
+        hold_on_loss: false,
+        valve,
+        label: toolKey === 'vacuum' ? 'vacuum' : 'actuator',
+      }]
+    : []
+  return {
+    id:       `standard:${toolKey}`,
+    name,
+    type:     toolKey,
+    valve,
+    inputs,
+    outputs:  [],
+    actuators,
+    sensor_count: sensorCount,
+    tool_ref: null,
+  }
 }

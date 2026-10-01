@@ -85,6 +85,13 @@ export function cellClaimedPorts(cell) {
   const outputs = new Set()
   for (const e of c.eoats || []) {
     if (e.valve) valves.add(e.valve)
+    // Multi-actuator (2026-10-01): every actuator carries its own
+    // valve, so claim the union across the whole array.
+    if (Array.isArray(e.actuators)) {
+      for (const a of e.actuators) {
+        if (a && a.valve) valves.add(a.valve)
+      }
+    }
     for (const i of e.inputs || []) inputs.add(i)
     for (const o of e.outputs || []) outputs.add(o)
   }
