@@ -416,7 +416,14 @@ test('MyCellSection is mounted on the Synapse page', () => {
     v('SynapsePage must render <MyCellSection />'))
 })
 
-test('MyCellSection is VIEW-tier: no writes, no /cmd/, no dispatchEvent', () => {
+test('MyCellSection is runtime-safe: no /cmd/, no dispatchEvent, no literal POST/DELETE string', () => {
+  // 2026-10-01 operator directive moved rename + delete into My Cell;
+  // the view calls saveCellEoat / deleteCellEoat from lib/cellStore
+  // (which own the literal `method:` strings). This pin keeps the
+  // runtime-safety invariants intact: no control-plane calls, no
+  // dispatchEvent escape hatch, no localStorage writes, and no
+  // literal `method: 'POST'` string sneaking back into the view —
+  // writes still flow through the vetted cellStore helpers.
   const codeOnly = myCellSrc
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/.*$/gm, '')
@@ -425,12 +432,13 @@ test('MyCellSection is VIEW-tier: no writes, no /cmd/, no dispatchEvent', () => 
     { pat: /\/cmd\//, label: '/cmd/' },
     { pat: /dispatchEvent\s*\(/, label: 'dispatchEvent()' },
     { pat: /method:\s*['"](POST|PUT|DELETE|PATCH)['"]/,
-      label: 'POST/PUT/DELETE/PATCH method' },
+      label: 'literal method: "POST/PUT/DELETE/PATCH" (route through cellStore)' },
     { pat: /\.setItem\s*\(/, label: 'localStorage write' },
   ]) {
     assert.equal(forbidden.pat.test(codeOnly), false,
-      v(`MyCellSection must NOT contain ${forbidden.label} — the view `
-        + `is read-only; writes belong to the wizards.`))
+      v(`MyCellSection must NOT contain ${forbidden.label} — control-`
+        + `plane calls and raw fetches are off-limits; cell writes `
+        + `must flow through lib/cellStore (saveCellEoat / deleteCellEoat).`))
   }
 })
 
@@ -899,6 +907,368 @@ test('new-profile-appears-in-program-wizard: save + getCell roundtrip', async ()
       v('Round-tripped entry must preserve all actuators'))
     assert.deepEqual(found.actuators.map((a) => a.valve), ['V05', 'V10'],
       v('Round-tripped entry must preserve per-actuator valves in order'))
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+
+// ── (15) EOAT setup name + save-visibility (2026-10-01) ────────────
+//
+// Operator directive: every EOAT setup path (finger / vacuum /
+// custom) must (a) ask the operator to NAME the tool, (b) refuse
+// duplicate names, and (c) show a save-confirmation screen with
+// [View in My Cell] / [Set up another tool] / [Done]. No silent-end
+// wizard.
+
+test('name-step-present-and-required: custom path has name step', () => {
+  // Already pinned at step-count level — this pin is explicit about
+  // the input + required predicate so a future refactor can't quietly
+  // drop the field.
+  assert.ok(/data-testid="custom-eoat-name"/.test(eoatWizSrc),
+    v('Custom flow must render data-testid="custom-eoat-name" input'))
+  assert.ok(/const\s+nameTrim\s*=\s*name\.trim\(\)/.test(eoatWizSrc),
+    v('Custom flow must trim the name before using it'))
+  // Required predicate — Next on step 0 blocks when name is empty
+  // AND when the name clashes with an existing cell entry.
+  assert.ok(/step === 0 \? nameOk/.test(eoatWizSrc),
+    v('Custom flow canAdvance(step===0) must gate on nameOk '
+      + '(nameOk = trim.length > 0 && !nameClash).'))
+})
+
+test('name-step-present-and-required: standard paths prompt for a name', () => {
+  // The standard body wraps a StandardNameInput component when the
+  // active tool is finger OR vacuum. The input prefills from
+  // _STANDARD_NAME_DEFAULTS and the operator can edit it before
+  // confirming.
+  assert.ok(/<StandardNameInput/.test(eoatWizSrc),
+    v('Standard body must mount <StandardNameInput /> so finger/vacuum '
+      + 'paths ask the operator to name the tool.'))
+  assert.ok(/_STANDARD_NAME_DEFAULTS\s*=\s*\{[\s\S]*?finger:\s*'Finger Gripper'[\s\S]*?vacuum:\s*'Vacuum Tool'[\s\S]*?\}/
+              .test(eoatWizSrc),
+    v("Standard name prefills must be { finger: 'Finger Gripper', "
+      + "vacuum: 'Vacuum Tool' } — the operator can edit, but a tap-"
+      + 'through workflow still produces named entries.'))
+  // Confirm button is disabled when the name is empty or clashes.
+  assert.ok(/standardNameClash/.test(eoatWizSrc),
+    v('Standard path must compute standardNameClash and feed it to the '
+      + 'Confirm disabled predicate.'))
+})
+
+test('duplicate-name guard: shared helper with plain-copy refusal', () => {
+  // One helper per spec — case-insensitive, trimmed, with the
+  // excludeId escape for the same-id rename path.
+  assert.ok(/function\s+_nameClashes\(cell,\s*candidate,\s*excludeId\s*=\s*null\)/
+              .test(eoatWizSrc),
+    v('EOATSetupWizard must define _nameClashes(cell, candidate, excludeId=null)'))
+  // Plain-copy refusal rendered in both the custom and standard flows.
+  // Grep for the two anchor phrases together instead of a brittle
+  // name-token regex (the message interpolates the operator's name).
+  const copyHits = (eoatWizSrc.match(/You already have a tool named/g) || []).length
+  assert.ok(copyHits >= 3,
+    v("'You already have a tool named …' refusal must appear at least "
+      + '3 times (standard confirm handler, custom finish, inline '
+      + `JSX) — found ${copyHits}.`))
+  const tailHits = (eoatWizSrc.match(/pick another name/g) || []).length
+  assert.ok(tailHits >= 3,
+    v("'pick another name' tail copy must appear at least 3 times — "
+      + `found ${tailHits}. This is the operator-visible refusal copy, `
+      + 'single-sourced across every entry point.'))
+  // Pinned testids on both flows so the refusal is DOM-targetable.
+  for (const tid of [
+    'custom-eoat-name-clash',
+    'hardware-setup-standard-name-clash',
+  ]) {
+    assert.ok(new RegExp(`data-testid="${tid}"`).test(eoatWizSrc),
+      v(`Duplicate-name refusal must expose data-testid="${tid}"`))
+  }
+})
+
+test('save-confirmation screen renders on all three paths (no silent end)', () => {
+  // SavedScreen is the shared closing surface, mounted on BOTH the
+  // standard-path body and the custom-flow step 4.
+  assert.ok(/function\s+SavedScreen\(/.test(eoatWizSrc),
+    v('EOATSetupWizard must define a SavedScreen function — the '
+      + 'shared closing surface across standard + custom paths.'))
+  // Standard-path mount: when savedEntry is set we render SavedScreen.
+  const standardMount = /savedEntry\s*&&\s*toolKey\s*!==\s*['"]custom_new['"][\s\S]{0,120}<SavedScreen/
+  assert.ok(standardMount.test(eoatWizSrc),
+    v('Standard body must mount <SavedScreen /> when savedEntry is set '
+      + '(gated on toolKey !== "custom_new"). This is the standard-path '
+      + 'exit — no silent-end for finger/vacuum.'))
+  // Custom-flow mount: step 4 + savedEntry → SavedScreen.
+  const customMount = /step === 4 && savedEntry[\s\S]{0,80}<SavedScreen/
+  assert.ok(customMount.test(eoatWizSrc),
+    v('CustomEOATFlow step 4 must mount <SavedScreen /> when savedEntry '
+      + 'is set (not the old inline "saved" strip).'))
+  // Three action buttons on the saved screen.
+  for (const tid of [
+    'hardware-setup-saved-view',
+    'hardware-setup-saved-another',
+    'hardware-setup-saved-done',
+  ]) {
+    assert.ok(new RegExp(`data-testid="${tid}"`).test(eoatWizSrc),
+      v(`SavedScreen must expose data-testid="${tid}"`))
+  }
+  // Headline carries the operator's name verbatim.
+  assert.ok(/"\{name\}" saved to your cell\./.test(eoatWizSrc),
+    v('SavedScreen headline must read \'"<name>" saved to your cell.\''))
+})
+
+test('view-in-my-cell navigation routes to the Synapse tab', () => {
+  // SavedScreen's primary action lands on My Cell. The Synapse tab
+  // is where MyCellSection is mounted (pages/SynapsePage.jsx).
+  assert.ok(/useStore\.getState\(\)\.setTab\(['"]synapse['"]\)/
+              .test(eoatWizSrc),
+    v('viewInMyCell must call useStore.getState().setTab("synapse") so '
+      + 'the Synapse tab (which mounts MyCellSection) is the landing '
+      + 'spot for the operator.'))
+})
+
+
+// ── (16) My Cell rename + delete (2026-10-01) ──────────────────────
+
+test('rename affordance: My Cell entries render Rename + Save/Cancel buttons', () => {
+  for (const tid of [
+    'my-cell-entry-rename',
+    'my-cell-entry-rename-input',
+    'my-cell-entry-rename-save',
+    'my-cell-entry-rename-cancel',
+  ]) {
+    assert.ok(new RegExp(`data-testid="${tid}"`).test(myCellSrc),
+      v(`My Cell row must expose data-testid="${tid}" for the rename flow`))
+  }
+})
+
+test('rename-preserves-program-binding: cell POST reuses entry id (name-only diff)', () => {
+  // The rename commit path spreads the full entry and only overwrites
+  // name. Backend upserts by id, so every program binding by id
+  // survives untouched. Grep the commit payload shape.
+  assert.ok(/const\s+payload\s*=\s*\{\s*\.\.\.entry,\s*name:\s*next\s*\}/
+              .test(myCellSrc),
+    v('commitRename must build payload = { ...entry, name: next } — '
+      + 'any other shape risks dropping actuators[] / inputs / '
+      + 'sensor_count and would silently break program bindings.'))
+  assert.ok(/saveCellEoat\(payload\)/.test(myCellSrc),
+    v('commitRename must POST via saveCellEoat(payload) so the '
+      + 'backend upsert key (id) is preserved — programs bound by id '
+      + 'follow the rename automatically.'))
+})
+
+test('rename-preserves-program-binding: id-binding roundtrip (fetch-mocked)', async () => {
+  // Simulate end-to-end: start with an EOAT in the cell + a program
+  // whose config.cell_eoat_id points at it. Rename the EOAT. Fetch
+  // the program again. Verify the program's binding still resolves
+  // to the renamed entry.
+  const { saveCellEoat, getCell } = await import('../../src/lib/cellStore.js')
+  const originalFetch = global.fetch
+
+  const cell = { eoats: [{
+    id: 'eoat_x1', name: 'Old Name', type: 'vacuum',
+    valve: 'V03', inputs: ['IN04'], outputs: [],
+    actuators: [{ type: 'vacuum', hold_on_loss: false,
+                  valve: 'V03', label: 'vacuum' }],
+    sensor_count: 1,
+  }], fixtures: [], meta: {} }
+  const program = { id: 'p1', name: 'Pick',
+                    config: { cell_eoat_id: 'eoat_x1' } }
+
+  global.fetch = async (url, opts) => {
+    if (url === '/api/cell/eoat' && opts && opts.method === 'POST') {
+      const body = JSON.parse(opts.body)
+      // Upsert in place by id — the backend contract.
+      const existing = cell.eoats.find((e) => e.id === body.id)
+      Object.assign(existing, body)
+      return new Response(JSON.stringify({ ok: true, entry: existing }),
+                          { status: 200 })
+    }
+    if (url === '/api/cell') {
+      return new Response(JSON.stringify({ ok: true, cell }),
+                          { status: 200 })
+    }
+    throw new Error(`unmocked fetch: ${url}`)
+  }
+  try {
+    const existing = cell.eoats[0]
+    await saveCellEoat({ ...existing, name: 'New Name' })
+    const after = await getCell()
+    const renamed = after.eoats.find((e) => e.id === 'eoat_x1')
+    assert.equal(renamed.name, 'New Name',
+      v('Rename must persist the new name on the same id'))
+    // Program's cell_eoat_id still resolves to the renamed entry.
+    const resolved = after.eoats.find(
+      (e) => e.id === program.config.cell_eoat_id)
+    assert.ok(resolved,
+      v('Program binding by id must still resolve after rename'))
+    assert.equal(resolved.name, 'New Name',
+      v('Program binding should transparently see the new name '
+        + 'because programs bind by id, not by name.'))
+    // Preserved fields (actuators + sensor_count + ports) survive.
+    assert.equal(resolved.sensor_count, 1,
+      v('Rename must preserve sensor_count'))
+    assert.deepEqual(resolved.inputs, ['IN04'],
+      v('Rename must preserve inputs'))
+    assert.equal(resolved.actuators.length, 1,
+      v('Rename must preserve the actuators array'))
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('delete affordance: My Cell entries render Delete + confirm with programs warning', () => {
+  for (const tid of [
+    'my-cell-entry-delete',
+    'my-cell-entry-delete-confirm',
+    'my-cell-entry-delete-commit',
+    'my-cell-entry-delete-cancel',
+  ]) {
+    assert.ok(new RegExp(`data-testid="${tid}"`).test(myCellSrc),
+      v(`My Cell row must expose data-testid="${tid}" for the delete flow`))
+  }
+  // Programs-ref warning uses the existing cellActions helper so a
+  // future binding-source change (new config field) auto-propagates.
+  assert.ok(/import\s*\{[^}]*programsReferencingCellId[^}]*\}/.test(myCellSrc),
+    v('MyCellSection must import programsReferencingCellId from '
+      + 'lib/cellActions — the existing programs-reference warning '
+      + 'helper (per the Sep 22 directive) is the single source.'))
+  assert.ok(/data-testid="my-cell-entry-delete-ref"/.test(myCellSrc),
+    v('Programs-reference list items must expose data-testid='
+      + '"my-cell-entry-delete-ref" so tests can target them.'))
+})
+
+
+// ── (17) Per-path save-and-reuse roundtrip (2026-10-01) ────────────
+
+test('standard finger: save → cell carries operator name under standard:finger', async () => {
+  const { saveCellEoat, getCell } = await import('../../src/lib/cellStore.js')
+  const stored = []
+  const originalFetch = global.fetch
+  global.fetch = async (url, opts) => {
+    if (url === '/api/cell/eoat' && opts && opts.method === 'POST') {
+      const body = JSON.parse(opts.body)
+      const i = stored.findIndex((e) => e.id === body.id)
+      if (i >= 0) stored[i] = body
+      else stored.push(body)
+      return new Response(JSON.stringify({ ok: true, entry: body }),
+                          { status: 200 })
+    }
+    if (url === '/api/cell') {
+      return new Response(JSON.stringify({
+        ok: true, cell: { eoats: stored, fixtures: [], meta: {} },
+      }), { status: 200 })
+    }
+    throw new Error(`unmocked fetch: ${url}`)
+  }
+  try {
+    const saved = await saveCellEoat({
+      id: 'standard:finger', name: 'My Gripper', type: 'finger',
+      valve: 'V01', inputs: ['IN01', 'IN02'], outputs: [],
+      actuators: [{ type: 'single_acting', hold_on_loss: false,
+                    valve: 'V01', label: 'actuator' }],
+      sensor_count: 2,
+    })
+    assert.equal(saved.name, 'My Gripper',
+      v('Standard-finger save must echo the operator-supplied name'))
+    const cell = await getCell()
+    const found = cell.eoats.find((e) => e.id === 'standard:finger')
+    assert.ok(found, v('Standard-finger entry must appear in the cell'))
+    assert.equal(found.name, 'My Gripper',
+      v('Operator name — not type label — must be the card title'))
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('standard vacuum: save upserts under standard:vacuum (one-per-type)', async () => {
+  const { saveCellEoat, getCell } = await import('../../src/lib/cellStore.js')
+  const stored = [{
+    id: 'standard:vacuum', name: 'Prior Vacuum', type: 'vacuum',
+    valve: 'V03', inputs: ['IN04'], outputs: [],
+  }]
+  const originalFetch = global.fetch
+  global.fetch = async (url, opts) => {
+    if (url === '/api/cell/eoat' && opts && opts.method === 'POST') {
+      const body = JSON.parse(opts.body)
+      const i = stored.findIndex((e) => e.id === body.id)
+      if (i >= 0) stored[i] = body
+      else stored.push(body)
+      return new Response(JSON.stringify({ ok: true, entry: body }),
+                          { status: 200 })
+    }
+    if (url === '/api/cell') {
+      return new Response(JSON.stringify({
+        ok: true, cell: { eoats: stored, fixtures: [], meta: {} },
+      }), { status: 200 })
+    }
+    throw new Error(`unmocked fetch: ${url}`)
+  }
+  try {
+    await saveCellEoat({
+      id: 'standard:vacuum', name: 'Edited Vacuum', type: 'vacuum',
+      valve: 'V03', inputs: ['IN04'], outputs: [],
+    })
+    const cell = await getCell()
+    const matches = cell.eoats.filter(
+      (e) => e.id === 'standard:vacuum')
+    assert.equal(matches.length, 1,
+      v('Standard-vacuum save must upsert in place — no duplicate '
+        + 'standard:vacuum entry can appear.'))
+    assert.equal(matches[0].name, 'Edited Vacuum',
+      v('Upsert must overwrite the name field with the operator edit'))
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('custom path: save → entry appears + resolveable by ToolFromCellStep card shape', async () => {
+  const { saveCellEoat, getCell } = await import('../../src/lib/cellStore.js')
+  const stored = []
+  const originalFetch = global.fetch
+  global.fetch = async (url, opts) => {
+    if (url === '/api/cell/eoat' && opts && opts.method === 'POST') {
+      const body = JSON.parse(opts.body)
+      // Backend assigns a fresh id when none supplied.
+      const entry = { id: 'eoat_abc1234', ...body }
+      stored.push(entry)
+      return new Response(JSON.stringify({ ok: true, entry }),
+                          { status: 200 })
+    }
+    if (url === '/api/cell') {
+      return new Response(JSON.stringify({
+        ok: true, cell: { eoats: stored, fixtures: [], meta: {} },
+      }), { status: 200 })
+    }
+    throw new Error(`unmocked fetch: ${url}`)
+  }
+  try {
+    const payload = {
+      name: 'Multi-Tool',
+      type: 'custom',
+      valve: 'V05',
+      inputs: ['IN01'],
+      outputs: [],
+      actuators: [
+        { type: 'single_acting', hold_on_loss: false, valve: 'V05',
+          label: 'gripper' },
+        { type: 'vacuum', hold_on_loss: false, valve: 'V10',
+          label: 'vacuum' },
+      ],
+      sensor_count: 1,
+    }
+    const saved = await saveCellEoat(payload)
+    assert.equal(saved.name, 'Multi-Tool',
+      v('Custom save must echo the operator-supplied name'))
+    const cell = await getCell()
+    const found = cell.eoats.find((e) => e.id === saved.id)
+    assert.ok(found,
+      v('Custom entry must appear in the cell after save'))
+    // ToolFromCellStep renders cards from cell.eoats directly — the
+    // card title is entry.name, type is entry.type, and ports render
+    // via valve + inputs.
+    assert.equal(found.name, 'Multi-Tool')
+    assert.equal(found.type, 'custom')
+    assert.equal(found.actuators.length, 2,
+      v('Both actuators must survive the roundtrip'))
   } finally {
     global.fetch = originalFetch
   }

@@ -13,6 +13,8 @@ import {
 import {
   getCell, saveCellEoat,
 } from '../lib/cellStore'
+import { useKeyboardInset } from '../lib/keyboardInset'
+import { useStore } from '../store/useStore'
 
 // Standalone EOAT Setup wizard.
 //
@@ -69,6 +71,27 @@ const BUILT_IN = [
 const _STANDARD_SENSOR_DEFAULTS = { finger: 2, vacuum: 1 }
 const _STANDARD_SENSOR_MAX      = { finger: 3, vacuum: 3 }
 
+// Default profile names for the standard paths. The operator can
+// edit before confirming — the directive requires the NAME be the
+// operator's word, since program-wizard cards render it verbatim.
+const _STANDARD_NAME_DEFAULTS = {
+  finger: 'Finger Gripper',
+  vacuum: 'Vacuum Tool',
+}
+
+// Shared duplicate-name predicate. Case-insensitive, trimmed. When
+// `excludeId` is set, allows the operator to rename back to the same
+// name on the same entry.
+function _nameClashes(cell, candidate, excludeId = null) {
+  const want = String(candidate || '').trim().toLowerCase()
+  if (!want) return false
+  for (const e of (cell && cell.eoats) || []) {
+    if (excludeId && e.id === excludeId) continue
+    if (String(e.name || '').trim().toLowerCase() === want) return true
+  }
+  return false
+}
+
 export default function EOATSetupWizard({
   onClose, initialToolKey = null, readOnly = false,
 }) {
@@ -86,6 +109,31 @@ export default function EOATSetupWizard({
   // Keyed by toolKey so flipping between finger and vacuum retains
   // their own answer.
   const [standardSensors, setStandardSensors] = useState({})
+  // Standard-path operator-editable name — 2026-10-01 directive: the
+  // profile name is what the program-wizard tool card displays, so
+  // the operator writes it in their own words. Prefilled from
+  // _STANDARD_NAME_DEFAULTS; kept per-tool so switching paths
+  // preserves answers.
+  const [standardNames, setStandardNames] = useState({})
+  // Cell snapshot for duplicate-name guards + "saved" screen render.
+  const [cell, setCell]           = useState(null)
+  // After a successful save (standard OR custom), the wizard
+  // switches to a dedicated "saved" screen with [View in My Cell]
+  // + [Set up another tool] + [Done]. Never silently ends.
+  const [savedEntry, setSavedEntry] = useState(null)
+
+  // On-screen keyboard inset — the standard-path name input + custom
+  // name input both benefit, so apply once at the wizard level.
+  useKeyboardInset()
+
+  // Load the cell on mount (for duplicate-name checks + the saved
+  // confirmation screen's cross-link). Refetched after any save so
+  // the duplicate-guard sees the fresh cell during a multi-tool
+  // session.
+  async function _refetchCell() {
+    try { setCell(await getCell()) } catch { /* keep prior cell */ }
+  }
+  useEffect(() => { _refetchCell() }, [])
 
   useEffect(() => {
     let alive = true
@@ -155,6 +203,27 @@ export default function EOATSetupWizard({
     return _STANDARD_SENSOR_DEFAULTS[key] ?? 0
   }, [activeTool, standardSensors])
 
+  const activeStandardName = useMemo(() => {
+    if (!activeTool) return ''
+    const key = activeTool.key
+    if (key !== 'finger' && key !== 'vacuum') return ''
+    const override = standardNames[key]
+    if (typeof override === 'string') return override
+    return _STANDARD_NAME_DEFAULTS[key] || ''
+  }, [activeTool, standardNames])
+
+  // Duplicate-name check for the standard confirm path. The entry
+  // id is deterministic ("standard:finger" / "standard:vacuum"), so
+  // a rename of the SAME standard tool back to its default name is
+  // not a collision — excludeId lets through that case.
+  const standardNameClash = useMemo(() => {
+    if (!activeTool) return false
+    const key = activeTool.key
+    if (key !== 'finger' && key !== 'vacuum') return false
+    return _nameClashes(cell, activeStandardName,
+      `standard:${key}`)
+  }, [cell, activeTool, activeStandardName])
+
   const guidancePortMap = useMemo(() => {
     if (!activeTool) return null
     if (activeTool.key === 'custom_new') return null
@@ -180,25 +249,47 @@ export default function EOATSetupWizard({
   // flow writes its own cell entry at finish().
   async function handleGuidanceConfirm() {
     if (!toolKey || toolKey === 'custom_new') return
+    // Standard path: enforce duplicate-name guard BEFORE touching
+    // any network — the operator's name is a precondition, not an
+    // override, and the custom path has the same guarantee.
+    if (toolKey === 'finger' || toolKey === 'vacuum') {
+      const nameTrim = activeStandardName.trim()
+      if (!nameTrim) {
+        setError('Give this tool a name before saving.')
+        return
+      }
+      if (standardNameClash) {
+        setError(`You already have a tool named "${nameTrim}" — pick another name.`)
+        return
+      }
+    }
     setBusy(true); setError(null)
     try {
       const rec = await confirmToolHookup(toolKey,
         { noSensor: {}, optional: {} })
       setRecord(rec)
       setSavedAt(rec && rec.confirmed_at)
-      // Mirror the confirmation into the cell for finger/vacuum
-      // so the Program Wizard's tool-step shows this tool as a
-      // card immediately after confirmation.
+      // Mirror the confirmation into the cell for finger/vacuum so
+      // the Program Wizard's tool-step shows this tool as a card
+      // immediately after confirmation. The cell entry carries the
+      // operator's name (not the type label) because the directive
+      // makes the operator's word the single source for the card.
       if (toolKey === 'finger' || toolKey === 'vacuum') {
         try {
           const sensors = activeStandardSensorCount ?? 0
           const port = _buildStandardPortMap(toolKey, sensors)
           const entry = _standardCellEntry({
-            toolKey, port, sensorCount: sensors,
+            toolKey,
+            name: activeStandardName.trim(),
+            port,
+            sensorCount: sensors,
           })
-          await saveCellEoat(entry)
+          const saved = await saveCellEoat(entry)
+          // Refresh the cell AND switch to the saved screen — the
+          // operator never sees a silent-end wizard.
+          await _refetchCell()
+          setSavedEntry(saved || entry)
         } catch (ce) {
-          // Soft failure — the legacy confirm already succeeded.
           setError(`Saved tool, but cell mirror failed: ${
             String(ce && ce.message || ce)}`)
         }
@@ -208,6 +299,26 @@ export default function EOATSetupWizard({
     } finally {
       setBusy(false)
     }
+  }
+
+  // Operator-facing nav helper — "View in My Cell" jumps to the
+  // Synapse tab where MyCellSection is mounted, then closes the
+  // wizard. Called from the saved-confirmation screens on all three
+  // paths.
+  function viewInMyCell() {
+    try { useStore.getState().setTab('synapse') } catch { /* ignore */ }
+    onClose()
+  }
+
+  // "Set up another tool" — stay in the wizard, reset back to the
+  // picker. Preserves the saved tool in the cell; the picker now
+  // shows it as an entry on the next pass.
+  function setupAnother() {
+    setSavedEntry(null)
+    setSavedAt(null)
+    setToolKey(null)
+    setError(null)
+    _refetchCell()
   }
 
   const backdrop = {
@@ -287,14 +398,19 @@ export default function EOATSetupWizard({
         {toolKey === 'custom_new' && activeTool && (
           <CustomEOATFlow
             customs={customs}
+            cell={cell}
+            onCellChanged={_refetchCell}
             onBack={() => setToolKey(null)}
             onClose={onClose}
+            onViewInMyCell={viewInMyCell}
+            onSetupAnother={setupAnother}
           />
         )}
 
         {/* Existing (built-in or already-configured custom) tool
             path — Synapse glowing map is the sole wiring guide. */}
-        {toolKey && toolKey !== 'custom_new' && activeTool && (
+        {toolKey && toolKey !== 'custom_new' && activeTool
+            && !savedEntry && (
           <div data-testid="hardware-setup-body">
             <div style={{
               display: 'flex', alignItems: 'center', gap: 10,
@@ -328,6 +444,18 @@ export default function EOATSetupWizard({
               <>
                 {(activeTool.key === 'finger'
                     || activeTool.key === 'vacuum') && (
+                  <StandardNameInput
+                    toolKey={activeTool.key}
+                    value={activeStandardName}
+                    disabled={readOnly}
+                    clash={standardNameClash}
+                    onChange={(s) => setStandardNames((prev) => ({
+                      ...prev, [activeTool.key]: s,
+                    }))}
+                  />
+                )}
+                {(activeTool.key === 'finger'
+                    || activeTool.key === 'vacuum') && (
                   <StandardSensorCount
                     toolKey={activeTool.key}
                     value={activeStandardSensorCount ?? 0}
@@ -348,7 +476,11 @@ export default function EOATSetupWizard({
                     <button
                       data-testid="hardware-setup-confirm"
                       onClick={handleGuidanceConfirm}
-                      disabled={busy}
+                      disabled={busy
+                        || ((activeTool.key === 'finger'
+                              || activeTool.key === 'vacuum')
+                            && (!activeStandardName.trim()
+                                || standardNameClash))}
                       style={{
                         padding: '10px 16px', fontSize: 14, fontWeight: 700,
                         background: '#16A34A', color: '#fff',
@@ -392,28 +524,30 @@ export default function EOATSetupWizard({
                 )}
               </div>
             )}
-            {savedAt && (
-              <div data-testid="hardware-setup-saved"
+            {error && (
+              <div data-testid="hardware-setup-error"
                    style={{
                      marginTop: 10, padding: '8px 12px',
-                     background: '#ECFDF5',
-                     border: '1px solid #6EE7B7', borderRadius: 6,
-                     color: '#065F46', fontSize: 12,
+                     background: '#FEE2E2', border: '1px solid #FCA5A5',
+                     borderRadius: 6, color: '#7F1D1D', fontSize: 12,
                    }}>
-                Saved — this tool's hookup is now confirmed as of{' '}
-                <b>{_formatDate(savedAt)}</b>.
-              </div>
-            )}
-            {error && (
-              <div style={{
-                marginTop: 10, padding: '8px 12px',
-                background: '#FEE2E2', border: '1px solid #FCA5A5',
-                borderRadius: 6, color: '#7F1D1D', fontSize: 12,
-              }}>
                 {error}
               </div>
             )}
           </div>
+        )}
+
+        {/* Saved-confirmation screen — standard-path exit surface
+            (2026-10-01 directive). Custom path has its OWN saved
+            screen embedded in CustomEOATFlow because that flow has
+            richer summary content already assembled. */}
+        {savedEntry && toolKey !== 'custom_new' && (
+          <SavedScreen
+            entry={savedEntry}
+            onViewInMyCell={viewInMyCell}
+            onSetupAnother={setupAnother}
+            onDone={onClose}
+          />
         )}
 
         {toolKey && toolKey !== 'custom_new' && !activeTool && recordLoaded && (
@@ -559,7 +693,10 @@ function StandardSensorCount({ toolKey, value, max, disabled, onChange }) {
 //   4 — Review (summary + save to cell)
 const _ACTUATOR_MAX = 4
 
-function CustomEOATFlow({ customs, onBack, onClose }) {
+function CustomEOATFlow({
+  customs, cell, onCellChanged,
+  onBack, onClose, onViewInMyCell, onSetupAnother,
+}) {
   const [step, setStep]  = useState(0)
   const [name, setName]  = useState('')
   const [actuatorCount, setActuatorCount] = useState(1)
@@ -570,7 +707,20 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
   const [sensorCount, setSensorCount] = useState(0)
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState(null)
-  const [savedName, setSavedName] = useState(null)
+  // savedEntry holds the full persisted cell entry so the closing
+  // screen can show port details + act on them. Null until finish()
+  // succeeds.
+  const [savedEntry, setSavedEntry] = useState(null)
+
+  // Live duplicate-name check — the custom flow saves under a fresh
+  // id each time, so no excludeId. The name is required already
+  // (canAdvance checks trim().length > 0); this adds the "same name
+  // as an existing tool" guard with the plain-copy refusal.
+  const nameTrim    = name.trim()
+  const nameClash   = useMemo(
+    () => _nameClashes(cell, nameTrim),
+    [cell, nameTrim])
+  const nameOk      = nameTrim.length > 0 && !nameClash
 
   function _setActuatorCount(n) {
     const bounded = Math.max(1, Math.min(_ACTUATOR_MAX, n))
@@ -598,7 +748,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
     a.type && (a.type !== 'double_acting' || a.holdOnLoss !== null))
 
   const canAdvance = (
-    step === 0 ? name.trim().length > 0
+    step === 0 ? nameOk
     : step === 1 ? actuatorCount >= 1 && actuatorCount <= _ACTUATOR_MAX
     : step === 2 ? perActuatorReady
     : step === 3 ? true
@@ -606,10 +756,14 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
   )
 
   async function finish() {
+    if (nameClash) {
+      setSaveErr(`You already have a tool named "${nameTrim}" — pick another name.`)
+      return
+    }
     setSaving(true); setSaveErr(null)
     try {
       const entry = {
-        name: name.trim(),
+        name: nameTrim,
         type: 'custom',
         valve: resolved.required_valves[0] || null,
         inputs: resolved.required_inputs || [],
@@ -622,8 +776,11 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
         })),
         sensor_count: sensorCount,
       }
-      await saveCellEoat(entry)
-      setSavedName(name)
+      const saved = await saveCellEoat(entry)
+      setSavedEntry(saved || entry)
+      // Refresh the parent's cell so [View in My Cell] + the picker
+      // see the fresh entry on the next pass.
+      try { onCellChanged?.() } catch { /* ignore */ }
     } catch (e) {
       setSaveErr(String(e && e.message || e))
     } finally {
@@ -682,13 +839,26 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. Custom Vacuum Head"
               data-testid="custom-eoat-name"
+              aria-invalid={nameClash ? 'true' : 'false'}
               style={{
                 marginTop: 4, padding: '8px 10px', fontSize: 14,
                 width: '100%', maxWidth: 320,
-                border: '1px solid #d1d5db', borderRadius: 6,
+                border: `1px solid ${nameClash ? '#DC2626' : '#d1d5db'}`,
+                borderRadius: 6,
                 fontFamily: 'inherit',
               }} />
           </div>
+          {nameClash && (
+            <div data-testid="custom-eoat-name-clash"
+                 style={{
+                   padding: '8px 10px', background: '#FEE2E2',
+                   border: '1px solid #FCA5A5', borderRadius: 6,
+                   color: '#7F1D1D', fontSize: 12, lineHeight: 1.5,
+                 }}>
+              You already have a tool named "{nameTrim}" — pick
+              another name.
+            </div>
+          )}
           <div style={{ fontSize: 12, color: '#6B7280' }}>
             Pick a short, distinctive name — you'll see it in the
             tool picker and in program references.
@@ -800,7 +970,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
         </div>
       )}
 
-      {step === 4 && (
+      {step === 4 && !savedEntry && (
         <div data-testid="hardware-setup-custom-step-summary"
              style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div style={{
@@ -808,7 +978,7 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
             border: '1px solid #E5E7EB', borderRadius: 8,
             fontSize: 13, color: '#111827', lineHeight: 1.6,
           }}>
-            <div><b>Tool:</b> {name || '(unnamed)'}</div>
+            <div><b>Tool:</b> {nameTrim || '(unnamed)'}</div>
             <div><b>Actuators:</b> {actuators.length}</div>
             {(resolved.actuators || []).map((a, i) => (
               <div key={i} data-testid="custom-eoat-summary-actuator"
@@ -825,28 +995,35 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
             </div>
           </div>
           <GuidanceBlock port={resolved} />
-          {savedName && (
-            <div data-testid="hardware-setup-custom-saved"
-                 style={{
-                   padding: '10px 12px', background: '#ECFDF5',
-                   border: '1px solid #6EE7B7', borderRadius: 6,
-                   color: '#065F46', fontSize: 12,
-                 }}>
-              Custom EOAT "{savedName}" saved to the cell. It will
-              appear in the Program Wizard's tool picker on the
-              next step.
-            </div>
-          )}
           {saveErr && (
-            <div style={{
-              padding: '10px 12px', background: '#FEE2E2',
-              border: '1px solid #FCA5A5', borderRadius: 6,
-              color: '#7F1D1D', fontSize: 12,
-            }}>
+            <div data-testid="hardware-setup-custom-save-err"
+                 style={{
+                   padding: '10px 12px', background: '#FEE2E2',
+                   border: '1px solid #FCA5A5', borderRadius: 6,
+                   color: '#7F1D1D', fontSize: 12,
+                 }}>
               {saveErr}
             </div>
           )}
         </div>
+      )}
+
+      {step === 4 && savedEntry && (
+        <SavedScreen
+          entry={savedEntry}
+          onViewInMyCell={onViewInMyCell}
+          onSetupAnother={() => {
+            // Reset local flow state back to the start before
+            // handing control back to the parent picker.
+            setSavedEntry(null); setSaveErr(null)
+            setStep(0); setName('')
+            setActuatorCount(1)
+            setActuators([{ type: '', holdOnLoss: null }])
+            setSensorCount(0)
+            onSetupAnother?.()
+          }}
+          onDone={onClose}
+        />
       )}
 
       <div style={{
@@ -866,18 +1043,13 @@ function CustomEOATFlow({ customs, onBack, onClose }) {
             Next →
           </button>
         )}
-        {step === 4 && !savedName && (
+        {step === 4 && !savedEntry && (
           <button
             data-testid="hardware-setup-custom-finish"
             style={btnPrim}
-            disabled={saving}
+            disabled={saving || nameClash}
             onClick={finish}>
             {saving ? 'Saving…' : 'Finish'}
-          </button>
-        )}
-        {step === 4 && savedName && (
-          <button style={btnPrim} onClick={onClose}>
-            Done
           </button>
         )}
       </div>
@@ -1023,6 +1195,141 @@ function ActuationChoice({ value, onChange, options }) {
   )
 }
 
+// Standard-path name input (2026-10-01 directive). Prefilled from
+// _STANDARD_NAME_DEFAULTS; shows a plain-copy refusal when the
+// operator picks a name that already exists in the cell.
+function StandardNameInput({
+  toolKey, value, disabled, clash, onChange,
+}) {
+  const trim = String(value || '').trim()
+  return (
+    <div data-testid="hardware-setup-standard-name"
+         data-tool-key={toolKey}
+         data-clash={String(!!clash)}
+         style={{
+           padding: '10px 12px', marginBottom: 12,
+           background: '#F9FAFB', border: '1px solid #E5E7EB',
+           borderRadius: 6, color: '#374151',
+         }}>
+      <div style={{ fontSize: 13, marginBottom: 6 }}>
+        What do you want to call this tool?{' '}
+        <span style={{ color: '#6B7280' }}>
+          (This is what the Program Wizard will show.)
+        </span>
+      </div>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        placeholder={_STANDARD_NAME_DEFAULTS[toolKey] || 'Tool'}
+        data-testid="hardware-setup-standard-name-input"
+        aria-invalid={clash ? 'true' : 'false'}
+        style={{
+          padding: '8px 10px', fontSize: 14,
+          width: '100%', maxWidth: 320,
+          border: `1px solid ${clash ? '#DC2626' : '#d1d5db'}`,
+          borderRadius: 6, fontFamily: 'inherit',
+          opacity: disabled ? 0.55 : 1,
+        }} />
+      {clash && (
+        <div data-testid="hardware-setup-standard-name-clash"
+             style={{
+               marginTop: 8, padding: '6px 10px', background: '#FEE2E2',
+               border: '1px solid #FCA5A5', borderRadius: 6,
+               color: '#7F1D1D', fontSize: 12, lineHeight: 1.5,
+             }}>
+          You already have a tool named "{trim}" — pick another name.
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Saved-confirmation screen (2026-10-01 directive). Rendered on all
+// three paths after a successful cell save; the operator sees that
+// the save happened + has three next-step affordances. Never a
+// silent-end wizard.
+function SavedScreen({ entry, onViewInMyCell, onSetupAnother, onDone }) {
+  const name = entry?.name || 'Tool'
+  const valves = []
+  if (entry?.valve) valves.push(entry.valve)
+  if (Array.isArray(entry?.actuators)) {
+    for (const a of entry.actuators) {
+      if (a?.valve && !valves.includes(a.valve)) valves.push(a.valve)
+    }
+  }
+  const inputs = Array.isArray(entry?.inputs)
+    ? entry.inputs.filter(Boolean) : []
+  const btnPrim = {
+    padding: '10px 16px', fontSize: 14, fontWeight: 700,
+    background: '#0284c7', color: '#fff',
+    border: '1px solid #0369a1', borderRadius: 8,
+    cursor: 'pointer', fontFamily: 'inherit',
+  }
+  const btnGhost = {
+    padding: '10px 16px', fontSize: 14, fontWeight: 600,
+    background: '#fff', color: '#374151',
+    border: '1px solid #d1d5db', borderRadius: 8,
+    cursor: 'pointer', fontFamily: 'inherit',
+  }
+  return (
+    <div data-testid="hardware-setup-saved-screen"
+         data-cell-id={entry?.id || ''}
+         style={{
+           padding: 18, borderRadius: 10, background: '#ECFDF5',
+           border: '1px solid #6EE7B7', color: '#065F46',
+           fontSize: 14, lineHeight: 1.6,
+         }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10,
+                    marginBottom: 10 }}>
+        <div style={{
+          width: 28, height: 28, borderRadius: '50%',
+          background: '#16A34A', color: '#fff',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 16, fontWeight: 800,
+        }}>✓</div>
+        <div data-testid="hardware-setup-saved-headline"
+             style={{ fontSize: 18, fontWeight: 700, color: '#064E3B' }}>
+          "{name}" saved to your cell.
+        </div>
+      </div>
+      <div style={{ color: '#065F46', marginBottom: 14 }}>
+        It will appear as a card in the Program Wizard's tool step
+        and in <b>My Cell</b> on the Synapse tab.
+        {(valves.length > 0 || inputs.length > 0) && (
+          <div style={{ marginTop: 6, fontSize: 13, color: '#047857' }}>
+            Ports claimed:{' '}
+            {valves.length > 0 && <b>{valves.join(', ')}</b>}
+            {valves.length > 0 && inputs.length > 0 && ' · '}
+            {inputs.length > 0 && <b>{inputs.join(', ')}</b>}
+          </div>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button
+          data-testid="hardware-setup-saved-view"
+          style={btnPrim}
+          onClick={onViewInMyCell}>
+          View in My Cell →
+        </button>
+        <button
+          data-testid="hardware-setup-saved-another"
+          style={btnGhost}
+          onClick={onSetupAnother}>
+          Set up another tool
+        </button>
+        <button
+          data-testid="hardware-setup-saved-done"
+          style={btnGhost}
+          onClick={onDone}>
+          Done
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function _formatDate(iso) {
   if (!iso) return '—'
   try {
@@ -1075,15 +1382,13 @@ function _buildStandardPortMap(toolKey, sensorCount) {
 
 // Project a standard-path confirmation into a cell.eoats entry. The
 // stable id lets re-confirmation update in place instead of adding
-// a duplicate card. Legacy single-valve shape preserved alongside
-// the new actuators[] array so cellStore and the program wizard
-// can read either.
-function _standardCellEntry({ toolKey, port, sensorCount }) {
-  const name = toolKey === 'finger'
-    ? 'Finger Gripper'
-    : toolKey === 'vacuum'
-      ? 'Vacuum Suction'
-      : 'EOAT'
+// a duplicate card. The operator-supplied name is the single source
+// for program-wizard card display — the type-label default is only
+// a prefill.
+function _standardCellEntry({ toolKey, name, port, sensorCount }) {
+  const nameTrim = String(name || '').trim()
+    || _STANDARD_NAME_DEFAULTS[toolKey]
+    || 'EOAT'
   const valve = (port.required_valves || [])[0] || null
   const inputs = Array.from(port.required_inputs || [])
   const actuators = valve
@@ -1096,7 +1401,7 @@ function _standardCellEntry({ toolKey, port, sensorCount }) {
     : []
   return {
     id:       `standard:${toolKey}`,
-    name,
+    name:     nameTrim,
     type:     toolKey,
     valve,
     inputs,
