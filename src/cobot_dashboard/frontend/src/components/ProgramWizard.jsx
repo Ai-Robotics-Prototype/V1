@@ -1,9 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Canvas } from '@react-three/fiber'
-import { OrbitControls } from '@react-three/drei'
-import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
-import * as THREE from 'three'
 import { useStore } from '../store/useStore'
+import { HoldButton } from './JogControls'
+import NumericField from './NumericField'
+import PalletFrameDiagram from './PalletFrameDiagram'
+import { getToolHookup, toolHookupKey } from '../lib/toolsApi'
+import ToolFromCellStep from './ToolFromCellStep'
+import { QuestionCard } from './WizardStepCard'
+import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
+import { useSynapsePortmap, displayNameForRaw } from '../lib/synapsePortmap'
+import { effectorReady, effectorEngage, effectorDisengage,
+         effectorOf,
+         clampWorkpiece, unclampWorkpiece,
+         startMachineCycle, waitMachineCycle } from '../lib/effectorVocab'
 
 /*
  * Conversational Program Wizard
@@ -17,21 +25,10 @@ import { useStore } from '../store/useStore'
 // Question definitions
 // ────────────────────────────────────────────────────────
 
-function QuestionCard({ question, description, children }) {
-  return (
-    <div style={{ padding: 32, maxWidth: 600, margin: '0 auto' }}>
-      <div style={{ fontSize: 22, fontWeight: 700, color: '#111', marginBottom: 8, lineHeight: 1.3 }}>
-        {question}
-      </div>
-      {description && (
-        <div style={{ fontSize: 14, color: '#6b7280', marginBottom: 28, lineHeight: 1.5 }}>
-          {description}
-        </div>
-      )}
-      {children}
-    </div>
-  )
-}
+// QuestionCard (canonical wizard-step container) moved to
+// ./WizardStepCard.jsx so steps imported from their own files
+// (ToolFromCellStep + any future per-file step) render inside the
+// SAME chrome as inline PAGES entries. Import, don't fork.
 
 function ChoiceButton({ label, description, selected, onClick, icon }) {
   return (
@@ -158,9 +155,41 @@ function PadCenterTile({ label, width = 64, height = 64 }) {
   )
 }
 
+// Wizard-sized wrapper for the shared HoldButton — same pattern as
+// ProgramEditor.OverlayJogArrow. Migrated from the old onPress
+// setInterval(150ms) pulsing that fired discrete /cmd/jog HTTP POSTs
+// (never `s.jog` — that store action doesn't exist, so joint-mode
+// jog was a silent TypeError). Now uses the same WS transport +
+// hold_id/seq/keepalive the main pendant does.
+function WizardJogArrow({
+  onPressStart, onPressTick, onPressEnd,
+  color, label, rotation, size = 64, svgSize,
+  disabled,
+}) {
+  const sp = svgSize || Math.max(24, Math.floor(size * 0.28))
+  const lp = Math.max(10, Math.floor(size * 0.10))
+  return (
+    <HoldButton
+      jogStyle="CONTINUOUS"
+      onPressStart={onPressStart}
+      onPressTick={onPressTick}
+      onPressEnd={onPressEnd}
+      color={color}
+      width={size} height={size}
+      disabled={disabled}>
+      <svg width={sp} height={sp} viewBox="0 0 24 24"
+           style={{ transform: `rotate(${rotation}deg)` }}>
+        <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
+      </svg>
+      <span style={{ fontSize: lp, fontWeight: 700, color: '#374151' }}>{label}</span>
+    </HoldButton>
+  )
+}
+
 function TeachWithJog({ title, description, instructions, pointName, answers, setAnswer, onNext, onSkip }) {
-  const jog          = useStore((s) => s.jog)
-  const jogCartesian = useStore((s) => s.jogCartesian)
+  const jogHold          = useStore((s) => s.jogHold)
+  const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
+  const jogRelease       = useStore((s) => s.jogRelease)
   const homeRobot    = useStore((s) => s.homeRobot)
   const triggerEstop = useStore((s) => s.triggerEstop)
 
@@ -203,17 +232,28 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
     return () => { alive = false; clearInterval(iv) }
   }, [])
 
-  // Use the same store actions the Program-tab jog panel uses —
-  // joint mode posts /cmd/jog (rad delta), cartesian mode posts
-  // /cmd/jog_cartesian. Safety gates already live in the backend.
-  const sendJog = useCallback((axis, direction) => {
+  // Shared WS jog transport — same store actions the main
+  // JogControls pendant and the fullscreen TeachOverlay use. The
+  // old broken pattern posted discrete HTTP /cmd/jog pulses through
+  // `s.jog` (undefined — silent TypeError on joint jog) or
+  // `s.jogCartesian` (worked but every 150 ms pulse looked like a
+  // fresh session to the driver → 300 ms freshness deadman fired
+  // between pulses → jog chatter). jogHold + jogRelease carry
+  // hold_id/seq/abort meta from HoldButton so the driver sees ONE
+  // continuous session and the server-side keepalive covers stalls.
+  const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
-      const deltaRad = direction * stepRef.current * Math.PI / 180
-      jog(axis - 1, deltaRad)
-    } else {
-      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+      return jogHold(axis, direction, speedRef.current, meta)
     }
-  }, [jog, jogCartesian])
+    return jogHoldCartesian(axis, direction, speedRef.current, meta)
+  }, [jogHold, jogHoldCartesian])
+  const holdEnd = useCallback((meta) => jogRelease(modeRef.current, meta),
+    [jogRelease])
+  const wire = useCallback((axis, direction) => ({
+    onPressStart: (meta) => holdStart(axis, direction, meta),
+    onPressTick:  (meta) => holdStart(axis, direction, meta),
+    onPressEnd:   (meta) => holdEnd(meta),
+  }), [holdStart, holdEnd])
 
   async function recordPosition() {
     try {
@@ -238,8 +278,28 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
 
   const padBtn = 64
 
+  // Tablet-first layout (2026-07-22 fix). The old layout was a flat
+  // document-flow div — the Record button sat at the BOTTOM of a
+  // ~1200 px stack of instructions + live readout + three jog grids +
+  // speed slider, which on any tablet viewport put Record below the
+  // fold. The operator would have had to scroll while hold-jogging,
+  // impossible on touch. Now the component fills its parent (the
+  // wizard modal's flex-1 content area) as a flex column:
+  //   * scrollable middle (instructions, live readout, jog pads)
+  //   * flex-shrink:0 STICKY FOOTER — Record + STOP + Cancel/Next
+  //     stay reserved, safe-area padded, ≥44px touch targets.
   return (
-    <div style={{ padding: 24, maxWidth: 760, margin: '0 auto' }}>
+    <div style={{
+      display: 'flex', flexDirection: 'column',
+      height: '100%', minHeight: 0,
+      background: '#fff',
+    }}>
+      <div style={{
+        flex: 1, minHeight: 0, overflowY: 'auto',
+        padding: 24,
+        maxWidth: 760, width: '100%', margin: '0 auto',
+        boxSizing: 'border-box',
+      }}>
       <div style={{ fontSize: 20, fontWeight: 700, color: '#111', marginBottom: 6 }}>{title}</div>
       <div style={{ fontSize: 14, color: '#6b7280', marginBottom: 16 }}>{description}</div>
 
@@ -317,20 +377,20 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
                 gridTemplateAreas: '". up ." "left center right" ". down ."',
                 gap: 4,
               }}>
-                <div style={{ gridArea: 'up' }}>    <JogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" /></div>
-                <div style={{ gridArea: 'left' }}>  <JogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" /></div>
+                <div style={{ gridArea: 'up' }}>    <WizardJogArrow {...wire('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} /></div>
+                <div style={{ gridArea: 'left' }}>  <WizardJogArrow {...wire('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} /></div>
                 <div style={{ gridArea: 'center' }}><PadCenterTile label="XY" /></div>
-                <div style={{ gridArea: 'right' }}> <JogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" /></div>
-                <div style={{ gridArea: 'down' }}>  <JogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" /></div>
+                <div style={{ gridArea: 'right' }}> <WizardJogArrow {...wire('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} /></div>
+                <div style={{ gridArea: 'down' }}>  <WizardJogArrow {...wire('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} /></div>
               </div>
             </div>
 
             <div>
               <div style={padLabelStyle}>Height</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: padBtn }}>
-                <JogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" />
+                <WizardJogArrow {...wire('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} />
                 <PadCenterTile label="Z" height={24} />
-                <JogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" />
+                <WizardJogArrow {...wire('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} />
               </div>
             </div>
 
@@ -343,11 +403,11 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
                 gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
                 gap: 4,
               }}>
-                <div style={{ gridArea: 'rxp' }}>   <JogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" /></div>
-                <div style={{ gridArea: 'rzn' }}>   <JogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" /></div>
+                <div style={{ gridArea: 'rxp' }}>   <WizardJogArrow {...wire('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} /></div>
+                <div style={{ gridArea: 'rzn' }}>   <WizardJogArrow {...wire('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} /></div>
                 <div style={{ gridArea: 'center' }}><PadCenterTile label="Rot" /></div>
-                <div style={{ gridArea: 'rzp' }}>   <JogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" /></div>
-                <div style={{ gridArea: 'rxn' }}>   <JogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" /></div>
+                <div style={{ gridArea: 'rzp' }}>   <WizardJogArrow {...wire('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} /></div>
+                <div style={{ gridArea: 'rxn' }}>   <WizardJogArrow {...wire('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} /></div>
               </div>
             </div>
           </div>
@@ -355,9 +415,9 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
           <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
             {[1, 2, 3, 4, 5, 6].map((j) => (
               <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-                <JogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={56} />
+                <WizardJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={56} />
                 <PadCenterTile label={'J' + j} width={56} height={24} />
-                <JogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={56} />
+                <WizardJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={56} />
               </div>
             ))}
           </div>
@@ -386,10 +446,32 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
           </div>
         </div>
       )}
+      </div>
 
-      <div style={{ display: 'flex', gap: 10 }}>
+      {/* STICKY FOOTER — tablet-first: Record + STOP + Skip/Next share
+          one row that stays reserved outside the scrollable content.
+          padding-bottom includes env(safe-area-inset-bottom) so the
+          row clears the iOS home indicator / Android nav bar. Every
+          button ≥56px tall (well over 44px minimum). */}
+      <div style={{
+        flexShrink: 0,
+        borderTop: '1px solid #e5e7eb', background: '#fff',
+        padding: '10px 16px',
+        paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 10px)',
+        display: 'flex', alignItems: 'center', gap: 10,
+      }}>
+        <button onClick={triggerEstop} style={{
+          minHeight: 56, minWidth: 96,
+          padding: '0 16px',
+          fontSize: 15, fontWeight: 800,
+          background: '#DC2626', color: '#fff',
+          border: 'none', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
+          boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
+        }}>⏹ STOP</button>
         <button onClick={recordPosition} style={{
-          flex: 2, padding: '16px', fontSize: 16, fontWeight: 700,
+          flex: 1, minHeight: 56, padding: '0 16px',
+          fontSize: 16, fontWeight: 800,
           background: taught ? '#16A34A' : '#2563EB', color: '#fff',
           border: 'none', borderRadius: 10, cursor: 'pointer',
         }}>
@@ -397,21 +479,23 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
         </button>
         {taught && (
           <button onClick={onNext} style={{
-            flex: 1, padding: '16px', fontSize: 16, fontWeight: 700,
+            minHeight: 56, padding: '0 22px',
+            fontSize: 15, fontWeight: 700,
             background: '#16A34A', color: '#fff',
             border: 'none', borderRadius: 10, cursor: 'pointer',
-          }}>Next</button>
+            flexShrink: 0,
+          }}>Next →</button>
+        )}
+        {onSkip && !taught && (
+          <button onClick={onSkip} style={{
+            minHeight: 56, padding: '0 16px',
+            fontSize: 14, fontWeight: 600,
+            background: '#fff', color: '#6b7280',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            flexShrink: 0,
+          }}>Skip →</button>
         )}
       </div>
-      {onSkip && !taught && (
-        <button onClick={onSkip} style={{
-          width: '100%', marginTop: 8, padding: '10px', fontSize: 13,
-          background: 'transparent', color: '#6b7280',
-          border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
-        }}>
-          Skip — use auto-detection instead
-        </button>
-      )}
     </div>
   )
 }
@@ -441,312 +525,7 @@ const inputBox = {
   boxSizing: 'border-box',
 }
 
-// ────────────────────────────────────────────────────────
-// Custom-gripper page support
-// ────────────────────────────────────────────────────────
-
-// STL viewer reused for the Custom Gripper preview. Same lighting /
-// material / OrbitControls / grid setup as the parts library viewer
-// so the operator sees the gripper rendered identically to a part.
-function GripperStlModel({ stlUrl }) {
-  const [mesh, setMesh] = useState(null)
-  useEffect(() => {
-    if (!stlUrl) { setMesh(null); return }
-    let cancelled = false
-    const loader = new STLLoader()
-    loader.load(
-      stlUrl,
-      (geometry) => {
-        if (cancelled) return
-        geometry.computeBoundingBox()
-        geometry.center()
-        const box = geometry.boundingBox
-        const size = Math.max(
-          box.max.x - box.min.x,
-          box.max.y - box.min.y,
-          box.max.z - box.min.z,
-        ) || 1
-        const scale = 0.2 / size
-        geometry.scale(scale, scale, scale)
-        const m = new THREE.Mesh(
-          geometry,
-          new THREE.MeshStandardMaterial({ color: '#A8B0C0', metalness: 0.5, roughness: 0.35 }),
-        )
-        m.castShadow = true
-        setMesh(m)
-      },
-      undefined,
-      () => { if (!cancelled) setMesh(null) },
-    )
-    return () => { cancelled = true }
-  }, [stlUrl])
-  if (!mesh) return null
-  return <primitive object={mesh} />
-}
-
-function GripperPreviewCanvas({ stlUrl, name, dims, onRemove }) {
-  return (
-    <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 10, overflow: 'hidden' }}>
-      <div style={{ height: 300, background: '#fafafa', position: 'relative' }}>
-        <Canvas camera={{ position: [0.25, 0.18, 0.25], fov: 45 }} shadows>
-          <ambientLight intensity={0.6} />
-          <directionalLight position={[5, 5, 5]} intensity={0.9} castShadow />
-          <directionalLight position={[-5, 3, -5]} intensity={0.3} />
-          <gridHelper args={[0.4, 16, '#d1d5db', '#e5e7eb']} position={[0, -0.1, 0]} />
-          {/* Shadow catcher beneath the model. */}
-          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.1, 0]} receiveShadow>
-            <planeGeometry args={[0.6, 0.6]} />
-            <shadowMaterial transparent opacity={0.18} />
-          </mesh>
-          <GripperStlModel stlUrl={stlUrl} />
-          <OrbitControls enablePan={false} target={[0, 0, 0]} />
-        </Canvas>
-        {onRemove && (
-          <button onClick={onRemove}
-            style={{
-              position: 'absolute', top: 8, right: 8,
-              padding: '4px 10px', fontSize: 11, fontWeight: 600,
-              background: 'rgba(255,255,255,0.92)', color: '#DC2626',
-              border: '1px solid #fecaca', borderRadius: 6, cursor: 'pointer',
-            }}>
-            Remove
-          </button>
-        )}
-      </div>
-      <div style={{ padding: '10px 14px', borderTop: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <div style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>{name || 'Custom Gripper'}</div>
-        {dims && (
-          <div style={{ fontSize: 12, color: '#6b7280' }}>
-            {Number(dims.w_cm || 0).toFixed(1)} × {Number(dims.d_cm || 0).toFixed(1)} × {Number(dims.h_cm || 0).toFixed(1)} cm
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// Small DO / DI selector that mirrors the editor's IOPortSelector
-// look so the operator gets the same dropdown they see when wiring
-// gripper IO on a step. Pulls labels from /api/io/config.
-function IOPortDropdown({ label, direction, value, onChange, ioLabels }) {
-  const ports = Array.from({ length: 16 }, (_, i) => {
-    const id  = (direction === 'output' ? 'DO' : 'DI') + i
-    const pin = (direction === 'output' ? 'Y' : 'X') + Math.floor(i / 8) + '.' + (i % 8)
-    return { id, pin, label: (ioLabels && ioLabels[id]) || id }
-  })
-  return (
-    <div style={{ marginBottom: 10 }}>
-      <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>{label}</div>
-      <select value={value || ''} onChange={(e) => onChange(e.target.value || undefined)}
-        style={{
-          width: '100%', padding: '10px 12px', fontSize: 14,
-          border: '1px solid #d1d5db', borderRadius: 6, background: '#fff',
-        }}>
-        <option value="">Not assigned</option>
-        {ports.map((p) => (
-          <option key={p.id} value={p.id}>{p.pin} — {p.label}</option>
-        ))}
-      </select>
-    </div>
-  )
-}
-
-function CustomGripperPanel({ answers, setAnswer, goNext }) {
-  const [uploading, setUploading] = useState(false)
-  const [uploadErr, setUploadErr] = useState('')
-  const [dragOver,  setDragOver]  = useState(false)
-  const [ioLabels,  setIoLabels]  = useState({})
-  const fileInputRef = useRef(null)
-
-  useEffect(() => {
-    let alive = true
-    fetch('/api/io/config')
-      .then((r) => r.json())
-      .then((d) => { if (alive && d) setIoLabels(d.labels || {}) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [])
-
-  const uploadedModelId  = answers.gripper_model_id  || null
-  const uploadedStlUrl   = answers.gripper_stl_url   || null
-  const uploadedGlbUrl   = answers.gripper_glb_url   || null
-  const uploadedName     = answers.gripper_upload_name || ''
-  const uploadedDims     = answers.gripper_dimensions || null
-  const gripperName      = answers.gripper_name || uploadedName
-  const activateSignal   = answers.gripper_activate_signal || ''
-  const confirmSignal    = answers.gripper_confirm_signal  || ''
-
-  const uploadFile = async (file) => {
-    if (!file) return
-    const lower = file.name.toLowerCase()
-    if (!(lower.endsWith('.step') || lower.endsWith('.stp'))) {
-      setUploadErr('Only .step / .stp files accepted')
-      return
-    }
-    setUploadErr('')
-    setUploading(true)
-    try {
-      const form = new FormData()
-      form.append('file', file)
-      const res = await fetch('/api/gripper/upload', { method: 'POST', body: form })
-      const data = await res.json()
-      if (!res.ok || data.error) {
-        setUploadErr(data.error || 'Upload failed')
-      } else {
-        setAnswer('gripper_model_id',   data.id)
-        setAnswer('gripper_glb_url',    data.glb_url || null)
-        setAnswer('gripper_stl_url',    data.stl_url || null)
-        setAnswer('gripper_upload_name', data.name || '')
-        setAnswer('gripper_dimensions', data.dimensions || null)
-        if (!answers.gripper_name && data.name) {
-          setAnswer('gripper_name', data.name)
-        }
-      }
-    } catch (e) {
-      setUploadErr('Upload error: ' + (e?.message || 'unknown'))
-    }
-    setUploading(false)
-  }
-
-  const removeModel = () => {
-    const id = answers.gripper_model_id
-    if (id) {
-      fetch('/api/gripper/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {})
-    }
-    setAnswer('gripper_model_id',   null)
-    setAnswer('gripper_glb_url',    null)
-    setAnswer('gripper_stl_url',    null)
-    setAnswer('gripper_upload_name', '')
-    setAnswer('gripper_dimensions', null)
-  }
-
-  const onDrop = (e) => {
-    e.preventDefault()
-    setDragOver(false)
-    const f = e.dataTransfer?.files?.[0]
-    if (f) uploadFile(f)
-  }
-
-  return (
-    <div style={{ padding: 24, maxWidth: 720, margin: '0 auto' }}>
-      <div style={{ fontSize: 22, fontWeight: 700, color: '#111', marginBottom: 8, lineHeight: 1.3 }}>
-        Custom Gripper
-      </div>
-      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 20, lineHeight: 1.5 }}>
-        Optional: upload a STEP file for a 3D preview. Name your gripper and assign any digital I/O it uses.
-      </div>
-
-      {/* Section 1 — STEP file */}
-      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 8 }}>STEP File (optional)</div>
-      {uploading ? (
-        <div style={{
-          padding: 28, border: '2px dashed #bfdbfe', borderRadius: 10, background: '#eff6ff',
-          textAlign: 'center', marginBottom: 20,
-        }}>
-          <div style={{
-            width: 28, height: 28, margin: '0 auto 10px',
-            border: '3px solid #bfdbfe', borderTopColor: '#2563EB',
-            borderRadius: '50%', animation: 'spin 1s linear infinite',
-          }} />
-          <div style={{ fontSize: 13, color: '#2563EB', fontWeight: 600 }}>Processing STEP file…</div>
-          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-        </div>
-      ) : uploadedModelId && uploadedStlUrl ? (
-        <div style={{ marginBottom: 20 }}>
-          <GripperPreviewCanvas
-            stlUrl={uploadedStlUrl}
-            name={uploadedName || gripperName}
-            dims={uploadedDims}
-            onRemove={removeModel}
-          />
-        </div>
-      ) : (
-        <div
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={onDrop}
-          style={{
-            padding: 28, marginBottom: 20,
-            border: '2px dashed ' + (dragOver ? '#2563EB' : '#d1d5db'),
-            background: dragOver ? '#eff6ff' : '#f8fafc',
-            borderRadius: 10, textAlign: 'center',
-            transition: 'all 100ms',
-          }}>
-          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 10 }}>
-            Upload a STEP file to preview your gripper in 3D (optional)
-          </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".step,.stp"
-            style={{ display: 'none' }}
-            onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f); e.target.value = '' }}
-          />
-          <button onClick={() => fileInputRef.current?.click()}
-            style={{
-              padding: '10px 18px', fontSize: 13, fontWeight: 700,
-              background: '#2563EB', color: '#fff', border: 'none',
-              borderRadius: 8, cursor: 'pointer',
-            }}>
-            Upload Gripper STEP File
-          </button>
-          <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 8 }}>
-            Or drag and drop a .step / .stp file here.
-          </div>
-        </div>
-      )}
-      {uploadErr && (
-        <div style={{
-          padding: 10, marginBottom: 16, fontSize: 12,
-          background: '#fef2f2', border: '1px solid #fecaca',
-          borderRadius: 6, color: '#DC2626',
-        }}>{uploadErr}</div>
-      )}
-
-      {/* Section 2 — Name */}
-      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 4 }}>Gripper name</div>
-      <input
-        value={gripperName}
-        onChange={(e) => setAnswer('gripper_name', e.target.value)}
-        placeholder="e.g. Custom Magnetic Gripper"
-        style={{ ...inputBox, fontSize: 15, marginBottom: 20 }}
-      />
-
-      {/* Section 3 — I/O */}
-      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 4 }}>
-        I/O signals (optional — assign if your gripper uses digital I/O)
-      </div>
-      <IOPortDropdown
-        label="Activate signal"
-        direction="output"
-        value={activateSignal}
-        onChange={(v) => setAnswer('gripper_activate_signal', v)}
-        ioLabels={ioLabels}
-      />
-      <IOPortDropdown
-        label="Confirm signal"
-        direction="input"
-        value={confirmSignal}
-        onChange={(v) => setAnswer('gripper_confirm_signal', v)}
-        ioLabels={ioLabels}
-      />
-
-      <NextButton onClick={goNext} disabled={!gripperName.trim()} label="Next" />
-    </div>
-  )
-}
-
-// ────────────────────────────────────────────────────────
-// TeachSequence — the dedicated end-of-wizard teach flow
-//
-// One position at a time. Derives the list from `answers` (operation
-// + pallet_mode, etc.), walks the operator through them
-// with a full-bleed jog pendant (140×140 buttons, same sizing as the
-// Program tab's maximised pendant), and writes the recorded
-// {tcp, joints, taught_at, skipped} payload into answers under
-// taught_home / taught_pick / taught_place / etc. so program
-// generation and the Review page can read them.
-// ────────────────────────────────────────────────────────
+// Style + math tokens retained from the retired custom-gripper block
 
 // Derive the ordered list of positions for the current operation.
 function teachPositionsForAnswers(answers) {
@@ -756,59 +535,105 @@ function teachPositionsForAnswers(answers) {
     { key: 'taught_home', label: 'HOME POSITION',
       instr: 'Jog the robot to its safe home position — a neutral pose away from the work area that the robot returns to between cycles.' },
   ]
+  // Teach flow speaks the contact-pose model — the operator teaches
+  // where the gripper physically TOUCHES the part / target, not an
+  // approach hover. Approach and retreat poses are derived at build
+  // time from the taught contact + program-config approach_height.
   if (op === 'palletize' && mode === 'palletize') {
     positions.push({
       key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
+    })
+    // 4-point pallet frame (2026-08-05 operator doctrine ruling,
+    // canonical): three CORNERS define the pallet FRAME ONLY
+    // (origin at corner 1, row axis toward corner 2, column axis
+    // toward corner 3, plane from all three). Point 4 is the
+    // CENTER of slot [1,1] — the first-part datum. Slot spacing
+    // comes exclusively from the typed row/column pitch in the
+    // parameters dialog: slot[i,j] = datum + (i-1)·pitch_row·rowax
+    // + (j-1)·pitch_col·colax. Corner-to-corner distance has NO
+    // required relationship to pitch — teach at the pallet's
+    // physical corners regardless of grid dimensions.
+    positions.push({
+      key: 'taught_pallet_corner1', label: '① PALLET CORNER — origin',
+      role: 'pallet_c1',
+      instr: "Touch the pallet's physical corner at slot [1,1] — this anchors the pallet frame origin. Geometry only; no part needs to be in the slot.",
     })
     positions.push({
-      key: 'taught_pallet_corner', label: 'PALLET CORNER [row 1, col 1, layer 1]',
-      instr: 'Jog the robot to the centre of the FIRST pallet slot — bottom layer, nearest corner [row 1, col 1, layer 1]. All other grid positions will be calculated automatically.',
+      key: 'taught_pallet_corner2', label: '② PALLET CORNER — along the first row',
+      role: 'pallet_c2',
+      instr: "Touch the pallet's physical corner at the far end of the first row. This locks the ROW DIRECTION only — slot pitch comes from the parameters dialog.",
+    })
+    positions.push({
+      key: 'taught_pallet_corner3', label: '③ PALLET CORNER — along the first column',
+      role: 'pallet_c3',
+      instr: "Touch the pallet's physical corner at the far end of the first column. This locks the COLUMN DIRECTION only — slot pitch comes from the parameters dialog.",
+    })
+    positions.push({
+      key: 'taught_pallet_part', label: '④ FIRST PART CENTER — slot [1,1] datum',
+      role: 'pallet_part',
+      instr: 'Place a real part in slot [1,1] and touch the CENTER of that first place position — this datum plus your typed row/column pitch determines every other slot.',
     })
   } else if (op === 'palletize' && mode === 'depalletize') {
     positions.push({
-      key: 'taught_pallet_corner', label: 'PALLET CORNER [row 1, col 1, top layer]',
-      instr: 'Jog the robot to the centre of the FIRST part to pick — top layer, nearest corner [row 1, col 1]. All other grid positions will be calculated automatically.',
+      key: 'taught_pallet_corner1', label: '① PALLET CORNER — origin (top layer)',
+      role: 'pallet_c1',
+      instr: "Touch the pallet's physical corner at slot [1,1] on the top layer — anchors the pallet frame origin.",
+    })
+    positions.push({
+      key: 'taught_pallet_corner2', label: '② PALLET CORNER — along the first row',
+      role: 'pallet_c2',
+      instr: "Touch the pallet's physical corner at the far end of the first row on the top layer — locks ROW DIRECTION only; pitch is typed.",
+    })
+    positions.push({
+      key: 'taught_pallet_corner3', label: '③ PALLET CORNER — along the first column',
+      role: 'pallet_c3',
+      instr: "Touch the pallet's physical corner at the far end of the first column on the top layer — locks COLUMN DIRECTION only; pitch is typed.",
+    })
+    positions.push({
+      key: 'taught_pallet_part', label: '④ FIRST PART CENTER — slot [1,1,top] datum',
+      role: 'pallet_part',
+      instr: 'Place a real part at slot [1,1,top] and touch the CENTER of it — this datum plus the typed pitch determines every pick pose.',
     })
     positions.push({
       key: 'taught_place', label: 'PLACE POSITION',
-      instr: 'Jog the robot to where it should place parts, above the target location at the correct approach angle.',
+      instr: 'Jog the robot to the place CONTACT — the pose where the part is released against the target surface. The retreat above is computed automatically.',
     })
   } else if (op === 'machine_tend') {
     positions.push({
       key: 'taught_pick', label: 'PICK / LOAD POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — where the gripper/vacuum touches the part. Approach and retreat are computed from your approach-height setting.',
     })
     positions.push({
       key: 'taught_machine_load', label: 'MACHINE LOAD POSITION',
-      instr: 'Jog the robot to the machine load point — where it places a part into the machine fixture.',
+      instr: 'Jog the robot to the machine-load CONTACT — where the part is seated in the fixture. Approach and retreat are computed automatically.',
     })
     positions.push({
       key: 'taught_unload', label: 'UNLOAD POSITION',
-      instr: 'Jog the robot to where it picks the finished part out of the machine.',
+      instr: 'Jog the robot to the unload CONTACT — where the finished part is released. Approach and retreat are computed automatically.',
     })
   } else if (op === 'sort') {
     positions.push({
       key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — where the gripper/vacuum touches the part. Approach and retreat are computed automatically.',
     })
     positions.push({
       key: 'taught_sort_1', label: 'SORT PLACE 1',
-      instr: 'Jog the robot to the first sort destination — where type 1 parts are placed.',
+      instr: 'Jog the robot to the CONTACT for the first sort destination — where type 1 parts are released.',
     })
     positions.push({
       key: 'taught_sort_2', label: 'SORT PLACE 2',
-      instr: 'Jog the robot to the second sort destination — where type 2 parts are placed.',
+      instr: 'Jog the robot to the CONTACT for the second sort destination — where type 2 parts are released.',
     })
   } else {
     // Default: pick_and_place and anything else with a pick + place flow.
     positions.push({
       key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
     })
     positions.push({
       key: 'taught_place', label: 'PLACE POSITION',
-      instr: 'Jog the robot to where it should place parts, above the target location at the correct approach angle.',
+      instr: 'Jog the robot to the place CONTACT — the pose where the part is released against the target surface. The retreat above is computed automatically.',
     })
   }
   // Every operation's generated program ends with a move_home ("Return
@@ -827,6 +652,8 @@ function teachPositionsForAnswers(answers) {
   })
   return positions
 }
+
+
 
 function ProgressDots({ count, currentIdx, statuses }) {
   return (
@@ -857,8 +684,9 @@ function ProgressDots({ count, currentIdx, statuses }) {
 }
 
 function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSteps, setReusedSteps }) {
-  const jog          = useStore((s) => s.jog)
-  const jogCartesian = useStore((s) => s.jogCartesian)
+  const jogHold          = useStore((s) => s.jogHold)
+  const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
+  const jogRelease       = useStore((s) => s.jogRelease)
   const homeRobot    = useStore((s) => s.homeRobot)
   const triggerEstop = useStore((s) => s.triggerEstop)
 
@@ -922,14 +750,57 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     return () => { alive = false; clearInterval(iv) }
   }, [])
 
-  const sendJog = useCallback((axis, direction) => {
+  // 2026-09-15 reuse UX: on mount, if THIS program has no locally
+  // taught home yet, consult the program-independent global home
+  // (/opt/cobot/home.json). When present, seed answers.taught_home
+  // with source='global' so the existing reuse-choice screen fires
+  // when the wizard reaches the HOME POSITION step. Never auto-
+  // applied — operator must click "Reuse This Position" (default
+  // action stays "Teach now"). If the global home is absent this
+  // is a no-op; if the program already carries a local taught_home
+  // (edit-mode, or the wizard back-navigated) we don't overwrite.
+  useEffect(() => {
+    let alive = true
+    const th = answers?.taught_home
+    const alreadyTaughtLocally = th && !th.skipped &&
+      (Array.isArray(th.joints) || Array.isArray(th.tcp))
+    if (alreadyTaughtLocally) return
+    ;(async () => {
+      try {
+        const res = await fetch('/api/robot/home')
+        if (!alive || !res.ok) return
+        const g = await res.json()
+        if (!g?.present) return
+        if (!Array.isArray(g.joints) && !Array.isArray(g.tcp)) return
+        setAnswer('taught_home', {
+          joints:    g.joints || null,
+          tcp:       Array.isArray(g.tcp) ? g.tcp : null,
+          taught_at: g.taught_at || null,
+          source:    'global',
+          skipped:   false,
+        })
+      } catch {}
+    })()
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Migrated 2026-07-22 from the discrete HTTP-pulse `s.jog` /
+  // `s.jogCartesian` pattern (see TeachWithJog above for the full
+  // rationale). Same HoldButton-driven WS transport TeachOverlay uses.
+  const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
-      const deltaRad = direction * stepRef.current * Math.PI / 180
-      jog(axis - 1, deltaRad)
-    } else {
-      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+      return jogHold(axis, direction, speedRef.current, meta)
     }
-  }, [jog, jogCartesian])
+    return jogHoldCartesian(axis, direction, speedRef.current, meta)
+  }, [jogHold, jogHoldCartesian])
+  const holdEnd = useCallback((meta) => jogRelease(modeRef.current, meta),
+    [jogRelease])
+  const wire = useCallback((axis, direction) => ({
+    onPressStart: (meta) => holdStart(axis, direction, meta),
+    onPressTick:  (meta) => holdStart(axis, direction, meta),
+    onPressEnd:   (meta) => holdEnd(meta),
+  }), [holdStart, holdEnd])
 
   // Compute per-position status (recorded / reused / skipped / pending)
   // for the progress dots and Review page card. A step marked 'reused'
@@ -1078,11 +949,25 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   }, [posIdx])
 
   function skipCurrent() {
-    setAnswer(current.key, {
-      tcp: null, joints: null,
-      taught_at: new Date().toISOString(),
-      skipped: true,
-    })
+    // Don't clobber an earlier-taught value that shares this key. The
+    // pallet + pick_and_place flows re-use `taught_home` for the return-
+    // home step at the tail of the sequence; if the operator taught
+    // home at step 1 and hits Skip on the return-home step, we must
+    // NOT overwrite the taught pose with {skipped:true} — otherwise
+    // the review page's Positions Taught list flips `taught_home` to
+    // "required — skipped" and the operator sees a false "home
+    // untaught" verdict after they clearly taught it. Same guard
+    // skipAllRemaining() already uses.
+    const existing = answers[current.key]
+    const alreadyRecorded = !!(existing && !existing.skipped
+      && (Array.isArray(existing.tcp) || Array.isArray(existing.joints)))
+    if (!alreadyRecorded) {
+      setAnswer(current.key, {
+        tcp: null, joints: null,
+        taught_at: new Date().toISOString(),
+        skipped: true,
+      })
+    }
     clearReusedAt(posIdx)
     advanceOrComplete()
   }
@@ -1184,11 +1069,14 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   return (
     // True fullscreen container — no centered modal, no backdrop margins,
     // no rounded corners. The overlay IS the screen. Vertical flex column
-    // with overflow: hidden so the layout exactly fills 100vh and nothing
-    // scrolls. The jog pad area absorbs all remaining vertical space.
+    // with overflow: hidden so the layout exactly fills the viewport and
+    // nothing scrolls. The jog pad area absorbs all remaining vertical
+    // space. `inset: 0` sizes to the ACTUAL visible viewport (not the
+    // large-viewport 100vh, which on mobile Safari includes the address
+    // bar and pushes the footer bottom off-screen). Removed the redundant
+    // `width: 100vw, height: 100vh` for that reason.
     <div style={{
-      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-      width: '100vw', height: '100vh',
+      position: 'fixed', inset: 0,
       margin: 0, padding: 0, borderRadius: 0,
       zIndex: 2000,
       background: '#fff',
@@ -1261,6 +1149,17 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
         }}>
           {current.instr}
         </div>
+        {current.role && (current.role === 'pallet_c1'
+                          || current.role === 'pallet_c2'
+                          || current.role === 'pallet_c3'
+                          || current.role === 'pallet_part') && (
+          <PalletFrameDiagram
+            role={current.role}
+            rows={answers.pallet_rows || 4}
+            cols={answers.pallet_cols || 4}
+            fillOrder={answers.pallet_fill_order || 'row_lr'}
+          />
+        )}
       </div>
 
       {recordErr && (
@@ -1397,7 +1296,22 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                 ) : null}
               </div>
               <div style={{ fontSize: 13, color: '#6b7280' }}>
-                Taught earlier in this setup.
+                {(() => {
+                  const src = existingForCurrent?.source
+                  const at  = existingForCurrent?.taught_at
+                  let when = null
+                  if (at) {
+                    try { when = new Date(at).toLocaleString() } catch { when = at }
+                  }
+                  if (src === 'global') {
+                    return when
+                      ? `From your saved home position (taught ${when}).`
+                      : 'From your saved home position.'
+                  }
+                  return when
+                    ? `Taught earlier in this setup on ${when}.`
+                    : 'Taught earlier in this setup.'
+                })()}
               </div>
             </div>
             <div style={{ fontSize: 16, color: '#374151', marginBottom: 18, textAlign: 'center' }}>
@@ -1458,12 +1372,10 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
               minHeight: 44,
             }}>Home</button>
-            <button onClick={triggerEstop} style={{
-              padding: '10px 16px', fontSize: 13, fontWeight: 700,
-              background: '#DC2626', color: '#fff',
-              border: 'none', borderRadius: 6, cursor: 'pointer',
-              minHeight: 44,
-            }}>STOP</button>
+            {/* STOP moved into the sticky footer bar so it stays visible
+                on tablet-portrait even when this toolbar wraps or the
+                jog area consumes all vertical space. See the FOOTER
+                block below. */}
           </div>
 
           {/* JOG PAD — flex:1, scales to fit. Buttons sized via the
@@ -1486,18 +1398,18 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                     gridTemplateAreas: '". up ." "left center right" ". down ."',
                     gap: padGap,
                   }}>
-                    <div style={{ gridArea: 'up' }}>    <JogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} /></div>
-                    <div style={{ gridArea: 'left' }}>  <JogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} /></div>
+                    <div style={{ gridArea: 'up' }}>    <WizardJogArrow {...wire('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} /></div>
+                    <div style={{ gridArea: 'left' }}>  <WizardJogArrow {...wire('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} /></div>
                     <div style={{ gridArea: 'center' }}><PadCenterTile label="XY" width={padBtn} height={padBtn} /></div>
-                    <div style={{ gridArea: 'right' }}> <JogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} /></div>
-                    <div style={{ gridArea: 'down' }}>  <JogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} /></div>
+                    <div style={{ gridArea: 'right' }}> <WizardJogArrow {...wire('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} /></div>
+                    <div style={{ gridArea: 'down' }}>  <WizardJogArrow {...wire('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} /></div>
                   </div>
                 </div>
                 <div>
                   <div style={padLabelStyle}>Height</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: padGap, width: padBtn }}>
-                    <JogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} />
-                    <JogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} />
+                    <WizardJogArrow {...wire('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} />
+                    <WizardJogArrow {...wire('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} />
                   </div>
                 </div>
                 <div>
@@ -1509,11 +1421,11 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                     gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
                     gap: padGap,
                   }}>
-                    <div style={{ gridArea: 'rxp' }}>   <JogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} /></div>
-                    <div style={{ gridArea: 'rzn' }}>   <JogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rxp' }}>   <WizardJogArrow {...wire('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rzn' }}>   <WizardJogArrow {...wire('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} /></div>
                     <div style={{ gridArea: 'center' }}><PadCenterTile label="Rot" width={padBtn} height={padBtn} /></div>
-                    <div style={{ gridArea: 'rzp' }}>   <JogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} /></div>
-                    <div style={{ gridArea: 'rxn' }}>   <JogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rzp' }}>   <WizardJogArrow {...wire('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rxn' }}>   <WizardJogArrow {...wire('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} /></div>
                   </div>
                 </div>
               </div>
@@ -1522,8 +1434,8 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                 {[1, 2, 3, 4, 5, 6].map((j) => (
                   <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: padGap }}>
                     <div style={{ fontSize: 14, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
-                    <JogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} />
-                    <JogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} />
+                    <WizardJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} />
+                    <WizardJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} />
                   </div>
                 ))}
               </div>
@@ -1541,42 +1453,58 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
         <ProgressDots count={positions.length} currentIdx={posIdx} statuses={statuses} />
       </div>
 
-      {/* FOOTER (~88px) — Back / Record / Skip in teach mode; only Back in
-          choice mode (the Reuse/Re-teach buttons live in the body). */}
+      {/* STICKY FOOTER — tablet-first: STOP + Back + Record + Skip share
+          one row that stays reserved outside the scrollable content.
+          padding-bottom includes env(safe-area-inset-bottom) so the row
+          clears the iOS home indicator / Android nav bar. `Enter
+          manually` moved down a tier — it's less critical than STOP and
+          the sticky row on 800 px portrait doesn't have space for a
+          fifth button. */}
       <div style={{
         flex: '0 0 auto', minHeight: 88,
-        padding: '14px 24px',
+        padding: '14px 16px',
+        paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 14px)',
         borderTop: '1px solid #e5e7eb',
-        display: 'flex', gap: 12, alignItems: 'center',
+        display: 'flex', gap: 10, alignItems: 'center',
         boxSizing: 'border-box',
+        flexWrap: 'wrap',
       }}>
+        <button onClick={triggerEstop} style={{
+          padding: '0 18px', minHeight: 56, minWidth: 96,
+          fontSize: 15, fontWeight: 800,
+          background: '#DC2626', color: '#fff',
+          border: 'none', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
+          boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
+        }}>⏹ STOP</button>
         <button onClick={goBack} style={{
-          padding: '14px 22px', minHeight: 56, fontSize: 14, fontWeight: 700,
+          padding: '0 18px', minHeight: 56, fontSize: 14, fontWeight: 700,
           background: '#fff', color: '#374151',
           border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
         }}>← Back</button>
         {!showChoiceScreen && (
           <>
-            <div style={{ flex: 1 }} />
-            <button onClick={openManualEntry} title="Type in x/y/z + orientation instead of capturing live" style={{
-              padding: '14px 20px', minHeight: 56, fontSize: 13, fontWeight: 700,
-              background: '#fff', color: '#2563EB',
-              border: '1px solid #93c5fd', borderRadius: 10, cursor: 'pointer',
-            }}>Enter manually</button>
             <button onClick={recordPosition} style={{
-              padding: '14px 32px', minHeight: 60, fontSize: 16, fontWeight: 800,
+              flex: 1, padding: '0 20px', minHeight: 60, fontSize: 16, fontWeight: 800,
               background: flash ? '#16A34A' : '#2563EB', color: '#fff',
               border: 'none', borderRadius: 10, cursor: 'pointer',
-              minWidth: 220,
+              minWidth: 200,
               transition: 'background 200ms',
             }}>
               {flash ? '✓ Recorded' : 'Record Position'}
             </button>
-            <div style={{ flex: 1 }} />
+            <button onClick={openManualEntry} title="Type in x/y/z + orientation instead of capturing live" style={{
+              padding: '0 14px', minHeight: 56, fontSize: 13, fontWeight: 700,
+              background: '#fff', color: '#2563EB',
+              border: '1px solid #93c5fd', borderRadius: 10, cursor: 'pointer',
+              flexShrink: 0,
+            }}>Enter…</button>
             <button onClick={skipCurrent} style={{
-              padding: '14px 22px', minHeight: 56, fontSize: 14, fontWeight: 700,
+              padding: '0 18px', minHeight: 56, fontSize: 14, fontWeight: 700,
               background: '#fff', color: '#374151',
               border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+              flexShrink: 0,
             }}>Skip →</button>
           </>
         )}
@@ -1585,75 +1513,155 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   )
 }
 
-function CellPickerPage({ answers, setAnswer, goNext }) {
-  const [cells, setCells]   = useState([])
-  const [active, setActive] = useState(null)
-  const [loaded, setLoaded] = useState(false)
-  useEffect(() => {
-    let alive = true
-    fetch('/api/cells').then(r => r.json()).then((j) => {
-      if (!alive) return
-      setCells((j.cells || []).filter(c => c.commissioning_complete))
-      setActive(j.active_cell_id || null)
-      setLoaded(true)
-      // Pre-select the active cell on first mount if the user hasn't
-      // already chosen one in this session.
-      if (j.active_cell_id && !answers.cell_id) {
-        setAnswer('cell_id', j.active_cell_id)
-      }
-    }).catch(() => { setLoaded(true) })
-    return () => { alive = false }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+// 2026-09-08: CellPickerPage RETIRED. Cell auto-assign lives in
+// ProgramWizard mount below — one commissioned cell auto-selects,
+// zero or many leaves cell_id null (silent).
 
-  const haveCells = cells.length > 0
+
+// ── Page bodies that use hooks — extracted as proper Components so
+// ── React tracks their hook stacks separately from the parent
+// ── ProgramWizard fiber. Prior inline lambda form
+//    render: ({...}) => { const [x] = useState(...); ... }
+// tripped react-hooks/rules-of-hooks because the render-prop function
+// has a lowercase name from ESLint's perspective; capitalising the
+// component name is what tells the linter this IS a component and
+// makes the hooks legal. The PAGES entries below simply spread these
+// component references into the `render` field.
+// Detection-engine capability list (2026-08-03 architecture directive).
+// The Isaac ROS TensorRT YOLOv8 pipeline ships with COCO weights on
+// day one, so parts whose canonical name matches a COCO class detect
+// immediately. Everything else needs the Phase 2 fine-tune pipeline
+// (CAD → synthetic renders → TensorRT engine) — training takes ~1
+// hour in the cloud, gated on the RunPod account. The wizard surfaces
+// the training requirement per-part so the operator sees the story
+// before they hit Run and get an empty detection.
+const COCO_NATIVE_NAMES = new Set([
+  'bowl', 'cup', 'bottle', 'wine glass', 'fork', 'knife', 'spoon',
+  'banana', 'apple', 'orange', 'book', 'scissors', 'cell phone',
+  'laptop', 'keyboard', 'mouse', 'remote', 'clock',
+])
+
+function partIsCocoNative(part) {
+  const name = String(part?.name || '').toLowerCase().trim()
+  // Match against the canonical name AND any coco_alias the parts
+  // library carries (added when the operator uploads a STEP with a
+  // matching classifier hint).
+  if (COCO_NATIVE_NAMES.has(name)) return true
+  const alias = String(part?.coco_alias || '').toLowerCase().trim()
+  if (alias && COCO_NATIVE_NAMES.has(alias)) return true
+  return false
+}
+
+function WhichPartBody({ answers, setAnswer, goNext }) {
+  const [parts, setParts] = useState([])
+  useEffect(() => {
+    fetch('/api/parts').then(r => r.json()).then(d => setParts(d.parts || [])).catch(() => {})
+  }, [])
   return (
     <QuestionCard
-      question="Which workspace is this program for?"
-      description="Programs are scoped to a commissioned cell. The active cell is pre-selected."
+      question="Which part should the robot look for?"
+      description={
+        "Select a part from the library. The robot will only pick "
+        + "this type. Parts marked “training required” will "
+        + "not be detected until their model is trained — the "
+        + "Isaac ROS engine ships with COCO weights, and custom "
+        + "parts need a ~1-hour fine-tune (Phase 2, gated on the "
+        + "RunPod cloud pilot)."
+      }
     >
-      {!loaded && <div style={{ color: '#6b7280', fontSize: 13 }}>Loading cells…</div>}
-      {loaded && !haveCells && (
-        <div style={{
-          padding: 14, background: '#fffbeb', border: '1px solid #fde68a',
-          borderRadius: 10, color: '#92400e', fontSize: 13, lineHeight: 1.5,
-          marginBottom: 12,
-        }}>
-          No cells commissioned yet. You can still continue without one, but linking the program to a cell unlocks per-cell baselines and bounds later.
-          {' '}Go to <strong>Configure → Setup Wizard</strong> to commission one.
+      {parts.length === 0 ? (
+        <div style={{ padding: 24, textAlign: 'center', color: '#6b7280', border: '2px dashed #d1d5db', borderRadius: 8 }}>
+          No parts in the library. Upload STEP files in Part Recognition first.
         </div>
-      )}
-      {loaded && haveCells && (
-        <div style={{ marginBottom: 12 }}>
-          {cells.map(c => (
-            <ChoiceButton key={c.cell_id}
-              label={c.name + (c.cell_id === active ? '   (Active)' : '')}
-              description={
-                (c.baseline_captured ? `Baseline ${(c.baseline_point_count || 0).toLocaleString()} pts · ` : 'No baseline · ')
-                + (c.commissioning_complete ? 'Commissioned' : 'Incomplete')
-              }
-              selected={answers.cell_id === c.cell_id}
-              onClick={() => { setAnswer('cell_id', c.cell_id); goNext() }}
-            />
-          ))}
+      ) : parts.map(p => {
+        const cocoNative = partIsCocoNative(p)
+        const modelTrained = !!p.model_trained
+        const detectable = cocoNative || modelTrained
+        const trainingNote = detectable
+          ? null
+          : ' — training required (~1 hour in the cloud, Phase 2)'
+        return (
+          <ChoiceButton key={p.id} label={p.name + (detectable ? '' : ' ⚠')}
+            description={
+              `${p.extents_cm?.[0]} x ${p.extents_cm?.[1]} x ${p.extents_cm?.[2]} cm`
+              + (trainingNote || '')
+            }
+            selected={answers.target_part === p.id}
+            onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext({ target_part: p.id, target_part_name: p.name }) }}
+          />
+        )
+      })}
+    </QuestionCard>
+  )
+}
+
+function MachineIOBody({ answers, setAnswer, goNext }) {
+  const portmap = useIOPortmap()
+  const synapsePortmap = useSynapsePortmap()
+  const doOptions = portmapToOptions(portmap, 'output')
+  const diOptions = portmapToOptions(portmap, 'input')
+  // 2026-10-01 Synapse Addressing Doctrine: dropdown rows render the
+  // Synapse name primarily ("Valve 03 (DO3) — Vacuum On") so operators
+  // pick slots by their panel labels, not by raw controller channels.
+  const synDisplay = (o) => {
+    if (!synapsePortmap) return o.display
+    const syn = displayNameForRaw(synapsePortmap, o.id)
+    const base = `${syn} (${o.id})`
+    const suffix = o.label
+      ? ` — ${o.label}${o.flange ? ' (flange)' : ''}`
+      : (o.flange ? ' (flange)' : '')
+    return `${base}${suffix}`
+  }
+  return (
+    <QuestionCard
+      question="Which I/O signals control the machine?"
+      description="Select the digital outputs and inputs that communicate with the machine."
+    >
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+          Cycle Start Signal (output to machine)
         </div>
-      )}
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
-        <NextButton
-          onClick={goNext}
-          label={haveCells ? 'Use selected' : 'Continue without a cell'}
-        />
+        <select value={answers.io_cycle_start || 'DO4'}
+          onChange={e => setAnswer('io_cycle_start', e.target.value)}
+          style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
+          {doOptions.map(o => <option key={o.id} value={o.id}>{synDisplay(o)}</option>)}
+        </select>
       </div>
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+          Cycle Complete Signal (input from machine)
+        </div>
+        <select value={answers.io_cycle_done || 'DI3'}
+          onChange={e => setAnswer('io_cycle_done', e.target.value)}
+          style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
+          {diOptions.map(o => <option key={o.id} value={o.id}>{synDisplay(o)}</option>)}
+        </select>
+      </div>
+      <SliderQuestion label="Cycle timeout" value={answers.cycle_timeout || 30}
+        onChange={v => setAnswer('cycle_timeout', v)} min={5} max={300} step={5} unit="s"
+        description="Maximum time to wait for the machine to finish before flagging an error" />
+      <NextButton onClick={goNext} label="Next" />
     </QuestionCard>
   )
 }
 
 const PAGES = [
-  // 0: Which workspace is this program for?
-  {
-    id: 'cell',
-    render: CellPickerPage,
-  },
+  // 2026-09-08 wizard simplification (operator directive):
+  //   * `cell` page RETIRED. Auto-assigned in ProgramWizard mount
+  //     when exactly one commissioned cell exists; silent null
+  //     otherwise. Cell-less programs load / push / run
+  //     correctly (the footer's "No cell — environment guard off"
+  //     path has been the default when no cell is active for a
+  //     week now).
+  //   * `sort` operation RETIRED from the operation page (codegen
+  //     paths on the backend stay live so existing sort programs
+  //     on disk still load; only the wizard chooser goes).
+  //   * `pick_method` page RETIRED. Source defaults to
+  //     'fixed_position' for pick_and_place + machine_tend; the
+  //     palletize flow still sets its own source via pallet_mode.
+  //     `which_part` skip predicate (`source !== 'camera_library'`)
+  //     handles the source=undefined case as True → page skipped
+  //     with no orphan.
 
   // 1: What operation?
   {
@@ -1665,13 +1673,28 @@ const PAGES = [
       >
         {[
           { value: 'pick_and_place', label: 'Pick and Place', desc: 'Pick an object and move it to another location', icon: 'P' },
-          { value: 'sort', label: 'Sort Parts', desc: 'Identify parts and place them in different locations by type', icon: 'S' },
           { value: 'machine_tend', label: 'Machine Tending', desc: 'Load parts into a machine, wait, then unload', icon: 'M' },
           { value: 'palletize', label: 'Palletize', desc: 'Stack parts onto a pallet or pick them off a pallet', icon: 'G' },
         ].map(op => (
           <ChoiceButton key={op.value} label={op.label} description={op.desc} icon={op.icon}
             selected={answers.operation === op.value}
-            onClick={() => { setAnswer('operation', op.value); goNext() }}
+            onClick={() => {
+              // Default `source` alongside `operation` per the
+              // 2026-09-08 directive: pick_and_place + machine_tend
+              // = fixed-position taught pick (skips the retired
+              // which_part page); palletize sets its own source
+              // in the pallet_mode click handler. Passing both
+              // keys through the goNext override so skip predicates
+              // on downstream pages see the fresh values (per the
+              // desync class fix).
+              const override = { operation: op.value }
+              if (op.value !== 'palletize') {
+                override.source = 'fixed_position'
+              }
+              setAnswer('operation', op.value)
+              if (override.source) setAnswer('source', override.source)
+              goNext(override)
+            }}
           />
         ))}
       </QuestionCard>
@@ -1687,9 +1710,10 @@ const PAGES = [
     skip: (answers) => answers.operation !== 'palletize',
     render: ({ answers, setAnswer, goNext }) => {
       const choose = (mode) => {
+        const source = mode === 'palletize' ? 'camera_library' : 'fixed_grid'
         setAnswer('pallet_mode', mode)
-        setAnswer('source', mode === 'palletize' ? 'camera_library' : 'fixed_grid')
-        goNext()
+        setAnswer('source', source)
+        goNext({ pallet_mode: mode, source })
       }
       const cardStyle = (selected) => ({
         flex: 1, minHeight: 140, padding: '20px 22px', cursor: 'pointer',
@@ -1737,113 +1761,54 @@ const PAGES = [
     },
   },
 
-  // 1: How does the robot find objects?
-  //    Skipped entirely for pallet modes — palletize forces camera_library,
-  //    depalletize forces fixed_grid (selection happens on the
-  //    pallet_mode page above).
-  //    Stores answers.source (the value downstream consumers read).
-  //    'camera_library' — vision detects the part using taught
-  //                       references from the Part Recognition library;
-  //                       requires the which_part page to pick which.
-  //    'fixed_position' — part is always in the same taught spot.
-  {
-    id: 'pick_method',
-    skip: (answers) => answers.operation === 'palletize',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="How should the robot find the parts?"
-        description="Choose how the robot identifies what to pick up."
-      >
-        {[
-          { value: 'camera_library', label: 'Camera Detection', desc: 'Camera detects parts using taught references from the Part Recognition library' },
-          { value: 'fixed_position', label: 'Fixed Position', desc: 'The part is always in the same spot (e.g. from a feeder or conveyor).' },
-        ].map(m => (
-          <ChoiceButton key={m.value} label={m.label} description={m.desc}
-            selected={answers.source === m.value}
-            onClick={() => { setAnswer('source', m.value); goNext() }}
-          />
-        ))}
-      </QuestionCard>
-    ),
-  },
+  // pick_method page RETIRED 2026-09-08. Source now defaults to
+  // 'fixed_position' from the operation page's click handler
+  // (pick_and_place + machine_tend). Palletize continues to set
+  // source in the pallet_mode click handler. Re-adding a
+  // camera-detection option is an editor-level change; do not
+  // reintroduce a wizard page for it without a fresh directive.
 
   // 2: Which part? (only if Camera Detection selected on page 1)
+  //   Palletize skips this page: the operator forces source=camera_library
+  //   from the pallet_mode selector for runtime detect emission, but does
+  //   NOT want to pre-select a specific library part during setup — the
+  //   emitted `detect mode:'library'` step scans for any known part, and
+  //   the label falls back to "Find library part" when target_part_name
+  //   is absent. Non-palletize flows (pick_and_place / sort with camera
+  //   detection) still show this page.
   {
     id: 'which_part',
-    skip: (answers) => answers.source !== 'camera_library',
-    render: ({ answers, setAnswer, goNext }) => {
-      const [parts, setParts] = useState([])
-      useEffect(() => {
-        fetch('/api/parts').then(r => r.json()).then(d => setParts(d.parts || [])).catch(() => {})
-      }, [])
-      return (
-        <QuestionCard
-          question="Which part should the robot look for?"
-          description="Select a part from the library. The robot will only pick this type."
-        >
-          {parts.length === 0 ? (
-            <div style={{ padding: 24, textAlign: 'center', color: '#6b7280', border: '2px dashed #d1d5db', borderRadius: 8 }}>
-              No parts in the library. Upload STEP files in Part Recognition first.
-            </div>
-          ) : parts.map(p => (
-            <ChoiceButton key={p.id} label={p.name}
-              description={`${p.extents_cm?.[0]} x ${p.extents_cm?.[1]} x ${p.extents_cm?.[2]} cm`}
-              selected={answers.target_part === p.id}
-              onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext() }}
-            />
-          ))}
-        </QuestionCard>
-      )
-    },
+    skip: (answers) => answers.operation === 'palletize'
+                    || answers.source !== 'camera_library',
+    render: WhichPartBody,
   },
 
-  // 3: What gripper type?
+  // 3: Which tool? (2026-09-22 "The Cell" tool-step directive)
+  //
+  // The old "What type of gripper?" question is retired. This step
+  // now renders CARDS from cell.eoats via the shared
+  // <ToolFromCellStep>, which is also imported by every other
+  // program-creation surface (palletizing, machine-tending — they
+  // ride the same PAGES list, so this file is the single mount).
+  // No tool-type / gripper-type / actuation question survives in
+  // any program-creation flow; every choice is a cell entry set up
+  // in EOAT Setup.
+  //
+  // The retired `gripper_settings` step (STEP upload + name + I/O)
+  // is gone with the type question — custom-tool CREATION lives in
+  // EOAT Setup. When the operator taps "+ Set up a new tool" here,
+  // the step opens EOATSetupWizard as a nested modal; on close, the
+  // cell refetches and the newly-added tool is preselected. Wizard
+  // state (all other answers) is preserved by construction — the
+  // ProgramWizard component doesn't unmount around the nested modal.
+  //
+  // Downstream code that historically read `answers.gripper_type`
+  // still gets it — ToolFromCellStep populates gripper_type +
+  // custom_tool_id + cell_eoat_id from the picked entry so
+  // buildSteps / codegen / tool-hookup lookups keep working.
   {
     id: 'gripper_type',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="What type of gripper will you use?"
-        description="Choose the end-of-arm tool for this operation."
-      >
-        {[
-          { value: 'finger', label: 'Finger Gripper', desc: 'Two parallel jaw fingers. Best for rigid parts with flat gripping surfaces.' },
-          { value: 'vacuum', label: 'Vacuum Suction', desc: 'Vacuum cup picks from the top. Best for flat, smooth, sealed surfaces.' },
-          { value: 'custom', label: 'Custom Gripper', desc: 'Upload a STEP file, name the gripper, and assign optional I/O. For magnetic, electroadhesive, or any other end-effector.' },
-        ].map(g => (
-          <ChoiceButton key={g.value} label={g.label} description={g.desc}
-            selected={answers.gripper_type === g.value}
-            onClick={() => { setAnswer('gripper_type', g.value); goNext() }}
-          />
-        ))}
-      </QuestionCard>
-    ),
-  },
-
-  // 4: Gripper settings
-  //    Vacuum → threshold slider.
-  //    Custom → STEP upload + name + I/O assignment.
-  //    Finger → nothing operator-tunable, page is skipped entirely.
-  {
-    id: 'gripper_settings',
-    skip: (answers) => !(answers.gripper_type === 'vacuum' || answers.gripper_type === 'custom'),
-    render: ({ answers, setAnswer, goNext }) => {
-      if (answers.gripper_type === 'custom') {
-        return (
-          <CustomGripperPanel answers={answers} setAnswer={setAnswer} goNext={goNext} />
-        )
-      }
-      return (
-        <QuestionCard
-          question="Set the vacuum settings"
-          description="These settings control how the gripper picks up parts."
-        >
-          <SliderQuestion label="Vacuum threshold" value={answers.vacuum_threshold || 70}
-            onChange={v => setAnswer('vacuum_threshold', v)} min={30} max={95} step={5} unit="%"
-            description="Minimum vacuum level needed to confirm a successful pick" />
-          <NextButton onClick={goNext} label="Next" />
-        </QuestionCard>
-      )
-    },
+    render: ToolFromCellStep,
   },
 
   // ──────────────────────────────────────────────────────────────────
@@ -1912,21 +1877,21 @@ const PAGES = [
           <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
             <label style={{ flex: 1, minWidth: 90 }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Rows</div>
-              <input type="number" min={1} max={20} value={rows}
-                onChange={(e) => setInt('pallet_rows', e.target.value, 1, 20)}
-                style={inputBox} />
+              <NumericField integer min={1} max={20} value={rows}
+                onCommit={(v) => setAnswer('pallet_rows', v)}
+                aria-label="Pallet rows" style={inputBox} />
             </label>
             <label style={{ flex: 1, minWidth: 90 }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Columns</div>
-              <input type="number" min={1} max={20} value={cols}
-                onChange={(e) => setInt('pallet_cols', e.target.value, 1, 20)}
-                style={inputBox} />
+              <NumericField integer min={1} max={20} value={cols}
+                onCommit={(v) => setAnswer('pallet_cols', v)}
+                aria-label="Pallet columns" style={inputBox} />
             </label>
             <label style={{ flex: 1, minWidth: 90 }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Layers</div>
-              <input type="number" min={1} max={10} value={layers}
-                onChange={(e) => setInt('pallet_layers', e.target.value, 1, 10)}
-                style={inputBox} />
+              <NumericField integer min={1} max={10} value={layers}
+                onCommit={(v) => setAnswer('pallet_layers', v)}
+                aria-label="Pallet layers" style={inputBox} />
             </label>
           </div>
 
@@ -2119,6 +2084,130 @@ const PAGES = [
     ),
   },
 
+  // 6b: Tool payload — mass + optional CoG. Stored under
+  // config.payload_kg / config.payload_cog_mm / config.tool_name.
+  // Non-blocking (operators can skip with "Not sure yet"), but every
+  // downstream surface (editor / run modal / monitor chip) will show
+  // an amber warning until it's filled in. See the codegen header
+  // and lib/payload.js for the full policy.
+  {
+    id: 'payload',
+    render: ({ answers, setAnswer, goNext }) => {
+      const kg = answers.payload_kg
+      const kgNum = Number(kg)
+      const canProceed = kg === 'skip' || (Number.isFinite(kgNum) && kgNum > 0)
+      // render() is always invoked from the wizard's <PageHost> as a
+      // component, so hook order stays stable. Rule flags the lowercase
+      // property name only.
+      // eslint-disable-next-line react-hooks/rules-of-hooks
+      const [showCog, setShowCog] = useState(false)
+      const cog = answers.payload_cog_mm || {}
+      return (
+        <QuestionCard
+          question="What tool or payload does this program use?"
+          description="Enter the tool's mass so the controller can size collision-detection thresholds correctly. If you don't know yet you can skip this and set it later in the program editor."
+        >
+          <div style={{
+            display: 'flex', flexDirection: 'column', gap: 12,
+            padding: '4px 2px',
+          }}>
+            <label style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>
+              Tool mass (kg)
+              <input
+                type="number" step="0.1" min="0" max="30"
+                placeholder="e.g. 1.2"
+                value={kg && kg !== 'skip' ? kg : ''}
+                onChange={(e) => setAnswer('payload_kg',
+                  e.target.value === '' ? null : Number(e.target.value))}
+                autoFocus
+                style={{
+                  display: 'block', marginTop: 6,
+                  padding: '8px 12px', fontSize: 16, fontWeight: 500,
+                  border: '1px solid #d1d5db', borderRadius: 8,
+                  background: '#fff', color: '#111827', width: 140,
+                }} />
+            </label>
+            <label style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>
+              Tool name (optional)
+              <input
+                type="text" maxLength={40}
+                placeholder="e.g. vacuum tool, welding gun, adaptive gripper"
+                value={answers.tool_name || ''}
+                onChange={(e) => setAnswer('tool_name', e.target.value)}
+                style={{
+                  display: 'block', marginTop: 6,
+                  padding: '8px 12px', fontSize: 14,
+                  border: '1px solid #d1d5db', borderRadius: 8,
+                  background: '#fff', color: '#111827', width: 340,
+                }} />
+            </label>
+            <button
+              onClick={() => setShowCog((v) => !v)}
+              style={{
+                background: 'none', border: 'none', padding: 0,
+                fontSize: 13, color: '#2563EB', cursor: 'pointer',
+                fontWeight: 500, textAlign: 'left', maxWidth: 300,
+              }}>
+              {showCog ? '▾ Hide CoG offset' : '▸ Add CoG offset (advanced)'}
+            </button>
+            {showCog && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+                fontSize: 13, color: '#374151',
+              }}>
+                <span>CoG (mm from flange)</span>
+                {['x', 'y', 'z'].map((k) => (
+                  <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ color: '#6b7280', fontWeight: 700, textTransform: 'uppercase' }}>{k}</span>
+                    <input
+                      type="number" step="1"
+                      placeholder="0"
+                      value={cog[k] ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        const next = { ...cog }
+                        if (v === '') delete next[k]
+                        else if (Number.isFinite(Number(v))) next[k] = Number(v)
+                        setAnswer('payload_cog_mm', Object.keys(next).length ? next : null)
+                      }}
+                      style={{
+                        padding: '4px 8px', fontSize: 13,
+                        border: '1px solid #d1d5db', borderRadius: 5,
+                        width: 72, textAlign: 'right',
+                      }} />
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{
+            padding: 12, background: '#EFF6FF', borderRadius: 8,
+            border: '1px solid #bfdbfe', fontSize: 12, color: '#1E3A8A',
+            marginTop: 14, lineHeight: 1.55,
+          }}>
+            <b>Why we ask.</b> Without a payload value the collision
+            monitor uses default (heavier) thresholds — false positives
+            go up and true collisions register later. Programs without
+            a set payload will show a warning until it's filled in.
+          </div>
+          <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center' }}>
+            <button
+              onClick={() => { setAnswer('payload_kg', 'skip'); goNext({ payload_kg: 'skip' }) }}
+              style={{
+                padding: '10px 18px', fontSize: 14, fontWeight: 500,
+                background: 'transparent', color: '#6b7280',
+                border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+              }}>
+              Not sure yet — skip
+            </button>
+            <div style={{ flex: 1 }} />
+            <NextButton onClick={goNext} label="Next" disabled={!canProceed} />
+          </div>
+        </QuestionCard>
+      )
+    },
+  },
+
   // 7: Where to place? (for pick_and_place)
   //    Skipped for machine_tend (own load/unload teach) and palletize
   //    (the pallet pages own the place flow).
@@ -2142,7 +2231,7 @@ const PAGES = [
         ].map(p => (
           <ChoiceButton key={p.value} label={p.label} description={p.desc}
             selected={answers.place_method === p.value}
-            onClick={() => { setAnswer('place_method', p.value); goNext() }}
+            onClick={() => { setAnswer('place_method', p.value); goNext({ place_method: p.value }) }}
           />
         ))}
       </QuestionCard>
@@ -2153,51 +2242,7 @@ const PAGES = [
   {
     id: 'machine_io',
     skip: (answers) => answers.operation !== 'machine_tend',
-    render: ({ answers, setAnswer, goNext }) => {
-      const [ioLabels, setIoLabels] = useState({})
-      useEffect(() => {
-        fetch('/api/io/config').then(r => r.json()).then(d => setIoLabels(d.labels || {})).catch(() => {})
-      }, [])
-      const doOptions = Array.from({ length: 16 }, (_, i) => ({
-        id: 'DO' + i, label: ioLabels['DO' + i] || 'DO' + i,
-        pin: 'Y' + Math.floor(i/8) + '.' + (i%8),
-      }))
-      const diOptions = Array.from({ length: 16 }, (_, i) => ({
-        id: 'DI' + i, label: ioLabels['DI' + i] || 'DI' + i,
-        pin: 'X' + Math.floor(i/8) + '.' + (i%8),
-      }))
-      return (
-        <QuestionCard
-          question="Which I/O signals control the machine?"
-          description="Select the digital outputs and inputs that communicate with the machine."
-        >
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
-              Cycle Start Signal (output to machine)
-            </div>
-            <select value={answers.io_cycle_start || 'DO4'}
-              onChange={e => setAnswer('io_cycle_start', e.target.value)}
-              style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-              {doOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
-            </select>
-          </div>
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
-              Cycle Complete Signal (input from machine)
-            </div>
-            <select value={answers.io_cycle_done || 'DI3'}
-              onChange={e => setAnswer('io_cycle_done', e.target.value)}
-              style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-              {diOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
-            </select>
-          </div>
-          <SliderQuestion label="Cycle timeout" value={answers.cycle_timeout || 30}
-            onChange={v => setAnswer('cycle_timeout', v)} min={5} max={300} step={5} unit="s"
-            description="Maximum time to wait for the machine to finish before flagging an error" />
-          <NextButton onClick={goNext} label="Next" />
-        </QuestionCard>
-      )
-    },
+    render: MachineIOBody,
   },
 
   // 10: Should it repeat?
@@ -2253,14 +2298,59 @@ const PAGES = [
           ].map(r => (
             <ChoiceButton key={r.value} label={r.label} description={r.desc}
               selected={answers.repeat === r.value}
-              onClick={() => { setAnswer('repeat', r.value); if (r.value !== 'count') goNext() }}
+              onClick={() => { setAnswer('repeat', r.value); if (r.value !== 'count') goNext({ repeat: r.value }) }}
             />
           ))}
           {answers.repeat === 'count' && (
             <div style={{ marginTop: 12 }}>
-              <SliderQuestion label="Number of cycles" value={answers.repeat_count || 10}
-                onChange={v => setAnswer('repeat_count', v)} min={2} max={500} step={1} unit="" />
-              <NextButton onClick={goNext} label="Next" />
+              {/* 2026-09-08 wizard simplification: SliderQuestion
+                  replaced with a plain numeric input per operator
+                  directive. Direct typing, min=1, no artificial
+                  max — codegen accepts any positive integer (the
+                  Lua `for i=1,N do … end` loop caps at controller
+                  int range). Validate integer at commit; letting
+                  operator type freely as they go. */}
+              <label style={{
+                display: 'block', fontSize: 13, fontWeight: 600,
+                color: '#111', marginBottom: 6,
+              }}>
+                Number of cycles
+              </label>
+              <input
+                data-testid="wizard-cycles-input"
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={answers.repeat_count ?? 10}
+                onChange={(e) => {
+                  const raw = e.target.value
+                  if (raw === '') { setAnswer('repeat_count', ''); return }
+                  const n = parseInt(raw, 10)
+                  if (Number.isFinite(n) && n >= 1) {
+                    setAnswer('repeat_count', n)
+                  }
+                }}
+                style={{
+                  width: 140, padding: '8px 12px',
+                  fontSize: 16, fontFamily: 'var(--font-mono, monospace)',
+                  border: '1px solid #d1d5db', borderRadius: 6,
+                  background: '#fff', color: '#111',
+                }}
+              />
+              <NextButton
+                onClick={() => {
+                  // Belt-and-braces integer validation at commit
+                  // time. Empty / non-integer / <1 clamps to 1.
+                  const n = parseInt(answers.repeat_count, 10)
+                  if (!Number.isFinite(n) || n < 1) {
+                    setAnswer('repeat_count', 1)
+                    goNext({ repeat_count: 1 })
+                  } else {
+                    goNext({ repeat_count: n })
+                  }
+                }}
+                label="Next" />
             </div>
           )}
         </QuestionCard>
@@ -2435,19 +2525,38 @@ const PAGES = [
               {isDepal ? 'Pick' : 'Fill'} order: {isDepal ? `Top layer first, ${orderLabel}` : orderLabel}
             </div>
             <div style={{ color: '#6b7280', marginTop: 6 }}>
-              {isDepal ? (
-                <>
-                  Corner [1,1,top]: {readTaught(answers, 'taught_pallet_corner') ? '✓ Taught' : '— Not taught'}
-                  <br />
-                  Place position: {readTaught(answers, 'taught_place') ? '✓ Taught' : '— Not taught'}
-                </>
-              ) : (
-                <>
-                  Pick position: {readTaught(answers, 'taught_pick') ? '✓ Taught' : '— Not taught'}
-                  <br />
-                  Corner [1,1,1]: {readTaught(answers, 'taught_pallet_corner') ? '✓ Taught' : '— Not taught'}
-                </>
-              )}
+              {/* v2 frame: 3 corners + first-part datum. The old
+                  single-key `taught_pallet_corner` check dates to v1
+                  and always resolves to false against v2 answers,
+                  which made this row read "Not taught" on the
+                  review page even after the operator taught all
+                  four points. Read the v2 keys. */}
+              {(() => {
+                // 2026-09-15 widened validator: prefer wizard-marker
+                // key; fall back to config.pallet.corner*_tcp so a
+                // program taught via the editor overlay reads as
+                // "taught" (both stores are truth — geometry is the
+                // authority codegen uses).
+                const _cfg  = buildPalletConfig(answers) ? { pallet: buildPalletConfig(answers) } : {}
+                const c1   = readTaughtWithConfig(answers, _cfg, 'taught_pallet_corner1')
+                const c2   = readTaughtWithConfig(answers, _cfg, 'taught_pallet_corner2')
+                const c3   = readTaughtWithConfig(answers, _cfg, 'taught_pallet_corner3')
+                const part = readTaughtWithConfig(answers, _cfg, 'taught_pallet_part')
+                const allFour = c1 && c2 && c3 && part
+                return isDepal ? (
+                  <>
+                    Pallet frame (①②③ + ④ part): {allFour ? '✓ Taught' : '— Not fully taught'}
+                    <br />
+                    Place position: {readTaught(answers, 'taught_place') ? '✓ Taught' : '— Not taught'}
+                  </>
+                ) : (
+                  <>
+                    Pick position: {readTaught(answers, 'taught_pick') ? '✓ Taught' : '— Not taught'}
+                    <br />
+                    Pallet frame (①②③ + ④ part): {allFour ? '✓ Taught' : '— Not fully taught'}
+                  </>
+                )
+              })()}
             </div>
           </div>
         )}
@@ -2509,15 +2618,31 @@ const PAGES = [
                 // Build the trailing label. For reused entries point at
                 // the earlier step that taught this key (when one exists)
                 // so the operator knows where the value came from.
+                // 2026-09-15: append the source pose's timestamp / origin
+                // per operator directive ("reused from <date>") — for
+                // globally-seeded home, name the origin ("saved home
+                // position") rather than a bare date.
                 let trailing
                 if (isReused) {
                   const firstIdx = seenKeyAt[p.key]
                   const primary  = (firstIdx !== undefined && firstIdx !== i)
                     ? positions[firstIdx]?.label
                     : null
-                  trailing = primary
-                    ? `reused (same as ${primary.toLowerCase()})`
-                    : 'reused'
+                  const v = answers[p.key]
+                  let origin = null
+                  if (v?.source === 'global') {
+                    origin = 'saved home position'
+                  } else if (v?.taught_at) {
+                    try { origin = new Date(v.taught_at).toLocaleDateString() }
+                    catch { origin = v.taught_at }
+                  }
+                  if (primary) {
+                    trailing = origin
+                      ? `reused (same as ${primary.toLowerCase()}, from ${origin})`
+                      : `reused (same as ${primary.toLowerCase()})`
+                  } else {
+                    trailing = origin ? `reused from ${origin}` : 'reused'
+                  }
                 } else {
                   trailing = s === 'recorded' ? 'recorded'
                            : isWarn         ? 'required — skipped'
@@ -2620,12 +2745,54 @@ function readTaught(answers, key) {
   return v
 }
 
+// 2026-09-15 field-triage fix: for pallet corner / part keys, ALSO
+// consult the geometry store (config.pallet.corner*_tcp + part_tcp).
+// The editor's palletTeachRecord writes only the geometry keys, so a
+// program taught via the editor overlay had config.pallet.corner*_tcp
+// populated but config.taught_pallet_corner* empty. The wizard Review
+// card was then reading the empty wizard-marker key and claiming the
+// pallet was "not fully taught" even though geometry authority (used
+// by codegen) held the operator's pose. Widen the reader here — the
+// mirror-write fix in ProgramEditor.jsx now stamps both stores going
+// forward, but this fallback repairs any program that was taught
+// under the old code.
+const PALLET_TAUGHT_KEY_TO_GEOMETRY_FIELD = {
+  taught_pallet_corner1: 'corner1_tcp',
+  taught_pallet_corner2: 'corner2_tcp',
+  taught_pallet_corner3: 'corner3_tcp',
+  taught_pallet_part:    'part_tcp',
+}
+function readTaughtWithConfig(answers, config, key) {
+  const direct = readTaught(answers, key)
+  if (direct) return direct
+  const geom = PALLET_TAUGHT_KEY_TO_GEOMETRY_FIELD[key]
+  if (!geom) return null
+  const tcp = config?.pallet?.[geom] || config?.pallet_place?.[geom]
+  if (!Array.isArray(tcp) || tcp.length < 6) return null
+  return {
+    tcp:       [...tcp],
+    joints:    null,
+    taught_at: null,
+    source:    'editor_overlay',
+    skipped:   false,
+  }
+}
+
 // Build the typed pallet config block saved into program.config.pallet.
 // The wizard never bakes per-slot coordinates into steps — the executor
 // computes them at runtime from this block. See the EXECUTOR CHANGES
 // section of the task spec.
 function buildPalletConfig(answers) {
-  const cornerPoint = readTaught(answers, 'taught_pallet_corner')
+  // v2 (2026-07-30): four taught points — three corners for the
+  // frame + a first-part pose for orientation and Z. See
+  // programming_by_demonstration.pallet_geometry docstring for the
+  // slot derivation math. New writes emit the corner1/2/3/part
+  // fields; the schema's from_dict handles v1-only saved programs
+  // via a migration path so legacy loads still work.
+  const corner1 = readTaught(answers, 'taught_pallet_corner1')
+  const corner2 = readTaught(answers, 'taught_pallet_corner2')
+  const corner3 = readTaught(answers, 'taught_pallet_corner3')
+  const part    = readTaught(answers, 'taught_pallet_part')
   return {
     rows:            answers.pallet_rows   ?? 4,
     cols:            answers.pallet_cols   ?? 4,
@@ -2634,9 +2801,21 @@ function buildPalletConfig(answers) {
     spacing_y_mm:    answers.pallet_spacing_y_mm   ?? 150,
     layer_height_mm: answers.pallet_layer_height_mm ?? 100,
     fill_order:      answers.pallet_fill_order || 'row_lr',
-    corner_tcp:      tcpToObj(cornerPoint?.tcp),
+    // Legacy corner_tcp mirror (backwards-compat with old readers
+    // that consume the pallet block outside pallet_place — the 3D
+    // twin's pre-2026-07-30 preview path still reads this). Seed
+    // from corner1's TCP so the display doesn't jump.
+    corner_tcp:      tcpToObj(corner1?.tcp),
     approach_height_mm: answers.pallet_approach_height_mm ?? 100,
     retract_height_mm:  answers.pallet_retract_height_mm  ?? 200,
+    // v2 taught frame: three corners + first-part pose.
+    corner1_tcp: Array.isArray(corner1?.tcp) ? [...corner1.tcp] : null,
+    corner2_tcp: Array.isArray(corner2?.tcp) ? [...corner2.tcp] : null,
+    corner3_tcp: Array.isArray(corner3?.tcp) ? [...corner3.tcp] : null,
+    part_tcp:    Array.isArray(part?.tcp)    ? [...part.tcp]    : null,
+    teach_mode:  'far_slot',            // retained for schema; v2 ignores
+    pitch_row_mm: answers.pallet_spacing_x_mm   ?? 150,
+    pitch_col_mm: answers.pallet_spacing_y_mm   ?? 150,
   }
 }
 
@@ -2671,19 +2850,34 @@ function buildPalletizeSteps(answers) {
   // finger / vacuum / magnetic — 'custom' is mapped to 'magnetic'
   // (single-signal IO) so its branch handles the gripper actuation.
   const stepGripType = gripType === 'custom' ? 'magnetic' : gripType
-  const gripOpen  = (label = 'Open gripper') => gripType === 'finger'
-    ? { action: 'open_gripper', label, width_mm: gripW, speed_pct: spd, io_open: 'DO1', io_open_confirm: 'DI1' }
-    : gripType === 'vacuum'
-      ? { action: 'set_io', label, io_id: 'DO2', value: 0 }
-      : { action: 'set_io', label, io_id: customActivate, value: 0 }
-  const gripClose = (label = 'Close gripper') => gripType === 'finger'
-    ? { action: 'close_gripper', label, force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' }
-    : gripType === 'vacuum'
-      ? { action: 'set_io', label, io_id: 'DO2', value: 1 }
-      : { action: 'set_io', label, io_id: customActivate, value: 1, ...(customConfirm ? { io_close_confirm: customConfirm } : {}) }
+
+  // effector-vocabulary shared with the PBD composer + editor palette.
+  // The old label-taking gripOpen/gripClose closures were the bug —
+  // they used the CALLER's label verbatim (e.g. 'Grip part') even
+  // when the effector was vacuum. See lib/effectorVocab for the
+  // single source of truth (2026-07-30 audit instance #4).
+  //
+  // 2026-09-08 blow-off audit: withBlowOff surfaces to the vocab
+  // as the operator's explicit choice on the hookup page (default
+  // true — preserves prior behavior). Off = effectorDisengage's
+  // vacuum branch skips the blow-off triplet AND the hookup
+  // guide filters out the vacuum-blow-off instruction card.
+  const _vocabOpts = {
+    spd, gripW, gripF, customActivate, customConfirm,
+    withBlowOff: answers.blow_off_enabled !== false,
+  }
+  const engageSteps = (labelOverride) =>
+    effectorEngage({ effector: gripType }, { ..._vocabOpts, labelOverride })
+  const disengageSteps = (labelOverride) =>
+    effectorDisengage({ effector: gripType }, { ..._vocabOpts, labelOverride })
+  const readySteps = () =>
+    effectorReady({ effector: gripType }, _vocabOpts)
 
   const steps = []
   steps.push({ action: 'move_home', label: 'Move to home position' })
+  // Effector-ready state at program start (vacuum off / gripper open /
+  // magnet off). Same shared vocabulary module the PBD composer uses.
+  steps.push(...readySteps())
 
   // Loop start index — step number (1-indexed for the executor's
   // goto-1 convention) of the first inside-loop step we're about to
@@ -2700,40 +2894,28 @@ function buildPalletizeSteps(answers) {
     const pickTcp   = Array.isArray(pickPoint.tcp) ? pickPoint.tcp : null
     const pickJoints = Array.isArray(pickPoint.joints) ? pickPoint.joints : null
 
-    // Approach above pick — emit as movj on taught joints (matches
-    // the wizard's existing 'approach' semantics in buildSteps). The
-    // executor goes to the taught pose; the operator already taught
-    // it at the pick. The compound descend / lift TCPs below carry
-    // the approach / retract offsets.
-    // Source step for taught_pick; descend / lift derive from it via
-    // derived_from + offset so re-teaching the pick in the editor
-    // propagates to both children automatically.
+    // Two-taught-poses model on the pick side: approach and lift
+    // derive from a single taught 'pick' CONTACT step; the operator's
+    // taught_pick landed at that contact, not above it. Derived
+    // approach/retreat steps carry no taught data — the codegen
+    // resolver applies the base-frame Z offset at build time.
     steps.push({
-      action: 'approach', label: 'Approach above pick',
+      action: 'move_linear', label: 'Approach above pick',
+      speed_pct: spd, offset_z_mm: appH,
+      derived_from: 'pick',
+    })
+    steps.push({
+      action: 'move_linear', label: 'Pick position — contact',
       taught: !!pickJoints, taught_joints: pickJoints, joints: pickJoints,
       taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
-      speed_pct: spd, offset_z_mm: appH,
-      position_role: 'pick',
+      speed_pct: slow, position_role: 'pick',
     })
-    // Descend to pick TCP. Keep the literal taught data as a fallback
-    // for the legacy executor path but tag derived_from so the new
-    // resolver uses the source step's current pose (handles re-teach).
-    if (pickTcp) {
-      steps.push({
-        action: 'move_linear', label: 'Descend to pick',
-        taught_tcp: pickTcp, position: pickTcp.slice(0, 3),
-        taught_joints: pickJoints, joints: pickJoints,
-        speed_pct: slow, offset_z_mm: 0,
-        derived_from: 'pick',
-      })
-    }
-    steps.push(gripClose('Grip part'))
-    if (gripType === 'vacuum') steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
-    // Lift from pick — derived from taught_pick + retract offset.
+    // Effector-aware engage (vacuum → "Engage vacuum" + wait for seal;
+    // finger → "Grip part"; magnet → "Engage magnet"). Never emits
+    // gripper-vocabulary when effector is vacuum (2026-07-30 fix).
+    steps.push(...engageSteps())
     steps.push({
-      action: 'move_linear', label: 'Lift from pick',
-      taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
-      taught_joints: pickJoints, joints: pickJoints,
+      action: 'move_linear', label: 'Retreat above pick',
       speed_pct: medium, offset_z_mm: retH,
       derived_from: 'pick',
     })
@@ -2768,47 +2950,37 @@ function buildPalletizeSteps(answers) {
     const placeTcp   = Array.isArray(placePoint.tcp) ? placePoint.tcp : null
     const placeJoints = Array.isArray(placePoint.joints) ? placePoint.joints : null
 
-    // Source step for taught_place; the first "Move above place" carries
-    // the taught data and tags itself as the 'place' role so the descend
-    // and lift below can derive from it via derived_from + offset.
+    // Two-taught-poses model on the place side: approach and lift
+    // derive from a single taught 'place' CONTACT step.
     steps.push({
-      action: 'move_linear', label: 'Move above place',
+      action: 'move_linear', label: 'Approach above place',
+      speed_pct: spd, offset_z_mm: retH,
+      derived_from: 'place',
+    })
+    steps.push({
+      action: 'move_linear', label: 'Place position — contact',
       taught: !!placeTcp, taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
       taught_joints: placeJoints, joints: placeJoints,
-      speed_pct: spd, offset_z_mm: retH,
-      position_role: 'place',
+      speed_pct: slow, position_role: 'place',
     })
-    // Derived: descend to place at z+0 from taught_place.
-    if (placeTcp) {
-      steps.push({
-        action: 'move_linear', label: 'Descend to place',
-        taught_tcp: placeTcp, position: placeTcp.slice(0, 3),
-        taught_joints: placeJoints, joints: placeJoints,
-        speed_pct: slow, offset_z_mm: 0,
-        derived_from: 'place',
-      })
-    }
-    steps.push(gripOpen('Release part'))
-    if (gripType === 'vacuum') {
-      steps.push({ action: 'set_io', label: 'Blow off', io_id: 'DO3', value: 1 })
-      steps.push({ action: 'wait',   label: 'Wait for blow off', duration_s: 0.3 })
-      steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
-    }
-    // Derived: lift from place at z+retract offset.
+    // Effector-aware disengage. Vacuum emits Disengage vacuum + the
+    // blow-off triplet in one call — no more parallel wizard-side
+    // hardcoded 'Blow off' emissions to drift from the composer.
+    steps.push(...disengageSteps())
     steps.push({
-      action: 'move_linear', label: 'Lift from place',
-      taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
-      taught_joints: placeJoints, joints: placeJoints,
+      action: 'move_linear', label: 'Retreat above place',
       speed_pct: medium, offset_z_mm: retH,
       derived_from: 'place',
     })
   }
 
-  // Loop back to the first inside-loop step. count = total slots.
+  // Palletize marker. count is fixed at 1 — pallet.py::expand inlines
+  // every slot per iteration; count>1 would multiply the emission
+  // (Sep 15 field bug: rows*cols*layers count → capacity² placements).
   steps.push({
     action: 'loop',
-    label: `Pallet loop — ${cycles} cycles (${rows} × ${cols} × ${layers})`,
-    goto: loopStart, count: cycles,
+    label: `Palletize marker — inline ${cycles} slots (${rows} × ${cols} × ${layers})`,
+    goto: loopStart, count: 1,
     pallet_loop: true,
   })
 
@@ -2816,7 +2988,7 @@ function buildPalletizeSteps(answers) {
   return steps.map((s, i) => ({ ...s, step: i + 1 }))
 }
 
-function buildSteps(answers) {
+function buildSteps(answers, portmap = null) {
   // Pallet programs follow a totally different shape — their steps
   // come from buildPalletizeSteps so the editor and executor see the
   // move_to_pallet flow rather than the generic pick/place body.
@@ -2840,90 +3012,133 @@ function buildSteps(answers) {
   // from the Custom Gripper page. Default to DO3 / no-confirm to match
   // the prior 'magnetic' behaviour for programs that didn't assign IO.
   const customActivate = answers.gripper_activate_signal || 'DO3'
+  const customConfirm  = answers.gripper_confirm_signal  || ''
 
-  if (answers.gripper_type === 'finger') {
-    steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: gripW, speed_pct: spd, io_open: 'DO1', io_open_confirm: 'DI1' })
-  } else if (answers.gripper_type === 'vacuum') {
-    steps.push({ action: 'set_io', label: 'Vacuum off', io_id: 'DO2', value: 0 })
-  } else if (answers.gripper_type === 'custom') {
-    steps.push({ action: 'set_io', label: 'Gripper off', io_id: customActivate, value: 0 })
+  // All effector-linked emissions (ready, engage, disengage) route
+  // through lib/effectorVocab. Same source the PBD composer uses on
+  // the backend and the Add Step palette uses in the editor — one
+  // vocabulary, all authoring surfaces (audit instance #4).
+  //
+  // 2026-09-08 blow-off audit: withBlowOff = operator's explicit
+  // choice on the hookup page (default true). See _vocabOpts in
+  // buildPalletizeSteps above for the same wiring.
+  const _vocabOpts = {
+    spd, gripW, gripF, customActivate, customConfirm,
+    withBlowOff: answers.blow_off_enabled !== false,
   }
+  const cfgEffector = { effector: answers.gripper_type }
+
+  steps.push(...effectorReady(cfgEffector, _vocabOpts))
 
   if (answers.source === 'camera_library') {
     steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
   }
 
-  // Source step for the pick — carries taught_pick (applied by applyTaught
-  // below) so the descend/lift derived moves can resolve to its taught_tcp
-  // plus their offsets at runtime.
-  steps.push({ action: 'approach', label: 'Move above pick position', target: answers.source === 'fixed_position' ? 'fixed' : 'auto', offset_z_mm: appH, speed_pct: spd, position_role: 'pick' })
-  // Derived from the taught pick — z+0 (descend onto the part). The
-  // editor treats `derived_from` steps as non-teachable; the executor
-  // resolves the actual TCP at runtime from the source step + offset.
-  steps.push({ action: 'move_linear', label: 'Descend to part', offset_z_mm: 0, speed_pct: slow, derived_from: 'pick' })
+  // Two-taught-poses-per-pair model (matches program_composer.py):
+  //   approach (derived, +appH) → pick contact (TAUGHT) → engage →
+  //   retreat (derived, +appH) → approach-place (derived, +appH) →
+  //   place contact (TAUGHT) → disengage → retreat (derived, +appH).
+  // Only the contact steps carry position_role + taught data; every
+  // approach/retreat step is derived_from that role.
+  steps.push({ action: 'move_linear', label: 'Approach above pick', offset_z_mm: appH, speed_pct: spd, derived_from: 'pick' })
+  steps.push({ action: 'move_linear', label: 'Pick position — contact', speed_pct: slow, position_role: 'pick' })
 
-  if (answers.gripper_type === 'finger') {
-    steps.push({ action: 'close_gripper', label: 'Grip part', force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' })
-  } else if (answers.gripper_type === 'vacuum') {
-    steps.push({ action: 'set_io', label: 'Vacuum on', io_id: 'DO2', value: 1 })
-    steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
-  } else {
-    // Custom gripper — single-signal toggle on the operator's activate port.
-    steps.push({ action: 'set_io', label: 'Gripper on', io_id: customActivate, value: 1 })
-  }
+  steps.push(...effectorEngage(cfgEffector, _vocabOpts))
 
-  // Lift = pick + appH (return above the part after gripping).
-  steps.push({ action: 'move_linear', label: 'Lift part', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
+  // Retreat back above the pick contact.
+  steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
 
   if (op === 'machine_tend') {
-    // Source step for the machine_load taught point; descend / retreat /
-    // approach-finished-part / descend-to-finished-part / lift-finished
-    // all derive from this single taught position with z-offsets.
-    steps.push({ action: 'move_joint', label: 'Move to machine load position', speed_pct: spd, position_role: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Descend to load position', offset_z_mm: 0, speed_pct: Math.min(spd, 20), derived_from: 'machine_load' })
-    if (answers.gripper_type === 'finger') {
-      steps.push({ action: 'open_gripper', label: 'Release part into machine', width_mm: gripW, io_open: 'DO1' })
-    } else {
-      steps.push({ action: 'set_io', label: 'Release part into machine', io_id: 'DO2', value: 0 })
-    }
-    steps.push({ action: 'move_linear', label: 'Retreat from machine', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
-    steps.push({ action: 'set_io', label: 'Start machine cycle', io_id: answers.io_cycle_start || 'DO4', value: 1 })
-    steps.push({ action: 'wait', label: 'Wait for machine to finish', duration_s: answers.cycle_timeout || 30 })
-    steps.push({ action: 'set_io', label: 'Clear cycle start', io_id: answers.io_cycle_start || 'DO4', value: 0 })
-    // The robot picks the finished part out of the same fixture it loaded
-    // into, so these all derive from machine_load too.
-    steps.push({ action: 'move_linear', label: 'Approach finished part', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Descend to finished part', offset_z_mm: 0, speed_pct: Math.min(spd, 20), derived_from: 'machine_load' })
-    if (answers.gripper_type === 'finger') {
-      steps.push({ action: 'close_gripper', label: 'Grip finished part', force_pct: gripF, io_close: 'DO0' })
-    } else {
-      steps.push({ action: 'set_io', label: 'Pick finished part', io_id: 'DO2', value: 1 })
-    }
-    steps.push({ action: 'move_linear', label: 'Lift finished part', offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
-    // Source step for the unload taught point; the descend-to-unload
-    // derives from it.
-    steps.push({ action: 'move_joint', label: 'Move to unload position', speed_pct: spd, position_role: 'unload' })
-    steps.push({ action: 'move_linear', label: 'Descend to unload', offset_z_mm: 0, speed_pct: slow, derived_from: 'unload' })
+    // ── Machine-tending template (2026-07-30 vocabulary work) ──
+    //
+    // Required taught poses:
+    //   * machine_safe  — safe-outside-machine waypoint (door
+    //                     clearance pose). MUST be reached before/
+    //                     after any fixture motion so the robot
+    //                     doesn't collide with the machine door.
+    //   * machine_load  — fixture pose (part-in-fixture contact).
+    //   * unload        — final drop-off contact.
+    //
+    // Load side:
+    //   safe → fixture pose → disengage → clamp workpiece → (verify)
+    //          → retreat to safe → start machine cycle (pulse)
+    //          → wait for machine cycle done
+    //
+    // Unload side (part is done, robot picks it back up):
+    //   safe → fixture pose → engage finished part → unclamp
+    //          → retreat to safe → unload contact → disengage
+    //
+    // The clamp→verify→release ordering is enforced at save time by
+    // the sequence guard in dashboard_server / effectorVocab; the
+    // wizard emits them in-order here, so the guard fires only if a
+    // subsequent hand-edit reorders them.
+
+    // Move to safe waypoint OUTSIDE the machine door.
+    steps.push({ action: 'move_linear', label: 'Move to safe-outside-machine waypoint',
+                 speed_pct: spd, position_role: 'machine_safe' })
+    // Approach + place in fixture.
+    steps.push({ action: 'move_linear', label: 'Approach machine fixture',
+                 offset_z_mm: appH, speed_pct: spd, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Place in fixture — contact',
+                 speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
+    // Clamp FIRST (workpiece is still gripped so a failed clamp
+    // doesn't drop the part). Vocab may attach verify_input if the
+    // Clamp confirmed DI is assigned; guard forbids release before
+    // the verify.
+    steps.push(...clampWorkpiece(portmap))
+    // Only NOW release the robot's grip — after clamp+verify.
+    steps.push(...effectorDisengage(cfgEffector, {
+      ..._vocabOpts, withBlowOff: false,
+      labelOverride: 'Release part into fixture',
+    }))
+    // Retreat from fixture → back to safe waypoint before starting
+    // the cycle so the robot is out of the machine's workspace.
+    steps.push({ action: 'move_linear', label: 'Retreat from fixture',
+                 offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
+                 speed_pct: medium, derived_from: 'machine_safe' })
+    // Start the machine cycle — PULSED DO. Vocab handles the
+    // set 1 → wait pulse_ms → set 0 triplet.
+    steps.push(...startMachineCycle(portmap, {
+      pulse_ms: answers.machine_pulse_ms || 500,
+    }))
+    // Wait for machine cycle done — blocking verify_input on the
+    // Cycle done DI with a configurable outer timeout.
+    steps.push(...waitMachineCycle(portmap, {
+      timeout_ms: (answers.cycle_timeout_s || 60) * 1000,
+    }))
+    // ── Unload side ────────────────────────────────────────────
+    // Return to fixture, engage grip, unclamp, retreat.
+    steps.push({ action: 'move_linear', label: 'Approach fixture (finished part)',
+                 offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Fixture — contact (finished part)',
+                 speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
+    steps.push(...effectorEngage(cfgEffector, {
+      ..._vocabOpts, labelOverride: (effectorOf(cfgEffector) === 'finger'
+        ? 'Grip finished part' : 'Pick finished part'),
+    }))
+    steps.push(...unclampWorkpiece(portmap))
+    steps.push({ action: 'move_linear', label: 'Retreat with finished part',
+                 offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
+                 speed_pct: medium, derived_from: 'machine_safe' })
+    // Unload contact — separate taught role.
+    steps.push({ action: 'move_linear', label: 'Approach unload',
+                 offset_z_mm: appH, speed_pct: spd, derived_from: 'unload' })
+    steps.push({ action: 'move_linear', label: 'Unload position — contact',
+                 speed_pct: slow, position_role: 'unload' })
   } else {
-    // Default place flow (pick_and_place / sort). The move_joint is the
-    // taught place position; the descend derives from it.
-    steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd, position_role: 'place' })
-    steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow, derived_from: 'place' })
+    // Default place flow (pick_and_place / sort).
+    steps.push({ action: 'move_linear', label: 'Approach above place', offset_z_mm: appH, speed_pct: spd, derived_from: 'place' })
+    steps.push({ action: 'move_linear', label: 'Place position — contact', speed_pct: slow, position_role: 'place' })
   }
 
-  if (answers.gripper_type === 'finger') {
-    steps.push({ action: 'open_gripper', label: 'Release part', width_mm: gripW, io_open: 'DO1' })
-  } else if (answers.gripper_type === 'vacuum') {
-    steps.push({ action: 'set_io', label: 'Vacuum off — release part', io_id: 'DO2', value: 0 })
-    steps.push({ action: 'set_io', label: 'Blow off', io_id: 'DO3', value: 1 })
-    steps.push({ action: 'wait', label: 'Wait for blow off', duration_s: 0.3 })
-    steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
-  } else {
-    // Custom gripper — release on the operator's activate port.
-    steps.push({ action: 'set_io', label: 'Gripper off — release part', io_id: customActivate, value: 0 })
-  }
+  steps.push(...effectorDisengage(cfgEffector, _vocabOpts))
 
-  steps.push({ action: 'move_linear', label: 'Lift from place', offset_z_mm: appH, speed_pct: medium, derived_from: 'place' })
+  // Retreat back above the final release contact (place or unload).
+  const retreatRole = (op === 'machine_tend') ? 'unload' : 'place'
+  const retreatLabel = (op === 'machine_tend') ? 'Retreat from unload' : 'Retreat above place'
+  steps.push({ action: 'move_linear', label: retreatLabel, offset_z_mm: appH, speed_pct: medium, derived_from: retreatRole })
   steps.push({ action: 'move_home', label: 'Return to home' })
 
   if (answers.repeat === 'continuous') {
@@ -2934,13 +3149,11 @@ function buildSteps(answers) {
 
   // Inject taught data from the wizard's teach pages so the editor's
   // green T badges appear immediately for the positions the operator
-  // recorded. Mapping rules:
-  //   home_point         → first + last move_home (start / return-home)
-  //   pick_point         → the 'approach' step (descend uses the same)
-  //   place_point        → first move_joint or move_linear labelled
-  //                        "Move above place position"
-  //   machine_load_point → "Move to machine load position"
-  //   unload_point       → "Move to unload position"
+  // recorded. Under the two-taught-poses-per-pair model, the taught
+  // step is the CONTACT step marked with position_role — approach and
+  // retreat are derived and never carry taught data. Matching by
+  // position_role rather than action label keeps this stable across
+  // label rewording.
   function applyTaught(s, point) {
     if (!point) return s
     return {
@@ -2967,30 +3180,22 @@ function buildSteps(answers) {
   const loadP   = readTaught(cfg, 'taught_machine_load')
   const unloadP = readTaught(cfg, 'taught_unload')
 
-  // First and last move_home both share taught_home.
+  const applyToRole = (role, point) => {
+    if (!point) return
+    const i = numbered.findIndex((s) => s.position_role === role
+                                     && !s.derived_from)
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], point)
+  }
+
+  // Home has two occurrences (start + return); apply to both.
   if (homeP) {
     const homeIdxs = numbered.map((s, i) => s.action === 'move_home' ? i : -1).filter((i) => i >= 0)
     homeIdxs.forEach((i) => { numbered[i] = applyTaught(numbered[i], homeP) })
   }
-  if (pickP) {
-    const i = numbered.findIndex((s) => s.action === 'approach')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], pickP)
-  }
-  if (placeP) {
-    const i = numbered.findIndex((s) =>
-      (s.action === 'move_joint' || s.action === 'move_linear') &&
-      typeof s.label === 'string' && s.label.toLowerCase().includes('place')
-    )
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], placeP)
-  }
-  if (loadP) {
-    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to machine load position')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], loadP)
-  }
-  if (unloadP) {
-    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to unload position')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], unloadP)
-  }
+  applyToRole('pick',         pickP)
+  applyToRole('place',        placeP)
+  applyToRole('machine_load', loadP)
+  applyToRole('unload',       unloadP)
 
   return numbered
 }
@@ -3000,6 +3205,11 @@ function buildSteps(answers) {
 // ────────────────────────────────────────────────────────
 
 export default function ProgramWizard({ onClose, onSaved }) {
+  // Portmap for machine-tending emitters — clamp / cycle start / cycle
+  // done / clamp confirmed. buildSteps receives it below so those
+  // steps land in the wizard's output only when the operator has
+  // actually assigned the roles on the I/O page.
+  const wizardPortmap = useIOPortmap()
   const [pageIdx, setPageIdx] = useState(0)
   const [answers, setAnswers] = useState({
     // Silently-defaulted: the wizard no longer asks about speed or motion
@@ -3025,11 +3235,39 @@ export default function ProgramWizard({ onClose, onSaved }) {
   // completes — TeachSequence's internal state would be lost on unmount.
   const [reusedSteps, setReusedSteps] = useState({})
 
+  // 2026-09-08 wizard simplification: auto-assign cell_id when
+  // exactly one commissioned cell exists. Silent null otherwise
+  // (no page, no toast — cell-less programs load / push / run
+  // exactly as today per the footer "No cell — environment guard
+  // off" doctrine that's been the running default all week).
+  useEffect(() => {
+    let alive = true
+    fetch('/api/cells').then((r) => r.ok ? r.json() : null)
+      .then((j) => {
+        if (!alive || !j) return
+        const commissioned = (j.cells || []).filter(
+          (c) => c && c.commissioning_complete)
+        if (commissioned.length === 1) {
+          setAnswers((prev) => prev.cell_id
+            ? prev
+            : { ...prev, cell_id: commissioned[0].cell_id })
+        }
+        // 0 or >1: leave cell_id undefined; buildSteps sends null.
+      })
+      .catch(() => { /* silent — cell_id stays null */ })
+    return () => { alive = false }
+  }, [])
+
   const setAnswer = (key, value) => setAnswers(prev => ({ ...prev, [key]: value }))
 
-  const goNext = () => {
+  const goNext = (overrides) => {
+    // Advance-with-value: React's setAnswer is asynchronous, so if the
+    // caller just set an answer whose value drives the next page's skip
+    // predicate, `answers` here is still stale. Callers pass that new
+    // value via `overrides` so skip() sees the fresh selection.
+    const merged = overrides ? { ...answers, ...overrides } : answers
     let next = pageIdx + 1
-    while (next < PAGES.length && PAGES[next].skip?.(answers)) next++
+    while (next < PAGES.length && PAGES[next].skip?.(merged)) next++
     if (next < PAGES.length) {
       setPageIdx(next)
       setHistory(prev => [...prev, next])
@@ -3044,7 +3282,7 @@ export default function ProgramWizard({ onClose, onSaved }) {
     }
   }
 
-  const builtSteps = buildSteps(answers)
+  const builtSteps = buildSteps(answers, wizardPortmap)
 
   const handleSave = async () => {
     setSaving(true)
@@ -3064,9 +3302,85 @@ export default function ProgramWizard({ onClose, onSaved }) {
       config.speed = SILENT_SPEED_PCT
       config.speed_pct = SILENT_SPEED_PCT
       config.motion_profile_name = SILENT_MOTION_PROFILE
+      // Payload normalization: the wizard stores `payload_kg='skip'`
+      // when the operator chose "Not sure yet". Persist that as an
+      // explicit null so codegen + editor + run modal all agree the
+      // program has no payload set. Empty tool_name / no-CoG entries
+      // stay out of config so we don't ship junk keys.
+      if (config.payload_kg === 'skip' || config.payload_kg === undefined) {
+        config.payload_kg = null
+      }
+      if (!config.tool_name || String(config.tool_name).trim() === '') {
+        delete config.tool_name
+      }
+      // 2026-09-08 Custom EOAT item 4: promote wizard-collected
+      // custom_tool_id to config.tool_id so codegen emits the
+      // toolOffset header + tool=__tool suffix on every mov*.
+      if (answers.custom_tool_id) {
+        config.tool_id = answers.custom_tool_id
+      }
+      // Wizard-internal state that shouldn't ship on config.
+      delete config.custom_tool_substep
+      delete config.custom_tool_id
+
+      // 2026-09-10 hookup restructure: hookup guidance now lives in
+      // the standalone EOAT Setup wizard (per-tool, not per-
+      // program). Snapshot the tool's confirmation record onto
+      // program.config so downstream codegen consumers (effectorVocab
+      // `withBlowOff`, `hookup_no_sensor` invariant) stay unchanged.
+      // Failure to read → leave config untouched (blow-off default
+      // remains opt-out true, matching prior silent-default behavior).
+      try {
+        const gt = answers.gripper_type || 'finger'
+        const key = toolHookupKey(gt, answers.custom_tool_id || config.tool_id || null)
+        const rec = await getToolHookup(key)
+        if (rec) {
+          if (rec.no_sensor && typeof rec.no_sensor === 'object') {
+            config.hookup_no_sensor = { ...rec.no_sensor }
+          }
+          if (rec.optional && typeof rec.optional === 'object') {
+            for (const k of Object.keys(rec.optional)) {
+              config[k] = rec.optional[k]
+            }
+          }
+          if (rec.confirmed_at) {
+            config.hookup_confirmed_at = rec.confirmed_at
+          }
+        }
+      } catch { /* thread line already advertises status; do not block save */ }
+      if (config.payload_cog_mm && typeof config.payload_cog_mm === 'object'
+          && Object.keys(config.payload_cog_mm).length === 0) {
+        delete config.payload_cog_mm
+      }
       if (answers.operation === 'palletize') {
         const pallet = buildPalletConfig(answers)
         config.pallet      = pallet
+        // 2026-07-30: pallet_place spec (the shape PalletPlaceSpec
+        // consumes on the backend) is also stashed under
+        // config.pallet_place so /api/programs/{id}/pallet_slots
+        // reads the 3-point taught frame + measured pitches without
+        // reconstructing from step metadata.
+        config.pallet_place = {
+          rows:            pallet.rows,
+          cols:            pallet.cols,
+          layers:          pallet.layers,
+          pitch_row_mm:    pallet.pitch_row_mm,
+          pitch_col_mm:    pallet.pitch_col_mm,
+          layer_height_mm: pallet.layer_height_mm,
+          order:           (pallet.fill_order === 'col')     ? 'col_major'
+                         : (pallet.fill_order === 'snake')   ? 'snake'
+                         : 'row_major',
+          row_axis:        '+X',
+          col_axis:        '+Y',
+          // v2 (2026-07-30): four taught points. Backend
+          // PalletPlaceSpec.from_dict migrates v1 saves (only
+          // corner_a/b/c present) into these fields transparently.
+          corner1_tcp:     pallet.corner1_tcp,
+          corner2_tcp:     pallet.corner2_tcp,
+          corner3_tcp:     pallet.corner3_tcp,
+          part_tcp:        pallet.part_tcp,
+          teach_mode:      pallet.teach_mode,
+        }
         config.pallet_mode = answers.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
         config.source      = config.pallet_mode === 'palletize' ? 'camera_library' : 'fixed_grid'
         config.speed_pct   = SILENT_SPEED_PCT
@@ -3141,6 +3455,30 @@ export default function ProgramWizard({ onClose, onSaved }) {
     while (probe < PAGES.length && PAGES[probe].skip?.(answers)) probe++
     safeIdx = probe < PAGES.length ? probe : PAGES.length - 1
   }
+  // Self-heal: if the render-time remap moved us past pageIdx (because a
+  // handler set state that made pageIdx's page transiently skip-hidden
+  // — the pageIdx/safeIdx desync class that caused the "click once,
+  // select; click twice, advance" bug), sync setPageIdx to what's
+  // actually on screen. Otherwise the NEXT click's goNext walks forward
+  // from the STALE stored pageIdx, lands back on the rendered page, and
+  // the operator sees "no advance" until a second click. Every handler
+  // now passes goNext overrides to avoid this in the first place; the
+  // effect is defense-in-depth so a future handler that forgets can't
+  // silently reintroduce the class.
+  useEffect(() => {
+    if (safeIdx !== pageIdx) {
+      // eslint-disable-next-line no-console
+      console.warn('[ProgramWizard] pageIdx/safeIdx drift:',
+        { pageIdx, safeIdx, page: PAGES[safeIdx]?.id })
+      setPageIdx(safeIdx)
+      setHistory((prev) => {
+        // Replace the tail of history with safeIdx so Back doesn't
+        // re-enter the skip-hidden page.
+        if (prev[prev.length - 1] === safeIdx) return prev
+        return [...prev.slice(0, -1), safeIdx]
+      })
+    }
+  }, [safeIdx, pageIdx])
   const page = PAGES[safeIdx]
   const progressPct = ((history.length - 1) / (PAGES.length - 1)) * 100
 

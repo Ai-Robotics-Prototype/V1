@@ -11,6 +11,7 @@ const TYPE_COLORS = {
 function Toast({ toast, onRemove }) {
   const [visible, setVisible] = useState(false)
   const [leaving, setLeaving] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
 
   useEffect(() => {
     // Trigger slide-in
@@ -23,8 +24,20 @@ function Toast({ toast, onRemove }) {
     setTimeout(() => onRemove(toast.id), 280)
   }
 
+  // Structured content (2026-08-04). Prefer title/detail from the
+  // structured toast API; fall back to `message` (legacy 2-arg
+  // callers). Each string renders EXACTLY ONCE — no concatenation.
+  // technicalDetail (raw wire reason: firmware bug numbers,
+  // mm2mAndDeg2rad, sha hashes, etc) is demoted behind a "Details"
+  // toggle so the operator's default view is operator-language
+  // only.
+  const title  = toast.title  || toast.message || ''
+  const detail = toast.detail || ''
+  const tech   = toast.technicalDetail || ''
+
   return (
     <div
+      data-testid="toast"
       style={{
         display: 'flex',
         alignItems: 'flex-start',
@@ -35,22 +48,78 @@ function Toast({ toast, onRemove }) {
         borderRadius: 'var(--radius-md)',
         padding: '8px 10px',
         minWidth: 220,
-        maxWidth: 320,
+        maxWidth: 360,
         boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
         transform: visible && !leaving ? 'translateX(0)' : 'translateX(110%)',
         opacity: visible && !leaving ? 1 : 0,
         transition: 'transform 280ms cubic-bezier(0.16,1,0.3,1), opacity 280ms',
       }}
     >
-      <span style={{
+      <div style={{
         flex: 1,
         fontSize: 13,
         color: 'var(--text-primary)',
         lineHeight: 1.4,
         wordBreak: 'break-word',
       }}>
-        {toast.message}
-      </span>
+        <div data-testid="toast-title"
+             style={{ fontWeight: detail || tech ? 600 : 400 }}>
+          {title}
+          {toast.repeatCount > 1 && (
+            <span data-testid="toast-repeat-count"
+                  style={{
+                    marginLeft: 6,
+                    padding: '1px 6px',
+                    borderRadius: 8,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    background: 'var(--surface-muted, #e5e7eb)',
+                    color: 'var(--text-muted, #4b5563)',
+                  }}>
+              ×{toast.repeatCount}
+            </span>
+          )}
+        </div>
+        {detail && (
+          <div data-testid="toast-detail"
+               style={{ marginTop: 4, fontWeight: 400,
+                        color: 'var(--text-secondary, #6b7280)' }}>
+            {detail}
+          </div>
+        )}
+        {tech && (
+          <div style={{ marginTop: 6 }}>
+            <button
+              data-testid="toast-details-toggle"
+              onClick={(e) => {
+                e.stopPropagation()
+                setDetailsOpen((v) => !v)
+              }}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: 'var(--text-muted, #9ca3af)',
+                fontSize: 11,
+                cursor: 'pointer',
+                padding: 0,
+                textDecoration: 'underline',
+              }}
+            >
+              {detailsOpen ? 'Hide details' : 'Details'}
+            </button>
+            {detailsOpen && (
+              <div data-testid="toast-technical-detail"
+                   style={{ marginTop: 4, fontSize: 11,
+                            fontFamily: 'ui-monospace, monospace',
+                            color: 'var(--text-muted, #9ca3af)',
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word' }}>
+                {tech}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
       <button
         onClick={dismiss}
         style={{
