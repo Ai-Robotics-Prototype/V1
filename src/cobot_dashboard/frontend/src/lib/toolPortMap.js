@@ -241,14 +241,30 @@ export function resolveCustomEOATRecord({
   let spareCursor = 0
   const resolvedActuators = acts.map((a, i) => {
     const type = a.type
-    const hold = a.holdOnLoss ?? a.hold_on_loss
+    const rawHold = a.holdOnLoss ?? a.hold_on_loss
+    const hasCheckValve = a.hasCheckValve ?? a.has_check_valve
+    // Vacuum: holds-on-loss is derived from the check valve answer
+    // (preselected YES on the custom path — NeuRobots standard
+    // vacuum tools include one). The valve class is HI/LO 3/2 N/C
+    // regardless, so holds_via distinguishes 'check_valve' from
+    // valve-class holding.
+    let hold
+    let holdsVia = null
+    if (type === 'vacuum') {
+      const vm = vacuumHoldMetadata(hasCheckValve)
+      hold = vm.holds_on_loss
+      holdsVia = vm.holds_via
+    } else {
+      hold = rawHold ?? null
+    }
     const rec = recommendValveType(type, hold)
     const valve = rec ? (freeSpares[spareCursor++] || null) : null
     const label = a.label
       || _defaultActuatorLabel(type, i, acts.length)
     return {
       type,
-      hold_on_loss: hold ?? null,
+      hold_on_loss: hold,
+      holds_via: holdsVia,
       valve,
       label,
       recommended_valve_type: rec ? rec.type : null,
@@ -328,18 +344,22 @@ export function recommendValveType(actuation, holdOnLoss) {
     }
   }
   if (actuation === 'double_acting') {
-    if (holdOnLoss) {
-      const info = VALVE_TYPE_INFO['5/2 DS'] || {}
+    // 2026-10-02 operator directive (hold-on-loss default): on no
+    // answer we recommend 5/2 DS so doing nothing yields the
+    // "part won't drop" valve class. The operator can still pick
+    // "No" at the actuator card to flip to 5/2 SS.
+    if (holdOnLoss === false) {
+      const info = VALVE_TYPE_INFO['5/2 SS'] || {}
       return {
-        type: '5/2 DS',
-        why:  info.best_use || 'Holds last position when power drops.',
+        type: '5/2 SS',
+        why:  info.best_use || 'Spring return to home on power or air loss.',
         notes: info.plain_explanation || '',
       }
     }
-    const info = VALVE_TYPE_INFO['5/2 SS'] || {}
+    const info = VALVE_TYPE_INFO['5/2 DS'] || {}
     return {
-      type: '5/2 SS',
-      why:  info.best_use || 'Spring return to home on power or air loss.',
+      type: '5/2 DS',
+      why:  info.best_use || 'Holds last position when power drops.',
       notes: info.plain_explanation || '',
     }
   }
@@ -352,6 +372,20 @@ export function recommendValveType(actuation, holdOnLoss) {
     }
   }
   return null
+}
+
+// Vacuum hold-on-loss is a HARDWARE property of the vacuum path, not
+// of the valve. NeuRobots standard vacuum tools ship with an inline
+// vacuum check valve so parts stay held through an air loss; a
+// third-party / custom vacuum head wired without one releases on
+// loss. The record keeps `holds_via` distinct from valve-class
+// holding so provenance stays truthful: 'check_valve' means the
+// physical hardware does the holding, not the solenoid class.
+export function vacuumHoldMetadata(hasCheckValve) {
+  if (hasCheckValve === false) {
+    return { holds_on_loss: false, holds_via: null }
+  }
+  return { holds_on_loss: true, holds_via: 'check_valve' }
 }
 
 function sensorTypeCopy() {

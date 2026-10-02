@@ -530,6 +530,7 @@ function AirActuationStep({ answers, onHoldChange }) {
   ]
   return (
     <div data-testid="fixture-step-air"
+         data-preselected-hold="true"
          style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
         If the robot stops or air is lost, should it STAY CLAMPED
@@ -563,6 +564,16 @@ function AirActuationStep({ answers, onHoldChange }) {
           )
         })}
       </div>
+      {hold === true && (
+        <div data-testid="fixture-hold-recommended-copy"
+             style={{
+               padding: '8px 12px', background: '#ECFDF5',
+               border: '1px solid #6EE7B7', borderRadius: 6,
+               fontSize: 12, color: '#065F46', lineHeight: 1.5,
+             }}>
+          Recommended — the part won't drop if power or air is lost.
+        </div>
+      )}
       <div style={{
         padding: '8px 12px', background: '#F9FAFB',
         border: '1px solid #E5E7EB', borderRadius: 6,

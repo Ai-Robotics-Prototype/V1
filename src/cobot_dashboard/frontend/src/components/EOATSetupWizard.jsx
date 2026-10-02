@@ -79,6 +79,14 @@ const _STANDARD_NAME_DEFAULTS = {
   vacuum: 'Vacuum Tool',
 }
 
+// Fresh actuator record for the custom flow. Hold / check-valve
+// preselects are applied on actuator-TYPE pick (ActuatorCard's
+// onChange handler) — a brand-new actuator with no type has both
+// fields cleared so the picker starts from zero.
+function _defaultActuator() {
+  return { type: '', holdOnLoss: null, hasCheckValve: null }
+}
+
 // Shared duplicate-name predicate. Case-insensitive, trimmed. When
 // `excludeId` is set, allows the operator to rename back to the same
 // name on the same entry.
@@ -467,6 +475,31 @@ export default function EOATSetupWizard({
                   />
                 )}
                 <GuidanceBlock port={guidancePortMap} />
+                {activeTool.key === 'vacuum' && (
+                  <div data-testid="hardware-setup-vacuum-check-valve-note"
+                       style={{
+                         padding: '8px 12px', marginBottom: 10,
+                         background: '#ECFDF5', border: '1px solid #6EE7B7',
+                         borderRadius: 6, color: '#065F46',
+                         fontSize: 12, lineHeight: 1.5,
+                       }}>
+                    Your NeuRobots vacuum tool includes a check valve
+                    — parts stay held if air is lost.
+                  </div>
+                )}
+                {activeTool.key === 'finger' && (
+                  <div data-testid="hardware-setup-finger-hold-note"
+                       style={{
+                         padding: '8px 12px', marginBottom: 10,
+                         background: '#ECFDF5', border: '1px solid #6EE7B7',
+                         borderRadius: 6, color: '#065F46',
+                         fontSize: 12, lineHeight: 1.5,
+                       }}>
+                    Recommended — the part won't drop if power or air
+                    is lost. The default valve is a double-acting (5/2
+                    DS) so the fingers stay clamped on loss.
+                  </div>
+                )}
                 {!readOnly && (
                   <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
                     <button style={btnGhost} onClick={onClose}
@@ -700,10 +733,19 @@ function CustomEOATFlow({
   const [step, setStep]  = useState(0)
   const [name, setName]  = useState('')
   const [actuatorCount, setActuatorCount] = useState(1)
-  // actuators[i] = { type, holdOnLoss | null }. Length always
-  // matches actuatorCount — we resize on count change so index
-  // stability is preserved.
-  const [actuators, setActuators] = useState([{ type: '', holdOnLoss: null }])
+  // actuators[i] = { type, holdOnLoss | null, hasCheckValve | null }.
+  // Length always matches actuatorCount — we resize on count change
+  // so index stability is preserved.
+  //
+  // 2026-10-02 operator directive (hold-on-loss default): a fresh
+  // double-acting actuator preselects holdOnLoss=true ("STAY CLAMPED"
+  // is recommended — doing nothing yields the safe valve class).
+  // Vacuum actuators preselect hasCheckValve=true per the standard
+  // NeuRobots vacuum tool shipping with a check valve inline; a
+  // customer wiring their own cup without one answers NO and the
+  // record stores holds_on_loss=false with honest copy.
+  const [actuators, setActuators] = useState(
+    [_defaultActuator()])
   const [sensorCount, setSensorCount] = useState(0)
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState(null)
@@ -727,7 +769,7 @@ function CustomEOATFlow({
     setActuatorCount(bounded)
     setActuators((prev) => {
       const next = [...prev]
-      while (next.length < bounded) next.push({ type: '', holdOnLoss: null })
+      while (next.length < bounded) next.push(_defaultActuator())
       next.length = bounded
       return next
     })
@@ -744,8 +786,17 @@ function CustomEOATFlow({
     customs,
   }), [name, actuators, sensorCount, customs])
 
-  const perActuatorReady = actuators.every((a) =>
-    a.type && (a.type !== 'double_acting' || a.holdOnLoss !== null))
+  // The hold-on-loss + check-valve preselects fill in on actuator-
+  // type pick, so perActuatorReady becomes "every actuator has a
+  // type". We still keep the per-type coverage explicit so a future
+  // actuator type that needs its own disambiguation flips the gate
+  // back to false by default (fail-closed).
+  const perActuatorReady = actuators.every((a) => {
+    if (!a.type) return false
+    if (a.type === 'double_acting') return a.holdOnLoss !== null
+    if (a.type === 'vacuum')        return a.hasCheckValve !== null
+    return true
+  })
 
   const canAdvance = (
     step === 0 ? nameOk
@@ -771,6 +822,7 @@ function CustomEOATFlow({
         actuators: (resolved.actuators || []).map((a) => ({
           type: a.type,
           hold_on_loss: a.hold_on_loss,
+          holds_via: a.holds_via || null,
           valve: a.valve,
           label: a.label,
         })),
@@ -1018,7 +1070,7 @@ function CustomEOATFlow({
             setSavedEntry(null); setSaveErr(null)
             setStep(0); setName('')
             setActuatorCount(1)
-            setActuators([{ type: '', holdOnLoss: null }])
+            setActuators([_defaultActuator()])
             setSensorCount(0)
             onSetupAnother?.()
           }}
@@ -1093,13 +1145,22 @@ function ActuatorCard({
       </div>
       <ActuationChoice
         value={value.type}
-        onChange={(t) => onChange({ type: t,
-          holdOnLoss: t === 'double_acting' ? value.holdOnLoss : null })}
+        onChange={(t) => onChange({
+          type: t,
+          // Preselect per the 2026-10-02 hold-on-loss default
+          // directive — doing nothing yields the safe answer:
+          //   double_acting → holdOnLoss=true (STAY CLAMPED → 5/2 DS)
+          //   vacuum        → hasCheckValve=true (NeuRobots standard)
+          //   anything else → both cleared (no hold question applies)
+          holdOnLoss:    t === 'double_acting' ? true : null,
+          hasCheckValve: t === 'vacuum'        ? true : null,
+        })}
         options={options}
       />
       {value.type === 'double_acting' && (
         <div data-testid="custom-eoat-hold-question"
              data-actuator-index={String(index)}
+             data-preselected-hold="true"
              style={{
                marginTop: 10, padding: 12,
                background: '#F9FAFB',
@@ -1140,6 +1201,77 @@ function ActuatorCard({
               No — snap home on loss (5/2 SS)
             </button>
           </div>
+          {value.holdOnLoss === true && (
+            <div data-testid="custom-eoat-hold-recommended-copy"
+                 style={{
+                   marginTop: 8, fontSize: 12, color: '#065F46',
+                 }}>
+              Recommended — the part won't drop if power or air
+              is lost.
+            </div>
+          )}
+        </div>
+      )}
+      {value.type === 'vacuum' && (
+        <div data-testid="custom-eoat-vacuum-check-valve"
+             data-actuator-index={String(index)}
+             data-preselected-check-valve="true"
+             style={{
+               marginTop: 10, padding: 12,
+               background: '#F9FAFB',
+               border: '1px solid #E5E7EB', borderRadius: 8,
+             }}>
+          <div style={{ fontSize: 13, fontWeight: 600,
+                        color: '#111827', marginBottom: 6 }}>
+            Does this tool have a vacuum check valve?
+          </div>
+          <div style={{ fontSize: 12, color: '#6B7280',
+                        marginBottom: 10 }}>
+            A check valve holds the part when the air drops. NeuRobots
+            vacuum tools ship with one — custom cups wired without
+            one will release on air loss.
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              data-testid="custom-eoat-check-valve-yes"
+              data-actuator-index={String(index)}
+              onClick={() => onChange({ hasCheckValve: true })}
+              style={{
+                ...btnGhost,
+                background: value.hasCheckValve === true ? '#DCFCE7' : '#fff',
+                borderColor: value.hasCheckValve === true ? '#22C55E' : '#d1d5db',
+              }}>
+              Yes — has a check valve
+            </button>
+            <button
+              data-testid="custom-eoat-check-valve-no"
+              data-actuator-index={String(index)}
+              onClick={() => onChange({ hasCheckValve: false })}
+              style={{
+                ...btnGhost,
+                background: value.hasCheckValve === false ? '#DBEAFE' : '#fff',
+                borderColor: value.hasCheckValve === false ? '#2563EB' : '#d1d5db',
+              }}>
+              No — no check valve
+            </button>
+          </div>
+          {value.hasCheckValve === true && (
+            <div data-testid="custom-eoat-check-valve-recommended-copy"
+                 style={{
+                   marginTop: 8, fontSize: 12, color: '#065F46',
+                 }}>
+              Recommended — the part won't drop if power or air
+              is lost.
+            </div>
+          )}
+          {value.hasCheckValve === false && (
+            <div data-testid="custom-eoat-check-valve-release-copy"
+                 style={{
+                   marginTop: 8, fontSize: 12, color: '#7F1D1D',
+                 }}>
+              Parts will release if air is lost.
+            </div>
+          )}
         </div>
       )}
       {resolved && resolved.recommended_valve_type && (
@@ -1385,20 +1517,45 @@ function _buildStandardPortMap(toolKey, sensorCount) {
 // a duplicate card. The operator-supplied name is the single source
 // for program-wizard card display — the type-label default is only
 // a prefill.
+//
+// 2026-10-02 operator directive (hold-on-loss default + vacuum
+// check-valve standard):
+//
+//   * Finger standard path records type='double_acting' with
+//     hold_on_loss=true. Previous default was 'single_acting'
+//     (spring-return, 5/2 SS → part drops on power loss).
+//   * Vacuum standard path records holds_on_loss=true + holds_via=
+//     'check_valve' — NeuRobots vacuum tools ship with an inline
+//     vacuum check valve. The valve class (HI/LO 3/2 N/C) stays
+//     the same; holds_via distinguishes check-valve holding from
+//     valve-class holding so the record stays physically truthful.
 function _standardCellEntry({ toolKey, name, port, sensorCount }) {
   const nameTrim = String(name || '').trim()
     || _STANDARD_NAME_DEFAULTS[toolKey]
     || 'EOAT'
   const valve = (port.required_valves || [])[0] || null
   const inputs = Array.from(port.required_inputs || [])
-  const actuators = valve
-    ? [{
-        type: toolKey === 'vacuum' ? 'vacuum' : 'single_acting',
-        hold_on_loss: false,
+  let actuators = []
+  if (valve) {
+    if (toolKey === 'vacuum') {
+      actuators = [{
+        type:         'vacuum',
+        hold_on_loss: true,
+        holds_via:    'check_valve',
         valve,
-        label: toolKey === 'vacuum' ? 'vacuum' : 'actuator',
+        label:        'vacuum',
       }]
-    : []
+    } else {
+      // finger (and any future paired-coil standard path)
+      actuators = [{
+        type:         'double_acting',
+        hold_on_loss: true,
+        holds_via:    null,
+        valve,
+        label:        'actuator',
+      }]
+    }
+  }
   return {
     id:       `standard:${toolKey}`,
     name:     nameTrim,

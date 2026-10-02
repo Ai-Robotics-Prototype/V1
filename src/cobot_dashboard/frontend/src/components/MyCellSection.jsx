@@ -7,6 +7,7 @@ import {
   namedActionsForEoat, namedActionsForFixture,
   programsReferencingCellId,
 } from '../lib/cellActions'
+import { shouldReviewHold } from '../lib/cellReview'
 import { useStore } from '../store/useStore'
 
 // My Cell — read-only summary of the cell registry, with per-entry
@@ -156,6 +157,7 @@ export default function MyCellSection() {
                 data-kind="eoat"
                 entry={e}
                 actions={namedActionsForEoat(e)}
+                reviewHold={_shouldReviewHold(e)}
                 expanded={expandedId === e.id}
                 onToggle={() => setExpandedId(
                   expandedId === e.id ? null : e.id)}
@@ -189,6 +191,7 @@ export default function MyCellSection() {
                 data-kind="fixture"
                 entry={f}
                 actions={namedActionsForFixture(f)}
+                reviewHold={_shouldReviewHold(f)}
                 expanded={expandedId === f.id}
                 onToggle={() => setExpandedId(
                   expandedId === f.id ? null : f.id)}
@@ -242,6 +245,7 @@ function _GroupHeader({ label, count }) {
 
 function _EntryRow({
   entry, actions, expanded, onToggle, ports,
+  reviewHold,
   renaming, renameDraft, renameErr,
   onRenameStart, onRenameDraft, onRenameCancel, onRenameCommit,
   confirmingDelete, onDeleteStart, onDeleteCancel, onDeleteCommit,
@@ -273,6 +277,19 @@ function _EntryRow({
             padding: 0,
           }}>
           <div style={{ flex: 1 }}>
+            {reviewHold && !renaming && (
+              <div data-testid="my-cell-entry-review-chip"
+                   data-cell-id={entry.id}
+                   style={{
+                     display: 'inline-flex', alignItems: 'center',
+                     padding: '2px 8px', marginBottom: 4,
+                     background: '#FEF3C7', color: '#92400E',
+                     border: '1px solid #FDE68A', borderRadius: 999,
+                     fontSize: 11, fontWeight: 600, letterSpacing: 0.3,
+                   }}>
+                Review recommended — hold-on-loss not set
+              </div>
+            )}
             {renaming ? (
               <input
                 type="text"
@@ -406,6 +423,20 @@ function _EntryRow({
           borderTop: '1px solid #E5E7EB', padding: 12,
           background: '#F9FAFB',
         }} data-testid="my-cell-entry-body">
+          {reviewHold && (
+            <div data-testid="my-cell-entry-review-copy"
+                 style={{
+                   padding: '8px 12px', marginBottom: 10,
+                   background: '#FFFBEB', color: '#92400E',
+                   border: '1px solid #FDE68A', borderRadius: 6,
+                   fontSize: 12, lineHeight: 1.5,
+                 }}>
+              This profile was saved before the current safety
+              default. We recommend you re-run EOAT Setup for this
+              tool to confirm whether it should STAY CLAMPED on
+              power or air loss — nothing has been changed for you.
+            </div>
+          )}
           {ports && <GuidanceBlock port={ports} />}
           {actions.length > 0 && (
             <div style={{ marginTop: 6 }} data-testid="my-cell-actions">
@@ -444,6 +475,10 @@ function _EntryRow({
     </div>
   )
 }
+
+// Thin wrapper so legacy call sites can keep the underscore-prefix
+// name; the predicate itself lives in lib/cellReview for testability.
+function _shouldReviewHold(entry) { return shouldReviewHold(entry) }
 
 // ── Port-record projections (feed the shared GuidanceBlock) ─────────
 

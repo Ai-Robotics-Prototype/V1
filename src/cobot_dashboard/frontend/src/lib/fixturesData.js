@@ -115,13 +115,21 @@ export const FIXTURE_TYPES = Object.freeze({
     defaults: {
       power_mode: 'air',
       air_actuation: 'double',
-      hold_on_loss: false,  // Doors default to RELEASE on loss so the
-                            // guard opens for evacuation / rescue.
+      // 2026-10-02 operator directive (hold-on-loss default +
+      // product standard): every asking path preselects STAY
+      // CLAMPED so doing nothing yields the "part won't drop"
+      // valve class. Doors / slides holding a cover over a part
+      // benefit from this default; an operator working on a safety
+      // guard that must open for egress can still pick Release.
+      hold_on_loss: true,
     },
     name_prefix: 'Door',
     why:
-      'Guards and doors default to RELEASE on power/air loss so the '
-      + 'operator can escape and the workspace clears.',
+      'A pneumatic door or slide with two states — open and closed. '
+      + 'The default answer is STAY CLAMPED on power/air loss so a '
+      + 'held cover or chute never drops a part mid-cycle. If this '
+      + 'door is a safety guard that must open for egress, pick '
+      + 'Release on the next step.',
   },
   other: {
     key: 'other', label: 'Something else',
@@ -129,7 +137,11 @@ export const FIXTURE_TYPES = Object.freeze({
     icon: 'other',
     defaults: {
       power_mode: null,
-      hold_on_loss: null,
+      // 2026-10-02 operator directive (hold-on-loss default): any
+      // asking path preselects STAY CLAMPED. The AIR branch here
+      // only becomes relevant when the operator picks air power on
+      // step 2; the preselect lands then via PowerForkStep's reset.
+      hold_on_loss: true,
     },
     name_prefix: 'Fixture',
     why:

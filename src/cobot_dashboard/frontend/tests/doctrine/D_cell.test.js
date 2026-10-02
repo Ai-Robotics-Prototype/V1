@@ -48,6 +48,10 @@ const {
   findCellEoat, findCellFixture,
 } = await import('../../src/lib/cellStore.js')
 
+const {
+  shouldReviewHold,
+} = await import('../../src/lib/cellReview.js')
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname  = dirname(__filename)
 const FRONT_ROOT = join(__dirname, '..', '..')
@@ -1272,4 +1276,279 @@ test('custom path: save → entry appears + resolveable by ToolFromCellStep card
   } finally {
     global.fetch = originalFetch
   }
+})
+
+
+// ── 2026-10-02 hold-on-loss default: My Cell review-chip + no-migration ──
+//
+// Saved profiles are NEVER silently migrated — changing a valve class
+// behind the operator's back changes physical behavior. Legacy entries
+// get a subtle "review recommended" chip + plain copy; the operator
+// re-confirms per tool.
+
+test('shouldReviewHold flags legacy single-valve finger (single_acting, hold false)', () => {
+  const legacyFinger = {
+    id: 'standard:finger', name: 'Finger Gripper', type: 'finger',
+    valve: 'V01', inputs: ['IN01', 'IN02'],
+    actuators: [{
+      type: 'single_acting', hold_on_loss: false,
+      valve: 'V01', label: 'actuator',
+    }],
+  }
+  assert.equal(shouldReviewHold(legacyFinger), false,
+    v('single_acting physically cannot hold on loss — it must NEVER '
+      + 'trigger the review chip (it is already honest).'))
+})
+
+test('shouldReviewHold flags legacy vacuum entry with hold_on_loss=false', () => {
+  const legacyVacuum = {
+    id: 'standard:vacuum', name: 'Vacuum Suction', type: 'vacuum',
+    valve: 'V03', inputs: ['IN04'],
+    actuators: [{
+      type: 'vacuum', hold_on_loss: false, valve: 'V03', label: 'vacuum',
+    }],
+  }
+  assert.equal(shouldReviewHold(legacyVacuum), true,
+    v('A pre-directive vacuum entry recording hold_on_loss=false '
+      + 'must trigger the chip — operator should re-confirm whether '
+      + 'the tool has a check valve.'))
+})
+
+test('shouldReviewHold does NOT flag vacuum entries that record holds_via=check_valve', () => {
+  const freshVacuum = {
+    id: 'standard:vacuum', name: 'Vacuum Suction', type: 'vacuum',
+    valve: 'V03', inputs: ['IN04'],
+    actuators: [{
+      type: 'vacuum', hold_on_loss: true, holds_via: 'check_valve',
+      valve: 'V03', label: 'vacuum',
+    }],
+  }
+  assert.equal(shouldReviewHold(freshVacuum), false,
+    v('A fresh vacuum entry recording holds_on_loss=true + '
+      + 'holds_via=check_valve is already truthful — no chip.'))
+})
+
+test('shouldReviewHold flags double_acting with hold_on_loss=false (release)', () => {
+  const dsReleaseFinger = {
+    id: 'standard:finger', name: 'Finger Gripper', type: 'finger',
+    valve: 'V01', inputs: ['IN01', 'IN02'],
+    actuators: [{
+      type: 'double_acting', hold_on_loss: false,
+      valve: 'V01', label: 'actuator',
+    }],
+  }
+  assert.equal(shouldReviewHold(dsReleaseFinger), true,
+    v('A double-acting entry with hold_on_loss=false predates the '
+      + '2026-10-02 safety default — chip the entry so the operator '
+      + 'can re-confirm.'))
+})
+
+test('shouldReviewHold does NOT flag fresh standard finger (double_acting, hold true)', () => {
+  const freshFinger = {
+    id: 'standard:finger', name: 'Finger Gripper', type: 'finger',
+    valve: 'V01', inputs: ['IN01', 'IN02'],
+    actuators: [{
+      type: 'double_acting', hold_on_loss: true,
+      valve: 'V01', label: 'actuator',
+    }],
+  }
+  assert.equal(shouldReviewHold(freshFinger), false,
+    v('A fresh finger entry under the new default (double_acting + '
+      + 'hold true) must NOT trigger the chip.'))
+})
+
+test('shouldReviewHold flags legacy air fixture with hold_on_loss=false', () => {
+  const legacyVice = {
+    id: 'fx_abc', name: 'Vice 1', type: 'vice',
+    power_mode: 'air', actuation: 'double',
+    hold_on_loss: false, valve: 'V05',
+  }
+  assert.equal(shouldReviewHold(legacyVice), true,
+    v('A pre-directive air-powered fixture recording hold_on_loss='
+      + 'false must trigger the chip.'))
+})
+
+test('shouldReviewHold ignores own-controller / manual fixtures (no hold question)', () => {
+  const indexer = {
+    id: 'fx_i', name: 'Indexer', type: 'indexer',
+    power_mode: 'own_controller', hold_on_loss: null,
+  }
+  const manual = {
+    id: 'fx_m', name: 'Manual', type: 'other',
+    power_mode: 'manual', hold_on_loss: null,
+  }
+  assert.equal(shouldReviewHold(indexer), false,
+    v('Own-controller fixtures never ask the hold question — no chip.'))
+  assert.equal(shouldReviewHold(manual), false,
+    v('Manual fixtures never ask the hold question — no chip.'))
+})
+
+test('shouldReviewHold ignores blow-off fixtures (no hold state at all)', () => {
+  const blowoff = {
+    id: 'fx_b', name: 'Blow-off', type: 'blow_off',
+    power_mode: 'air', actuation: 'blow_off', hold_on_loss: null,
+  }
+  assert.equal(shouldReviewHold(blowoff), false,
+    v('Blow-off is default-off; no hold state to review.'))
+})
+
+test('MyCellSection renders review-chip for flagged entries', () => {
+  assert.ok(/data-testid="my-cell-entry-review-chip"/.test(myCellSrc),
+    v('MyCellSection must render a review-recommended chip with '
+      + 'data-testid="my-cell-entry-review-chip" for legacy hold '
+      + 'entries.'))
+  assert.ok(/Review recommended — hold-on-loss not set/.test(myCellSrc),
+    v('Chip must carry the "Review recommended — hold-on-loss not '
+      + 'set" plain-copy label.'))
+  assert.ok(/import \{ shouldReviewHold \} from '\.\.\/lib\/cellReview'/
+    .test(myCellSrc),
+    v('MyCellSection must import shouldReviewHold from the shared '
+      + 'lib/cellReview module (test-reachable single source).'))
+})
+
+test('NO silent migration: backend never rewrites hold_on_loss on legacy entries', () => {
+  // Scan the cell endpoint block + migration helper for any
+  // assignment that would silently flip saved hold_on_loss to
+  // true. The actuators backfill is allowed to seed hold_on_loss
+  // for new fields but must NOT overwrite existing values.
+  const migrator = backendSrc.match(
+    /def _migrate_actuators_v1[\s\S]*?(?=\n    def [a-zA-Z_])/)
+  assert.ok(migrator, v('_migrate_actuators_v1 helper not found'))
+  const code = migrator[0]
+  // The seed line "hold_on_loss': False" is allowed (new backfill
+  // keeps the honest 'false' for legacy single_acting entries).
+  // A regression would look like "hold_on_loss'] = True" on an
+  // existing entry — forbid that pattern.
+  assert.equal(/hold_on_loss['"]\]\s*=\s*True/.test(code), false,
+    v('_migrate_actuators_v1 must NEVER overwrite an existing '
+      + 'hold_on_loss to True — that would silently change the '
+      + 'physical behavior of saved tools.'))
+})
+
+
+// ── 2026-10-02 EOAT wizard: per-actuator preselects + vacuum copy ──
+
+test('EOAT wizard custom path preselects holdOnLoss=true on double_acting', () => {
+  // The ActuationChoice onChange handler sets holdOnLoss=true when
+  // the operator picks double_acting (and clears it to null for
+  // every other type).
+  assert.ok(
+    /holdOnLoss:\s*t === 'double_acting' \? true : null/.test(eoatWizSrc),
+    v('ActuationChoice onChange handler must preselect holdOnLoss='
+      + 'true for double_acting per the 2026-10-02 safety default.'))
+  assert.ok(/data-preselected-hold="true"/.test(eoatWizSrc),
+    v('Custom-eoat-hold-question block must carry '
+      + 'data-preselected-hold="true" so the preselect is testable.'))
+})
+
+test('EOAT wizard custom path preselects hasCheckValve=true on vacuum', () => {
+  assert.ok(
+    /hasCheckValve:\s*t === 'vacuum'\s*\? true : null/.test(eoatWizSrc),
+    v('ActuationChoice onChange handler must preselect hasCheckValve='
+      + 'true for vacuum (NeuRobots standard includes check valve).'))
+  assert.ok(/data-preselected-check-valve="true"/.test(eoatWizSrc),
+    v('Custom-eoat vacuum check-valve block must carry '
+      + 'data-preselected-check-valve="true".'))
+})
+
+test('EOAT wizard renders the exact check-valve copy strings', () => {
+  const normalized = eoatWizSrc.replace(/\s+/g, ' ')
+  // YES copy (NeuRobots standard note).
+  assert.ok(
+    normalized.includes('NeuRobots vacuum tools ship with one'),
+    v('Custom-vacuum copy must explain the NeuRobots standard '
+      + 'check-valve inclusion to the operator.'))
+  // NO copy — "Parts will release if air is lost." (exact).
+  assert.ok(
+    normalized.includes('Parts will release if air is lost.'),
+    v('Custom-vacuum NO branch must render the honest "Parts will '
+      + 'release if air is lost." plain copy.'))
+})
+
+test('EOAT wizard standard-vacuum confirm renders check-valve note', () => {
+  // The copy is split across JSX whitespace — normalize for the
+  // match without weakening the content pin. The exact prose, with
+  // whitespace collapsed, must appear verbatim.
+  const normalized = eoatWizSrc.replace(/\s+/g, ' ')
+  assert.ok(
+    normalized.includes(
+      'Your NeuRobots vacuum tool includes a check valve '
+      + '— parts stay held if air is lost.'),
+    v('Standard vacuum confirm step must render the exact check-'
+      + 'valve inclusion note.'))
+  assert.ok(/data-testid="hardware-setup-vacuum-check-valve-note"/.test(eoatWizSrc),
+    v('Standard vacuum note must carry a stable data-testid for '
+      + 'future RTL render-pass tests.'))
+})
+
+test('standard-path cell entry: finger records double_acting + hold_on_loss=true', () => {
+  // The _standardCellEntry helper is private; grep for the exact
+  // record shape it produces.
+  assert.ok(
+    /type:\s*'double_acting',\s*hold_on_loss:\s*true,\s*holds_via:\s*null,\s*valve,/
+      .test(eoatWizSrc),
+    v('Standard finger path must record '
+      + "type='double_acting', hold_on_loss=true, holds_via=null on "
+      + 'the standard:finger cell entry.'))
+})
+
+test('standard-path cell entry: vacuum records holds_on_loss=true + holds_via=check_valve', () => {
+  assert.ok(
+    /type:\s*'vacuum',\s*hold_on_loss:\s*true,\s*holds_via:\s*'check_valve',\s*valve,/
+      .test(eoatWizSrc),
+    v('Standard vacuum path must record '
+      + "type='vacuum', hold_on_loss=true, holds_via='check_valve' on "
+      + 'the standard:vacuum cell entry.'))
+})
+
+test('recommendValveType defaults to 5/2 DS on unanswered double_acting', () => {
+  // toolPortMap.js pulls VALVE_TYPE_INFO from pages/SynapsePage (JSX),
+  // which node:test cannot import without a loader. Pin the branch
+  // ordering via source grep instead so a regression (reversing the
+  // if-chain so unanswered goes to 5/2 SS) fails loudly.
+  const toolPortSrc = readSrc('lib/toolPortMap.js')
+  // The 'false' branch must come FIRST inside the double_acting
+  // block, and the fallthrough must land on 5/2 DS. Match the two
+  // adjacent return statements in order.
+  const dblBlock = toolPortSrc.match(
+    /if \(actuation === 'double_acting'\)[\s\S]*?\n  \}/)
+  assert.ok(dblBlock,
+    v('recommendValveType must declare a double_acting block.'))
+  assert.ok(
+    /holdOnLoss === false[\s\S]*?type:\s*'5\/2 SS'/.test(dblBlock[0]),
+    v('double_acting block must handle holdOnLoss === false FIRST '
+      + 'and return 5/2 SS (explicit opt-out).'))
+  assert.ok(/type:\s*'5\/2 DS'/.test(dblBlock[0]),
+    v('double_acting block must fall through to 5/2 DS as the '
+      + 'default — "default-yields-DS" pin per 2026-10-02.'))
+  // The fall-through order: once the explicit-false branch is first,
+  // every other value (undefined/null/true) lands on 5/2 DS.
+  const dsIdx = dblBlock[0].indexOf("'5/2 DS'")
+  const ssIdx = dblBlock[0].indexOf("'5/2 SS'")
+  assert.ok(dsIdx > ssIdx && ssIdx !== -1,
+    v('5/2 SS branch must appear BEFORE 5/2 DS fallthrough so the '
+      + 'default lands on DS when no explicit false is given.'))
+})
+
+test('vacuumHoldMetadata records holds_via distinct from valve-class holding', () => {
+  const toolPortSrc = readSrc('lib/toolPortMap.js')
+  assert.ok(/export function vacuumHoldMetadata\(/.test(toolPortSrc),
+    v('toolPortMap.js must export vacuumHoldMetadata(hasCheckValve) '
+      + 'so the custom + standard vacuum paths share a single source '
+      + 'for the holds_via field.'))
+  // The function must return holds_on_loss=false on explicit NO,
+  // and holds_on_loss=true + holds_via='check_valve' otherwise
+  // (including the preselect-default when hasCheckValve is
+  // undefined). Pin each branch.
+  assert.ok(
+    /hasCheckValve === false[\s\S]*?holds_on_loss:\s*false,\s*holds_via:\s*null/
+      .test(toolPortSrc),
+    v('vacuumHoldMetadata must map hasCheckValve=false → '
+      + 'holds_on_loss:false + holds_via:null (operator wiring a '
+      + 'cup with no check valve gets an honest record).'))
+  assert.ok(
+    /holds_on_loss:\s*true,\s*holds_via:\s*'check_valve'/.test(toolPortSrc),
+    v('vacuumHoldMetadata must map the YES/preselect-default to '
+      + "holds_on_loss:true + holds_via:'check_valve' — provenance "
+      + 'stays truthful (hardware does the holding, not the valve).'))
 })

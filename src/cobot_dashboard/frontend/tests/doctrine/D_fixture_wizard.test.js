@@ -113,9 +113,13 @@ test('device-type defaults match the operator directive', () => {
   assert.equal(FIXTURE_TYPES.blow_off.defaults.air_actuation, 'blow_off',
     v('blow_off default air_actuation must be "blow_off"'))
 
-  // Door → release on loss (guards open for egress).
-  assert.equal(FIXTURE_TYPES.door.defaults.hold_on_loss, false,
-    v('door default hold_on_loss must be false (release for egress)'))
+  // Door → stay clamped on loss (2026-10-02 operator directive:
+  // every asking path preselects STAY CLAMPED; operators who need
+  // a safety guard that must open for egress can still pick
+  // Release on the next step).
+  assert.equal(FIXTURE_TYPES.door.defaults.hold_on_loss, true,
+    v('door default hold_on_loss must be true (STAY CLAMPED '
+      + 'preselect per 2026-10-02 safety default)'))
 })
 
 
@@ -415,6 +419,75 @@ test('wizard emits no /cmd/ or IO writes; guidance is visual only', () => {
       v(`ExternalFixtureWizard code must NOT contain ${forbidden.label} — `
         + `guidance is visual only, no IO writes.`))
   }
+})
+
+
+// ── (10) 2026-10-02 hold-on-loss default: STAY CLAMPED preselect ────
+//
+// Every asking path preselects STAY CLAMPED so doing nothing yields
+// hold_on_loss=true → 5/2 DS. Pinned at three layers so a regression
+// at any one of them fails loudly:
+//   (a) type defaults — vice/door/other default hold_on_loss=true;
+//       conveyor/own-controller stay null (no hold question).
+//   (b) compile — compileFixtureRecord with NO explicit answer picks
+//       up the type default and resolves valve_type='5/2 DS'.
+//   (c) wizard JSX — AirActuationStep carries the preselect marker
+//       and the "Recommended — the part won't drop" plain copy.
+
+test('every air-driven type with a hold question preselects STAY CLAMPED', () => {
+  // Air types that ask the hold question (not blow-off).
+  for (const k of ['vice', 'door', 'other']) {
+    assert.equal(FIXTURE_TYPES[k].defaults.hold_on_loss, true,
+      v(`FIXTURE_TYPES.${k}.defaults.hold_on_loss must be true — `
+        + `2026-10-02 safety default preselects STAY CLAMPED on `
+        + `every asking path.`))
+  }
+  // Continuous / own-controller devices never ask (no hold).
+  assert.equal(FIXTURE_TYPES.indexer.defaults.hold_on_loss, null,
+    v('indexer has its own controller — no hold question is asked, '
+      + 'default stays null.'))
+  assert.equal(FIXTURE_TYPES.feeder.defaults.hold_on_loss, null,
+    v('feeder has its own controller — no hold question is asked, '
+      + 'default stays null.'))
+  // Blow-off has no hold state at all.
+  assert.equal(FIXTURE_TYPES.blow_off.defaults.hold_on_loss, null,
+    v('blow-off is default-off — no hold state to pre-select.'))
+})
+
+test('air-driven type with NO explicit hold answer compiles to 5/2 DS', () => {
+  for (const k of ['vice', 'door', 'other']) {
+    const rec = compileFixtureRecord({
+      type: k, power_mode: 'air',
+      actuation: 'double',
+      completion: 'operator',
+    }, { tools: [], fixtures: [] })
+    assert.equal(rec.hold_on_loss, true,
+      v(`${k} with no explicit hold answer must inherit true from `
+        + `the type default.`))
+    assert.equal(rec.valve_type, '5/2 DS',
+      v(`${k} with no explicit hold answer must resolve `
+        + `valve_type='5/2 DS' — "default-yields-DS" pin.`))
+  }
+})
+
+test('AirActuationStep JSX carries preselect marker + recommended copy', () => {
+  // Preselect marker lets inspectors (and this test) confirm the
+  // step actually renders the preselect without re-running the
+  // wizard; the "data-preselected-hold" attribute is required.
+  assert.ok(/data-preselected-hold="true"/.test(wizardSrc),
+    v('AirActuationStep must carry data-preselected-hold="true" so '
+      + 'the preselect is visible to inspectors + regression tests.'))
+  // Recommended-copy pin — exact string required by the directive.
+  assert.ok(/Recommended — the part won't drop if power or air is lost\./
+    .test(wizardSrc),
+    v('AirActuationStep must render the exact "Recommended — the '
+      + "part won't drop if power or air is lost.\" plain copy under "
+      + 'the preselected STAY CLAMPED answer.'))
+  // The data-testid for the recommended-copy block exists so a
+  // future RTL render-pass test can target it directly.
+  assert.ok(/data-testid="fixture-hold-recommended-copy"/.test(wizardSrc),
+    v('AirActuationStep must expose fixture-hold-recommended-copy '
+      + 'via data-testid so the preselect copy is testable.'))
 })
 
 
