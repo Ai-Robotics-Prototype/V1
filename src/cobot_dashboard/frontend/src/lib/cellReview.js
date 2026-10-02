@@ -30,7 +30,8 @@ export function shouldReviewHold(entry) {
     for (const a of acts) {
       if (!a) continue
       const t = String(a.type || '')
-      if (t === 'single_acting' || t === 'electric_none') continue
+      if (t === 'single_acting' || t === 'electric_none'
+          || t === 'blow_off') continue
       if (t !== 'double_acting' && t !== 'vacuum') continue
       if (a.hold_on_loss !== true) return true
     }

@@ -852,29 +852,34 @@ test('EOATSetupWizard renders SynapseConnectionMap in guidance mode', () => {
       + 'into the map so the highlight-driven glow works.'))
 })
 
-test('EOATSetupWizard has a Custom EOAT flow with 5 steps (name → actuator-count → per-actuator → sensors → review)', () => {
-  // 2026-10-01 multi-actuator extension: the single actuation step
-  // is split into an actuator-count step + a per-actuator walk. The
-  // retired `hardware-setup-custom-step-actuation` testid is replaced
-  // with step-actuator-count + step-actuators.
+test('EOATSetupWizard has a Custom tool flow with 5 steps (name → capabilities → per-selection → sensors → review)', () => {
+  // 2026-10-02 plain-register directive: the actuator-count +
+  // per-actuator picker was replaced by a multi-select "What does
+  // this tool do?" step + per-selection confirmations. The retired
+  // actuator-count testid is replaced with step-capabilities.
   for (const tid of [
     'hardware-setup-custom-flow',
     'hardware-setup-custom-step-name',
-    'hardware-setup-custom-step-actuator-count',
+    'hardware-setup-custom-step-capabilities',
     'hardware-setup-custom-step-actuators',
     'hardware-setup-custom-step-sensors',
     'hardware-setup-custom-step-summary',
   ]) {
     assert.ok(new RegExp(`data-testid="${tid}"`).test(wizardSrc),
-      v(`Custom EOAT flow must expose data-testid="${tid}"`))
+      v(`Custom tool flow must expose data-testid="${tid}"`))
   }
-  // Retired single-actuation testid is GONE — the directive splits
-  // actuation into count + per-actuator walk.
+  // Retired single-actuation testid is GONE (2026-10-01 split).
   assert.equal(/data-testid="hardware-setup-custom-step-actuation"/
                 .test(wizardSrc), false,
     v('Retired testid "hardware-setup-custom-step-actuation" must '
-      + 'not appear — the actuation question is split into '
-      + 'actuator-count + per-actuator steps 2026-10-01.'))
+      + 'not appear.'))
+  // Retired actuator-count testid is GONE (2026-10-02 replaced by
+  // multi-select capability step).
+  assert.equal(/data-testid="hardware-setup-custom-step-actuator-count"/
+                .test(wizardSrc), false,
+    v('Retired testid "hardware-setup-custom-step-actuator-count" '
+      + 'must not appear — the actuator-count question was replaced '
+      + 'by the multi-select capability step 2026-10-02.'))
   // Retired mass testid still gone.
   assert.equal(/data-testid="hardware-setup-custom-step-mass"/.test(wizardSrc),
     false,
@@ -883,7 +888,7 @@ test('EOATSetupWizard has a Custom EOAT flow with 5 steps (name → actuator-cou
   // Back-paths intact: step 0's Back closes the picker (onBack),
   // otherwise setStep(step - 1).
   assert.ok(/step === 0 \? onBack\(\) : setStep\(step - 1\)/.test(wizardSrc),
-    v('Custom EOAT back button must remain `step === 0 ? onBack() : '
+    v('Custom tool back button must remain `step === 0 ? onBack() : '
       + 'setStep(step - 1)` — step 0 still back-paths to the picker.'))
 })
 
@@ -1092,9 +1097,12 @@ test('custom-tool-incomplete renders the finish-your-tool notice', () => {
     v('EOATSetupWizard must render the incomplete notice with '
       + 'data-testid="hardware-setup-custom-incomplete" when a '
       + 'saved custom tool has no assigned ports.'))
-  assert.ok(/Finish this tool's definition/.test(wizardSrc),
-    v('Incomplete notice copy must plainly say to finish the tool '
-      + 'definition — never a blank map.'))
+  // 2026-10-02 plain-register rewrite — "Tell us about this tool
+  // before wiring it up." replaces the old "Finish this tool's
+  // definition" copy.
+  assert.ok(/Tell us about this tool before wiring it up/.test(wizardSrc),
+    v('Incomplete notice copy must plainly say to tell us about '
+      + 'the tool before wiring it up — never a blank map.'))
 })
 
 test('wizard imports resolvePersistedCustomToolPortMap from lib/toolPortMap', () => {
@@ -1139,27 +1147,28 @@ test('actuator-count-drives-n-valves: resolveCustomEOATRecord assigns one SPARE 
       + 'multi-actuator tools silently collide with new allocations.'))
 })
 
-test('actuator-count UI: step exposes 1..4 buttons + contact-us copy', () => {
-  // Grep the mapper source — the N buttons are rendered from a map
-  // over the choices array, so there's one literal data-testid /
-  // data-count expression; verify the choices array covers 1..4 and
-  // the testid + data-count attributes are threaded through.
-  assert.ok(/\[1,\s*2,\s*3,\s*4\]\.map\(\(n\)/.test(wizardSrc),
-    v('Actuator-count step must iterate [1, 2, 3, 4] — the sane '
-      + 'bounds per operator directive (more → contact us copy).'))
-  assert.ok(/data-testid="custom-eoat-actuator-count"\s*\n\s*data-count=\{String\(n\)\}/
-              .test(wizardSrc),
-    v('Each count button must expose data-testid="custom-eoat-'
-      + 'actuator-count" + data-count={String(n)}.'))
-  assert.ok(/_ACTUATOR_MAX\s*=\s*4/.test(wizardSrc),
-    v('_ACTUATOR_MAX must be 4 (sane upper bound).'))
-  assert.ok(/data-testid="custom-eoat-actuator-count-contact"/.test(wizardSrc),
-    v('Actuator-count step must render the contact-us affordance '
-      + '(data-testid="custom-eoat-actuator-count-contact") when the '
+test('capability-select UI: step exposes 4 capability cards + contact-us copy', () => {
+  // 2026-10-02 plain-register directive: the N-button actuator-count
+  // picker was replaced by multi-select picture cards keyed to the
+  // capability catalog. The cap is still 4 (free SPARE slots) so the
+  // contact-us copy preserves the escape hatch for larger tools.
+  assert.ok(/data-testid="custom-eoat-capability"/.test(wizardSrc),
+    v('Each capability card must expose '
+      + 'data-testid="custom-eoat-capability".'))
+  assert.ok(/data-capability-key=\{cap\.key\}/.test(wizardSrc),
+    v('Each capability card must expose data-capability-key={cap.key}.'))
+  assert.ok(/_CAPABILITY_MAX\s*=\s*4/.test(wizardSrc),
+    v('_CAPABILITY_MAX must be 4 (sane upper bound matching the '
+      + 'free SPARE slot count on the controller).'))
+  assert.ok(/data-testid="custom-eoat-capability-contact"/.test(wizardSrc),
+    v('Capability-select step must render the contact-us affordance '
+      + '(data-testid="custom-eoat-capability-contact") when the '
       + 'operator needs more than the max.'))
-  // Each actuator step renders a per-actuator card.
+  // Each selection renders a per-selection confirmation card
+  // (reused testid from the old per-actuator flow — the card now
+  // carries data-capability-key, not data-actuator-index).
   assert.ok(/data-testid="custom-eoat-actuator-card"/.test(wizardSrc),
-    v('Per-actuator step must render actuator cards '
+    v('Per-selection step must render confirmation cards '
       + '(data-testid="custom-eoat-actuator-card").'))
 })
 

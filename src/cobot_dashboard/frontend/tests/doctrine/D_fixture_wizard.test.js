@@ -256,17 +256,16 @@ test('claimedValveIds / claimedInputIds / claimedOutputIds are stable helpers', 
 // ── (4) Process language — no hardware terms in operator copy ───────
 
 test('wizard JSX contains no hardware jargon in operator-facing copy', () => {
-  // Extract only the JSX/prose that the operator SEES — every string
-  // literal outside a comment. The valve-type WHY paragraph gets its
-  // copy from the shared VALVE_TYPE_INFO map in SynapsePage (which
-  // does contain the hardware terms — that's intentional; the pin
-  // just prevents the WIZARD's own JSX from leaking them).
-  const codeOnly = _stripComments(wizardSrc)
+  // Extract only the JSX/prose that the operator SEES — strip
+  // comments AND <WhyExpander> subtrees (the "why?" disclosure is
+  // the only legal home for hardware terms per the 2026-10-02
+  // plain-register directive).
+  const codeOnly = _stripWhyExpanders(_stripComments(wizardSrc))
   for (const term of ['5/2 DS', '5/2 SS', 'HI/LO 3/2', 'N/C', 'N/O',
                         'DO01', 'DO02']) {
     assert.equal(codeOnly.includes(term), false,
       v(`Wizard operator copy must NOT contain "${term}" — hardware `
-        + `terms live only in the valve-info explainer (imported `
+        + `terms live only inside <WhyExpander> subtrees (imported `
         + `into the port record notes/why, not written into the JSX).`))
   }
 })
@@ -477,12 +476,14 @@ test('AirActuationStep JSX carries preselect marker + recommended copy', () => {
   assert.ok(/data-preselected-hold="true"/.test(wizardSrc),
     v('AirActuationStep must carry data-preselected-hold="true" so '
       + 'the preselect is visible to inspectors + regression tests.'))
-  // Recommended-copy pin — exact string required by the directive.
-  assert.ok(/Recommended — the part won't drop if power or air is lost\./
-    .test(wizardSrc),
-    v('AirActuationStep must render the exact "Recommended — the '
-      + "part won't drop if power or air is lost.\" plain copy under "
-      + 'the preselected STAY CLAMPED answer.'))
+  // Recommended-copy pin — the 2026-10-02 plain-register directive
+  // shortened the copy to "Recommended — the part won't drop." The
+  // technical "if power or air is lost" explanation now lives in
+  // the WhyExpander below the question.
+  assert.ok(/Recommended — the part won't drop\./.test(wizardSrc),
+    v('AirActuationStep must render the "Recommended — the part '
+      + "won't drop.\" plain copy under the preselected STAY CLAMPED "
+      + 'answer.'))
   // The data-testid for the recommended-copy block exists so a
   // future RTL render-pass test can target it directly.
   assert.ok(/data-testid="fixture-hold-recommended-copy"/.test(wizardSrc),
@@ -498,4 +499,14 @@ function _stripComments(src) {
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/.*$/gm, '')
     .replace(/([^:'"`])\/\/.*$/gm, '$1')
+}
+
+function _stripWhyExpanders(src) {
+  let out = src
+  let prev
+  do {
+    prev = out
+    out = out.replace(/<WhyExpander\b[^>]*>[\s\S]*?<\/WhyExpander>/g, '')
+  } while (out !== prev)
+  return out
 }

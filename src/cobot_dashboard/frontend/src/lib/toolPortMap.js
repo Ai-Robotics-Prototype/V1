@@ -142,11 +142,17 @@ export function resolvePersistedCustomToolPortMap(tool) {
 }
 
 function _defaultActuatorLabel(type, idx, total) {
-  if (total === 1) return 'actuator'
-  if (type === 'vacuum') return 'vacuum'
-  if (type === 'single_acting') return `actuator ${idx + 1} (single-acting)`
-  if (type === 'double_acting') return `actuator ${idx + 1} (double-acting)`
-  return `actuator ${idx + 1}`
+  if (total === 1) {
+    if (type === 'vacuum')   return 'suction'
+    if (type === 'blow_off') return 'air blast'
+    if (type === 'double_acting' || type === 'single_acting') return 'gripper'
+    return 'action'
+  }
+  if (type === 'vacuum')   return 'suction'
+  if (type === 'blow_off') return 'air blast'
+  if (type === 'double_acting') return `gripper ${idx + 1}`
+  if (type === 'single_acting') return `gripper ${idx + 1}`
+  return `action ${idx + 1}`
 }
 
 // Given a live customs list from /api/tools, return the set of
@@ -254,6 +260,11 @@ export function resolveCustomEOATRecord({
       const vm = vacuumHoldMetadata(hasCheckValve)
       hold = vm.holds_on_loss
       holdsVia = vm.holds_via
+    } else if (type === 'blow_off') {
+      // Blow-off has no hold state — the valve pulses air out and
+      // whatever was being blown is gone. Record false so the My Cell
+      // review-chip predicate does not flag it.
+      hold = false
     } else {
       hold = rawHold ?? null
     }
@@ -363,11 +374,15 @@ export function recommendValveType(actuation, holdOnLoss) {
       notes: info.plain_explanation || '',
     }
   }
-  if (actuation === 'vacuum') {
+  if (actuation === 'vacuum' || actuation === 'blow_off') {
+    // Same valve class — default-off, pulses on command. Separate
+    // actuator TYPE so the record stays truthful (a blow-off is not
+    // a vacuum cup), but the valve recommendation collapses to the
+    // single physical choice.
     const info = VALVE_TYPE_INFO['HI/LO 3/2 N/C'] || {}
     return {
       type: 'HI/LO 3/2 N/C',
-      why:  info.best_use || 'Default-off — pulses vacuum on demand.',
+      why:  info.best_use || 'Default-off — pulses on demand.',
       notes: info.plain_explanation || '',
     }
   }

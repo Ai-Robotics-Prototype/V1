@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { GuidanceBlock } from './EOATSetupWizard'
+import WhyExpander from './WhyExpander'
 import {
   FIXTURE_TYPES, FIXTURE_TYPE_KEYS,
   compileFixtureRecord, fixturePortMap,
@@ -38,10 +39,10 @@ import { useKeyboardInset, scrollFocusedIntoView } from '../lib/keyboardInset'
 // the editor is a named follow-up — not this session.
 
 const STEP_TITLES = [
-  '1. What kind of fixture?',
-  '2. How is it powered?',
-  '3. Actuation',
-  "4. How will the robot know it's done?",
+  '1. What kind of device is this?',
+  '2. How does this device work?',
+  '3. Confirm its behavior',
+  "4. How will the robot know it's finished?",
   '5. Name + wire it up',
 ]
 
@@ -365,9 +366,9 @@ function FixturePicker({ fixtures, onNew, onEdit, onDelete }) {
   return (
     <div data-testid="external-fixture-picker">
       <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 12 }}>
-        External fixtures are things around your robot — vices,
-        indexers, feeders, blow-offs — that the program interacts
-        with during a cycle.
+        External fixtures are things around your robot — clamps,
+        turntables, part feeders, air blasts — that the program
+        works with during a cycle.
       </div>
       <button
         data-testid="external-fixture-new"
@@ -467,25 +468,24 @@ function DeviceTypeStep({ selected, onPick }) {
 function PowerForkStep({ typeDef, selected, onPick }) {
   const options = [
     { key: 'air',
-      label: 'Air (the robot controls its air)',
-      desc: 'The robot pushes air to a valve on the panel. Use this '
-        + 'for anything opened and closed by a pneumatic cylinder.' },
+      label: 'The robot controls its air',
+      desc: 'The robot sends air to the device to open or close it.' },
     { key: 'own_controller',
-      label: 'Has its own controller (robot sends a go signal)',
-      desc: 'The device runs itself. The robot dry-triggers it to '
-        + 'start and reads back a done signal.' },
+      label: 'It has its own controls — the robot just tells it to go',
+      desc: 'The device runs itself. The robot sends a start signal '
+        + 'and waits for the device to finish.' },
     { key: 'manual',
-      label: 'Manual (a person operates it)',
-      desc: 'A human handles the device. The robot only waits for '
-        + 'the operator to say "continue".' },
+      label: 'A person operates it',
+      desc: 'A human handles the device. The robot pauses and asks '
+        + 'the operator to press continue.' },
   ]
   return (
     <div data-testid="fixture-step-power"
          style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div style={{ fontSize: 13, color: '#374151' }}>
         {typeDef
-          ? <>How is the <b>{typeDef.label.toLowerCase()}</b> powered?</>
-          : 'How is this fixture powered?'}
+          ? <>How does the <b>{typeDef.label.toLowerCase()}</b> work?</>
+          : 'How does this device work?'}
       </div>
       {options.map((o) => {
         const on = selected === o.key
@@ -518,23 +518,23 @@ function AirActuationStep({ answers, onHoldChange }) {
   const hold = answers.hold_on_loss
   const cards = [
     { key: true,
-      title: 'Stay clamped',
-      desc: 'Keep gripping when power or air is lost. Recommended '
-        + 'for anything holding a part the robot cannot afford to '
-        + 'drop mid-cycle.' },
+      title: 'Yes — keep holding',
+      desc: 'The device holds whatever it is holding when power or '
+        + 'air is lost. Pick this if letting go would drop a part '
+        + 'or damage something.' },
     { key: false,
-      title: 'Release',
-      desc: 'Let go when power or air is lost. Recommended for '
-        + 'anything grabbing a person or a fragile item, and for '
-        + 'guards / doors that should open on power loss.' },
+      title: 'No — let go',
+      desc: 'The device opens on its own when power or air is lost. '
+        + 'Pick this for guards or doors that should open for a '
+        + 'person to walk through.' },
   ]
   return (
     <div data-testid="fixture-step-air"
          data-preselected-hold="true"
          style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
-        If the robot stops or air is lost, should it STAY CLAMPED
-        or RELEASE?
+        If the robot suddenly stops, should this keep holding the
+        part?
       </div>
       <div style={{ display: 'flex', gap: 10 }}>
         {cards.map((c) => {
@@ -571,18 +571,17 @@ function AirActuationStep({ answers, onHoldChange }) {
                border: '1px solid #6EE7B7', borderRadius: 6,
                fontSize: 12, color: '#065F46', lineHeight: 1.5,
              }}>
-          Recommended — the part won't drop if power or air is lost.
+          Recommended — the part won't drop.
         </div>
       )}
-      <div style={{
-        padding: '8px 12px', background: '#F9FAFB',
-        border: '1px solid #E5E7EB', borderRadius: 6,
-        fontSize: 12, color: '#6B7280', lineHeight: 1.5,
-      }}>
-        Why this matters — the answer picks the physical valve type
-        (spring-return vs. memory) so the panel behaves the way you
-        chose without any additional configuration.
-      </div>
+      <WhyExpander
+        label="Why does this matter?"
+        testId="fixture-hold-why">
+        "Yes" installs a 5/2 DS (double-solenoid) valve so the device
+        remembers its last commanded position when power drops. "No"
+        installs a 5/2 SS (single-solenoid) valve with a spring that
+        returns the device to its home position.
+      </WhyExpander>
     </div>
   )
 }
@@ -593,12 +592,12 @@ function OwnControllerStep({ answers, onWantsDoneChange }) {
     <div data-testid="fixture-step-own-controller"
          style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
-        Does it signal back when finished?
+        Does the device tell the robot when it's finished?
       </div>
       <div style={{ fontSize: 12, color: '#6b7280' }}>
-        The robot always sends a start signal on a spare output.
-        Reading a done signal back is optional — pick "No" and the
-        program will wait a fixed number of seconds instead.
+        The robot always sends the start signal. The device telling
+        the robot "I'm done" is a separate wire. If it doesn't, the
+        robot will wait a fixed amount of time instead.
       </div>
       <div style={{ display: 'flex', gap: 10 }}>
         {[true, false].map((v) => {
@@ -616,11 +615,19 @@ function OwnControllerStep({ answers, onWantsDoneChange }) {
                       borderRadius: 8, cursor: 'pointer', fontWeight: 700,
                       fontFamily: 'inherit',
                     }}>
-              {v ? 'Yes — read a done signal' : 'No — wait a set time'}
+              {v ? 'Yes — it sends a done signal'
+                 : 'No — the robot will wait a set time'}
             </button>
           )
         })}
       </div>
+      <WhyExpander
+        label="Which is safer?"
+        testId="fixture-wants-done-why">
+        A done signal is safer than a timer — the robot never guesses
+        whether the device finished. Pick "No" only when the device
+        has no spare output to wire back.
+      </WhyExpander>
     </div>
   )
 }
@@ -631,20 +638,19 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
     <div data-testid="fixture-step-completion"
          style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div style={{ fontSize: 13, color: '#374151' }}>
-        Choose how the program moves past this fixture.
+        How will the robot know it's finished?
       </div>
       {[
-        { key: 'sensor', label: 'Read a sensor',
-          desc: 'The robot waits until an input on the panel confirms '
-            + 'the fixture is done. Best answer for clamps, doors, '
-            + 'and anything where "done" has a physical signal.' },
-        { key: 'wait', label: 'Wait a fixed time',
-          desc: 'The robot waits a set number of seconds. Use only '
-            + 'when a signal is not available — a timer cannot tell '
-            + 'if the fixture actually finished.' },
-        { key: 'operator', label: 'Wait for operator',
-          desc: 'The program pauses and prompts the operator to '
-            + 'press Continue.' },
+        { key: 'sensor', label: 'A sensor tells it',
+          desc: 'A sensor on the device sends a signal when it is '
+            + 'done. The robot waits for the signal before moving on.' },
+        { key: 'wait', label: 'It always takes about the same time',
+          desc: 'The robot waits a set number of seconds. Pick this '
+            + 'only when the device has no signal — a timer cannot '
+            + 'tell if the device actually finished.' },
+        { key: 'operator', label: 'A person will press continue',
+          desc: 'The program pauses and asks the operator to confirm '
+            + 'before moving on.' },
       ].map((c) => {
         const on = kind === c.key
         return (
@@ -694,9 +700,8 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
           border: '1px solid #FDE68A', borderRadius: 6,
           fontSize: 12, color: '#92400E', lineHeight: 1.5,
         }}>
-          A sensor is safer than a timer on anything that holds a
-          part — a timer only measures how long you waited, not
-          whether the fixture actually reached its state.
+          A sensor is safest — the robot never guesses whether the
+          device finished.
         </div>
       )}
     </div>
@@ -733,22 +738,22 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
         border: '1px solid #E5E7EB', borderRadius: 8,
         fontSize: 13, color: '#111827', lineHeight: 1.6,
       }} data-testid="fixture-summary-record">
-        <div><b>Type:</b> {FIXTURE_TYPES[record.type]?.label || record.type}</div>
-        <div><b>Powered by:</b> {_powerLabel(record.power_mode)}</div>
+        <div><b>Kind:</b> {FIXTURE_TYPES[record.type]?.label || record.type}</div>
+        <div><b>How it works:</b> {_powerLabel(record.power_mode)}</div>
         {record.hold_on_loss !== null && (
           <div>
-            <b>On power/air loss:</b>{' '}
-            {record.hold_on_loss ? 'Stay clamped' : 'Release'}
+            <b>If the robot stops:</b>{' '}
+            {record.hold_on_loss ? 'Keeps holding' : 'Lets go'}
           </div>
         )}
         {record.valve && (
-          <div><b>Valve slot:</b> {record.valve}</div>
+          <div><b>Wire air line to:</b> {record.valve}</div>
         )}
         {record.out && (
-          <div><b>Start-signal output:</b> {record.out}</div>
+          <div><b>Wire start signal to:</b> {record.out}</div>
         )}
         {record.in_done && (
-          <div><b>Done sensor:</b> {record.in_done}</div>
+          <div><b>Wire done sensor to:</b> {record.in_done}</div>
         )}
         <div>
           <b>Robot waits by:</b>{' '}
@@ -766,7 +771,7 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
                color: '#065F46', fontSize: 12,
              }}>
           Saved — "{saved.name}" is in your fixtures list. Wire the
-          ports the map is glowing.
+          glowing points on the map.
         </div>
       )}
       {error && (
@@ -788,8 +793,8 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
                border: '1px solid #FDE68A', borderRadius: 6,
                color: '#92400E', fontSize: 12,
              }}>
-          No spare valve slots left on the panel. Free one up by
-          deleting an unused tool or fixture, then come back.
+          No spare air slots left on the controller. Remove an
+          unused tool or fixture to free one up, then come back.
         </div>
       )}
     </div>
@@ -797,16 +802,16 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
 }
 
 function _powerLabel(pm) {
-  if (pm === 'air') return 'Air (robot-controlled)'
-  if (pm === 'own_controller') return 'Its own controller (dry-signal from robot)'
-  if (pm === 'manual') return 'Manual (operator)'
+  if (pm === 'air') return 'The robot controls its air'
+  if (pm === 'own_controller') return 'It has its own controls — the robot tells it to go'
+  if (pm === 'manual') return 'A person operates it'
   return '—'
 }
 
 function _completionLabel(kind, waitS) {
-  if (kind === 'sensor') return 'Reading a sensor'
+  if (kind === 'sensor') return 'A sensor tells it'
   if (kind === 'wait') return `Waiting ${waitS ?? '?'} s`
-  if (kind === 'operator') return 'Waiting for the operator'
+  if (kind === 'operator') return 'A person will press continue'
   return '—'
 }
 

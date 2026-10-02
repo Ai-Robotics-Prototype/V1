@@ -23,9 +23,9 @@ const _VALVE_TYPE_WHY = Object.freeze({
     'Holds the last position when power or air is lost — the fixture '
     + 'stays clamped until the program commands a change.',
   '5/2 SS':
-    'Spring return to home when power or air is lost — the fixture '
-    + 'releases automatically, safer for anything grabbing a person '
-    + 'or a fragile item.',
+    'Snaps back to home when power or air is lost — the fixture '
+    + 'opens on its own, which is safer for anything grabbing a '
+    + 'person or a fragile item.',
   'HI/LO 3/2 N/C':
     'Default off. The valve pulses only when the program commands '
     + 'it — perfect for on-demand air like a blow-off or ejector.',
@@ -58,19 +58,17 @@ export const FIXTURE_TYPES = Object.freeze({
     defaults: {
       power_mode: 'air',
       air_actuation: 'double',
-      hold_on_loss: true,   // Vices default to STAY-CLAMPED on loss —
-                            // dropping the workpiece is worse than
-                            // pinning it (operator can override).
+      hold_on_loss: true,
     },
     name_prefix: 'Vice',
     why:
-      'A pneumatic vice with two states — open and closed. The '
-      + 'default answer is STAY CLAMPED on power/air loss so a '
-      + 'held part is never dropped mid-cycle.',
+      'A clamp with two states — open and closed. By default it '
+      + 'keeps holding the part if the robot stops, so nothing '
+      + 'drops mid-cycle. You can change this on the next step.',
   },
   indexer: {
     key: 'indexer', label: 'Rotary Table / Indexer',
-    desc: 'Rotates to a new station. Usually has its own controller.',
+    desc: 'Spins to a new position. Usually has its own controls.',
     icon: 'indexer',
     defaults: {
       power_mode: 'own_controller',
@@ -78,12 +76,12 @@ export const FIXTURE_TYPES = Object.freeze({
     },
     name_prefix: 'Indexer',
     why:
-      'Rotary indexers almost always ship with a start / done '
-      + 'interface; the robot sends "go" and waits for "done".',
+      'Rotary indexers almost always have their own controls — the '
+      + "robot tells it to go and waits for it to finish.",
   },
   feeder: {
     key: 'feeder', label: 'Part Feeder / Conveyor',
-    desc: 'Delivers the next part into place. Trigger it and wait.',
+    desc: 'Delivers the next part into place. The robot tells it to go.',
     icon: 'feeder',
     defaults: {
       power_mode: 'own_controller',
@@ -91,8 +89,8 @@ export const FIXTURE_TYPES = Object.freeze({
     },
     name_prefix: 'Feeder',
     why:
-      'Bowl feeders and conveyors carry their own control. The '
-      + 'robot dry-triggers a start and reads a part-ready sensor.',
+      'Bowl feeders and conveyors have their own controls. The '
+      + 'robot sends a start signal and waits for the next part.',
   },
   blow_off: {
     key: 'blow_off', label: 'Air Blast / Blow-off',
@@ -105,8 +103,8 @@ export const FIXTURE_TYPES = Object.freeze({
     },
     name_prefix: 'Blow-off',
     why:
-      'Blow-offs sit OFF by default and pulse when the program says '
-      + 'so — no hold state to worry about.',
+      'Blow-offs sit off by default and pulse when the program '
+      + 'says so — nothing to hold here.',
   },
   door: {
     key: 'door', label: 'Door / Slide',
@@ -115,32 +113,22 @@ export const FIXTURE_TYPES = Object.freeze({
     defaults: {
       power_mode: 'air',
       air_actuation: 'double',
-      // 2026-10-02 operator directive (hold-on-loss default +
-      // product standard): every asking path preselects STAY
-      // CLAMPED so doing nothing yields the "part won't drop"
-      // valve class. Doors / slides holding a cover over a part
-      // benefit from this default; an operator working on a safety
-      // guard that must open for egress can still pick Release.
       hold_on_loss: true,
     },
     name_prefix: 'Door',
     why:
-      'A pneumatic door or slide with two states — open and closed. '
-      + 'The default answer is STAY CLAMPED on power/air loss so a '
-      + 'held cover or chute never drops a part mid-cycle. If this '
-      + 'door is a safety guard that must open for egress, pick '
-      + 'Release on the next step.',
+      'A door or slide with two states — open and closed. By default '
+      + 'it keeps holding when the robot stops, so a cover or chute '
+      + 'never drops a part. If this is a safety guard that must '
+      + 'open for a person to walk through, pick "let go" on the '
+      + 'next step.',
   },
   other: {
     key: 'other', label: 'Something else',
-    desc: 'Any other external fixture — pick this and answer the questions.',
+    desc: 'Any other device around the robot — pick this and answer the questions.',
     icon: 'other',
     defaults: {
       power_mode: null,
-      // 2026-10-02 operator directive (hold-on-loss default): any
-      // asking path preselects STAY CLAMPED. The AIR branch here
-      // only becomes relevant when the operator picks air power on
-      // step 2; the preselect lands then via PowerForkStep's reset.
       hold_on_loss: true,
     },
     name_prefix: 'Fixture',

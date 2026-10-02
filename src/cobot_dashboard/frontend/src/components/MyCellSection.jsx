@@ -287,7 +287,7 @@ function _EntryRow({
                      border: '1px solid #FDE68A', borderRadius: 999,
                      fontSize: 11, fontWeight: 600, letterSpacing: 0.3,
                    }}>
-                Review recommended — hold-on-loss not set
+                Review recommended — set what happens on power loss
               </div>
             )}
             {renaming ? (
@@ -431,10 +431,10 @@ function _EntryRow({
                    border: '1px solid #FDE68A', borderRadius: 6,
                    fontSize: 12, lineHeight: 1.5,
                  }}>
-              This profile was saved before the current safety
-              default. We recommend you re-run EOAT Setup for this
-              tool to confirm whether it should STAY CLAMPED on
-              power or air loss — nothing has been changed for you.
+              This tool was saved before we started asking what
+              should happen on power loss. Re-run EOAT Setup to
+              confirm whether it should keep holding the part if
+              the robot stops. Nothing has been changed for you.
             </div>
           )}
           {ports && <GuidanceBlock port={ports} />}

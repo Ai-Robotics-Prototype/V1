@@ -15,6 +15,11 @@ import {
 } from '../lib/cellStore'
 import { useKeyboardInset } from '../lib/keyboardInset'
 import { useStore } from '../store/useStore'
+import WhyExpander from './WhyExpander'
+import {
+  CAPABILITY_CATALOG as _CAPABILITY_CATALOG,
+  capabilityDef, actuatorsFromCapabilities,
+} from '../lib/eoatCapabilities'
 
 // Standalone EOAT Setup wizard.
 //
@@ -54,15 +59,15 @@ const BUILT_IN = [
   { key: 'finger',
     gripper_type: 'finger',
     label: 'Finger Gripper',
-    desc: 'Two-jaw parallel gripper. Best for rigid parts with flat gripping surfaces.' },
+    desc: 'Two-jaw gripper that opens and closes on parts with flat sides.' },
   { key: 'vacuum',
     gripper_type: 'vacuum',
     label: 'Vacuum Suction',
-    desc: 'Vacuum cup picks from the top. Best for flat, smooth, sealed surfaces.' },
+    desc: 'A cup that picks parts from the top using suction. Best for flat, smooth surfaces.' },
   { key: 'custom_new',
     gripper_type: 'custom',
-    label: 'Custom EOAT',
-    desc: 'Walk through the setup for a tool that is not in this list — mass, actuation type, sensors.' },
+    label: 'Custom tool',
+    desc: 'Set up a tool that is not in this list — tell us what it does and we will do the rest.' },
 ]
 
 // Sensible defaults for the built-in paths (operator can lower
@@ -371,9 +376,9 @@ export default function EOATSetupWizard({
         {!toolKey && (
           <div data-testid="hardware-setup-picker">
             <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 12 }}>
-              Pick the end-of-arm tool you want to wire up. Each tool
-              keeps its OWN hookup confirmation — programs read it
-              via the tool they were authored against.
+              Pick the tool at the end of the robot arm. Each one
+              remembers how it is wired, so programs that use it
+              know what to send and what to listen for.
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {BUILT_IN.map((b) => (
@@ -388,7 +393,7 @@ export default function EOATSetupWizard({
                     gripper_type: 'custom',
                     tool_id: t.id,
                     label: t.name || `Custom tool ${t.id.slice(0, 6)}`,
-                    desc: 'EOAT-library tool.',
+                    desc: 'A tool you set up earlier.',
                   }}
                   onPick={() => setToolKey(`custom:${t.id}`)}
                 />
@@ -483,8 +488,16 @@ export default function EOATSetupWizard({
                          borderRadius: 6, color: '#065F46',
                          fontSize: 12, lineHeight: 1.5,
                        }}>
-                    Your NeuRobots vacuum tool includes a check valve
-                    — parts stay held if air is lost.
+                    Your NeuRobots suction tool keeps holding the part
+                    if the air supply is lost.
+                    <WhyExpander
+                      label="How?"
+                      testId="hardware-setup-vacuum-why">
+                      The tool ships with a vacuum check valve — the
+                      vacuum stays trapped in the cup until the program
+                      commands a release. Standard inclusion, not an
+                      upsell.
+                    </WhyExpander>
                   </div>
                 )}
                 {activeTool.key === 'finger' && (
@@ -495,9 +508,15 @@ export default function EOATSetupWizard({
                          borderRadius: 6, color: '#065F46',
                          fontSize: 12, lineHeight: 1.5,
                        }}>
-                    Recommended — the part won't drop if power or air
-                    is lost. The default valve is a double-acting (5/2
-                    DS) so the fingers stay clamped on loss.
+                    Recommended — the fingers keep holding the part
+                    if the robot suddenly stops.
+                    <WhyExpander
+                      label="How?"
+                      testId="hardware-setup-finger-why">
+                      The default valve is a 5/2 DS (double-solenoid)
+                      so the gripper remembers its last commanded
+                      position when power or air drops.
+                    </WhyExpander>
                   </div>
                 )}
                 {!readOnly && (
@@ -536,10 +555,10 @@ export default function EOATSetupWizard({
                      border: '1px solid #FDE68A',
                      fontSize: 13, lineHeight: 1.5,
                    }}>
-                <b>Finish this tool's definition before wiring it up.</b>
-                {' '}The Custom EOAT flow didn't record which valve or
-                sensor inputs this tool uses, so there's nothing to
-                glow on the map yet.
+                <b>Tell us about this tool before wiring it up.</b>
+                {' '}The custom tool flow didn't finish — we don't
+                know which air lines or sensors this tool uses, so
+                there's nothing to point at on the map yet.
                 {!initialToolKey && (
                   <div style={{ marginTop: 10 }}>
                     <button
@@ -551,7 +570,7 @@ export default function EOATSetupWizard({
                         border: '1px solid #F59E0B', borderRadius: 6,
                         cursor: 'pointer', fontFamily: 'inherit',
                       }}>
-                      Open the Custom EOAT flow →
+                      Open the custom tool flow →
                     </button>
                   </div>
                 )}
@@ -585,8 +604,8 @@ export default function EOATSetupWizard({
 
         {toolKey && toolKey !== 'custom_new' && !activeTool && recordLoaded && (
           <div style={{ fontSize: 13, color: '#6b7280' }}>
-            No such tool. It may have been deleted from the EOAT
-            library. Close and pick another.
+            No such tool. It may have been removed from your tool
+            list. Close and pick another.
           </div>
         )}
       </div>
@@ -673,10 +692,11 @@ function StandardSensorCount({ toolKey, value, max, disabled, onChange }) {
            borderRadius: 6, color: '#374151',
          }}>
       <div style={{ fontSize: 13, marginBottom: 6 }}>
-        How many feedback sensors does this tool have?{' '}
+        Does this tool have any sensors that tell the robot
+        what it's doing?{' '}
         <span style={{ color: '#6B7280' }}>
-          (default {_STANDARD_SENSOR_DEFAULTS[toolKey] ?? 0} —
-          typical for this tool)
+          (like "gripper closed" or "part detected" — default{' '}
+          {_STANDARD_SENSOR_DEFAULTS[toolKey] ?? 0} for this tool)
         </span>
       </div>
       <div style={{ display: 'flex', gap: 6 }}>
@@ -713,18 +733,21 @@ function StandardSensorCount({ toolKey, value, max, disabled, onChange }) {
 // per-tool payload correction is needed later, it lives on the
 // tool record (tools_library.update_payload), not in a setup step.
 
-// Flow steps (2026-10-01 operator directive — actuator count +
-// per-actuator walkthrough):
+// Flow steps (2026-10-02 plain-register directive):
 //   0 — Tool name
-//   1 — Actuator count ("How many air-driven actions does this
-//                        tool have?", 1-4; more → contact us copy)
-//   2 — Per-actuator loop (type + hold-on-loss where relevant);
-//        rendered as a single step with N inline sub-cards so the
-//        operator sees every actuator at once instead of a
-//        setStep flicker.
-//   3 — Sensors
+//   1 — "What does this tool do?" (multi-select picture cards —
+//        every selection becomes ONE actuator in the compiled record)
+//   2 — Per-selection confirmations (hold / suction / blow /
+//        something-else — rendered inline so the operator sees
+//        every capability at once)
+//   3 — Sensors ("Does this tool have any sensors..." with examples)
 //   4 — Review (summary + save to cell)
-const _ACTUATOR_MAX = 4
+//
+// The record shape is UNCHANGED (actuators[] with the same fields);
+// the questions are just plain-register. Pinned by compilation-
+// equivalence tests in D_cell.test.js so a future rewrite cannot
+// drift the saved record out from under existing programs.
+const _CAPABILITY_MAX = 4
 
 function CustomEOATFlow({
   customs, cell, onCellChanged,
@@ -732,20 +755,15 @@ function CustomEOATFlow({
 }) {
   const [step, setStep]  = useState(0)
   const [name, setName]  = useState('')
-  const [actuatorCount, setActuatorCount] = useState(1)
-  // actuators[i] = { type, holdOnLoss | null, hasCheckValve | null }.
-  // Length always matches actuatorCount — we resize on count change
-  // so index stability is preserved.
-  //
-  // 2026-10-02 operator directive (hold-on-loss default): a fresh
-  // double-acting actuator preselects holdOnLoss=true ("STAY CLAMPED"
-  // is recommended — doing nothing yields the safe valve class).
-  // Vacuum actuators preselect hasCheckValve=true per the standard
-  // NeuRobots vacuum tool shipping with a check valve inline; a
-  // customer wiring their own cup without one answers NO and the
-  // record stores holds_on_loss=false with honest copy.
-  const [actuators, setActuators] = useState(
-    [_defaultActuator()])
+  // Set of selected capability keys. Order follows _CAPABILITY_CATALOG
+  // so the compiled actuators[] array is deterministic across runs.
+  const [capabilities, setCapabilities] = useState(() => new Set())
+  // actuators[i] = { type, holdOnLoss | null, hasCheckValve | null,
+  // capability }. Derived from the capability set — one per selection,
+  // preselect per capability. Operator confirmations ride on top via
+  // _patchActuator (keyed by capability so capability-set edits don't
+  // scramble indices).
+  const [actuators, setActuators] = useState([])
   const [sensorCount, setSensorCount] = useState(0)
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState(null)
@@ -764,33 +782,64 @@ function CustomEOATFlow({
     [cell, nameTrim])
   const nameOk      = nameTrim.length > 0 && !nameClash
 
-  function _setActuatorCount(n) {
-    const bounded = Math.max(1, Math.min(_ACTUATOR_MAX, n))
-    setActuatorCount(bounded)
-    setActuators((prev) => {
-      const next = [...prev]
-      while (next.length < bounded) next.push(_defaultActuator())
-      next.length = bounded
+  // Toggle a capability selection — add/remove in place without
+  // perturbing other selections. Capped at _CAPABILITY_MAX so the
+  // free-slot allocator never runs out mid-flow.
+  function _toggleCapability(key) {
+    setCapabilities((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) {
+        next.delete(key)
+      } else if (next.size < _CAPABILITY_MAX) {
+        next.add(key)
+      }
       return next
     })
   }
-  function _patchActuator(i, patch) {
-    setActuators((prev) => prev.map((a, j) =>
-      (i === j ? { ...a, ...patch } : a)))
+  // Re-derive the actuators list whenever the capability set changes.
+  // Operator confirmations ride on top via _patchActuator (keyed by
+  // capability key, not index, so adding/removing a selection does
+  // NOT scramble answers for the surviving selections).
+  useEffect(() => {
+    setActuators((prev) => {
+      const byCap = new Map()
+      for (const a of prev) {
+        if (a && a.capability) byCap.set(a.capability, a)
+      }
+      const fresh = actuatorsFromCapabilities(capabilities)
+      return fresh.map((seed) => {
+        const prior = byCap.get(seed.capability)
+        if (!prior) return seed
+        // Preserve operator answers that still apply; fall back to
+        // the preselect for any field cleared by a type change.
+        return {
+          ...seed,
+          holdOnLoss:    prior.holdOnLoss    ?? seed.holdOnLoss,
+          hasCheckValve: prior.hasCheckValve ?? seed.hasCheckValve,
+          type:          prior.type || seed.type,
+        }
+      })
+    })
+  }, [capabilities])
+
+  function _patchActuatorByCapability(capKey, patch) {
+    setActuators((prev) => prev.map((a) =>
+      (a.capability === capKey ? { ...a, ...patch } : a)))
   }
 
   const resolved = useMemo(() => resolveCustomEOATRecord({
-    toolName: name || 'Custom EOAT',
+    toolName: name || 'Custom Tool',
     actuators,
     sensorCount,
     customs,
   }), [name, actuators, sensorCount, customs])
 
-  // The hold-on-loss + check-valve preselects fill in on actuator-
-  // type pick, so perActuatorReady becomes "every actuator has a
-  // type". We still keep the per-type coverage explicit so a future
-  // actuator type that needs its own disambiguation flips the gate
-  // back to false by default (fail-closed).
+  // Per-selection confirmations required to leave step 2:
+  //   * grips_fingers  (double_acting) → holdOnLoss must be set
+  //   * holds_suction  (vacuum)        → hasCheckValve must be set
+  //   * blows_air      (blow_off)      → nothing to ask
+  //   * something_else                 → operator must have picked a
+  //                                       type on the fallback picker
   const perActuatorReady = actuators.every((a) => {
     if (!a.type) return false
     if (a.type === 'double_acting') return a.holdOnLoss !== null
@@ -800,7 +849,8 @@ function CustomEOATFlow({
 
   const canAdvance = (
     step === 0 ? nameOk
-    : step === 1 ? actuatorCount >= 1 && actuatorCount <= _ACTUATOR_MAX
+    : step === 1 ? capabilities.size >= 1
+                     && capabilities.size <= _CAPABILITY_MAX
     : step === 2 ? perActuatorReady
     : step === 3 ? true
     : true
@@ -819,12 +869,13 @@ function CustomEOATFlow({
         valve: resolved.required_valves[0] || null,
         inputs: resolved.required_inputs || [],
         outputs: [],
-        actuators: (resolved.actuators || []).map((a) => ({
+        actuators: (resolved.actuators || []).map((a, i) => ({
           type: a.type,
           hold_on_loss: a.hold_on_loss,
           holds_via: a.holds_via || null,
           valve: a.valve,
           label: a.label,
+          capability: (actuators[i] && actuators[i].capability) || null,
         })),
         sensor_count: sensorCount,
       }
@@ -842,8 +893,8 @@ function CustomEOATFlow({
 
   const stepTitle = [
     '1. Tool name',
-    '2. How many actuators?',
-    '3. Set up each actuator',
+    '2. What does this tool do?',
+    '3. Confirm each choice',
     '4. Sensors',
     '5. Review',
   ][step]
@@ -876,7 +927,7 @@ function CustomEOATFlow({
           ← Back
         </button>
         <div style={{ fontSize: 14, fontWeight: 600, color: '#111827' }}>
-          Custom EOAT — {stepTitle}
+          Custom tool — {stepTitle}
         </div>
       </div>
 
@@ -889,7 +940,7 @@ function CustomEOATFlow({
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Custom Vacuum Head"
+              placeholder="e.g. Suction Head, Pinch Gripper"
               data-testid="custom-eoat-name"
               aria-invalid={nameClash ? 'true' : 'false'}
               style={{
@@ -919,38 +970,46 @@ function CustomEOATFlow({
       )}
 
       {step === 1 && (
-        <div data-testid="hardware-setup-custom-step-actuator-count"
+        <div data-testid="hardware-setup-custom-step-capabilities"
              style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ fontSize: 13, color: '#374151' }}>
-            How many air-driven actions does this tool have?{' '}
-            <span style={{ color: '#6B7280' }}>
-              (A gripper that also has a blow-off = 2.
-              A gripper with no extras = 1.)
-            </span>
+            What does this tool do? Pick everything that applies.
           </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {[1, 2, 3, 4].map((n) => (
-              <button
-                key={n}
-                data-testid="custom-eoat-actuator-count"
-                data-count={String(n)}
-                onClick={() => _setActuatorCount(n)}
-                style={{
-                  padding: '10px 16px', fontSize: 14, fontWeight: 700,
-                  background: actuatorCount === n ? '#DBEAFE' : '#fff',
-                  color: actuatorCount === n ? '#1E40AF' : '#374151',
-                  border: `1px solid ${actuatorCount === n ? '#2563EB' : '#d1d5db'}`,
-                  borderRadius: 8, cursor: 'pointer',
-                  fontFamily: 'inherit',
-                }}>
-                {n}
-              </button>
-            ))}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {_CAPABILITY_CATALOG.map((cap) => {
+              const on = capabilities.has(cap.key)
+              const atCap = capabilities.size >= _CAPABILITY_MAX && !on
+              return (
+                <button
+                  key={cap.key}
+                  data-testid="custom-eoat-capability"
+                  data-capability-key={cap.key}
+                  data-selected={String(on)}
+                  disabled={atCap}
+                  onClick={() => _toggleCapability(cap.key)}
+                  style={{
+                    textAlign: 'left', padding: '12px 14px',
+                    background: on ? '#DBEAFE' : '#fff',
+                    border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
+                    borderRadius: 8,
+                    cursor: atCap ? 'not-allowed' : 'pointer',
+                    opacity: atCap ? 0.5 : 1,
+                    fontFamily: 'inherit',
+                  }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>
+                    {on ? '✓ ' : ''}{cap.label}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#6B7280', marginTop: 2 }}>
+                    {cap.hint}
+                  </div>
+                </button>
+              )
+            })}
           </div>
-          <div data-testid="custom-eoat-actuator-count-contact"
+          <div data-testid="custom-eoat-capability-contact"
                style={{ fontSize: 12, color: '#6B7280' }}>
-            Need more than {_ACTUATOR_MAX}? Contact us — we'll
-            help route the extra valves off a bigger manifold.
+            Need to pick more than {_CAPABILITY_MAX}? Contact us —
+            we'll help wire up a bigger tool.
           </div>
         </div>
       )}
@@ -959,19 +1018,18 @@ function CustomEOATFlow({
         <div data-testid="hardware-setup-custom-step-actuators"
              style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div style={{ fontSize: 13, color: '#374151' }}>
-            Walk through each air-driven action — pick its type
-            (and, if it's double-acting, whether it should hold on
-            power loss). We'll assign each one its own valve from
-            the free SPARE slots on your Synapse map.
+            Confirm each thing this tool does. We'll pick the right
+            parts and the spare slot on your controller for each one.
           </div>
           {actuators.map((a, i) => (
             <ActuatorCard
-              key={i}
+              key={a.capability || i}
               index={i}
               total={actuators.length}
               value={a}
               resolved={resolved.actuators?.[i] || null}
-              onChange={(patch) => _patchActuator(i, patch)}
+              onChange={(patch) =>
+                _patchActuatorByCapability(a.capability, patch)}
               btnGhost={btnGhost}
             />
           ))}
@@ -982,13 +1040,19 @@ function CustomEOATFlow({
         <div data-testid="hardware-setup-custom-step-sensors"
              style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ fontSize: 13, color: '#374151' }}>
-            How many feedback sensors does this tool have?
+            Does this tool have any sensors that tell the robot what
+            it's doing?{' '}
             <span style={{ color: '#6B7280' }}>
-              {' '}(0 to 3; PNP proximity switches, 24 VDC per the panel spec)
+              (like "gripper closed" or "part detected")
             </span>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            {[0, 1, 2, 3].map((n) => (
+            {[
+              { n: 0, label: 'None' },
+              { n: 1, label: '1' },
+              { n: 2, label: '2' },
+              { n: 3, label: '3' },
+            ].map(({ n, label: lab }) => (
               <button
                 key={n}
                 data-testid="custom-eoat-sensor-count"
@@ -1002,10 +1066,20 @@ function CustomEOATFlow({
                   borderRadius: 8, cursor: 'pointer',
                   fontFamily: 'inherit',
                 }}>
-                {n}
+                {lab}
               </button>
             ))}
           </div>
+          <WhyExpander
+            label="What counts as a sensor?"
+            testId="custom-eoat-sensor-why">
+            A sensor is anything on your tool that sends an electrical
+            signal to the robot when something happens — a limit
+            switch, a part-present detector, a vacuum confirmation.
+            PNP proximity (24 VDC) is the standard your controller
+            expects; other kinds can be wired through a signal
+            converter.
+          </WhyExpander>
           {sensorCount > 0 && resolved.required_inputs.length > 0 && (
             <div data-testid="custom-eoat-sensor-assignments"
                  style={{
@@ -1013,10 +1087,10 @@ function CustomEOATFlow({
                    border: '1px solid #86EFAC', borderRadius: 6,
                    color: '#166534', fontSize: 13, lineHeight: 1.5,
                  }}>
-              Assigned to: <b>
+              Wire your sensors to: <b>
                 {resolved.required_inputs.join(', ')}
               </b>.
-              These are the next free IN ports on your Synapse map.
+              These are the next free input ports on your controller.
             </div>
           )}
         </div>
@@ -1031,19 +1105,26 @@ function CustomEOATFlow({
             fontSize: 13, color: '#111827', lineHeight: 1.6,
           }}>
             <div><b>Tool:</b> {nameTrim || '(unnamed)'}</div>
-            <div><b>Actuators:</b> {actuators.length}</div>
+            <div><b>Does:</b> {actuators.length}{' '}
+              thing{actuators.length === 1 ? '' : 's'}
+            </div>
             {(resolved.actuators || []).map((a, i) => (
               <div key={i} data-testid="custom-eoat-summary-actuator"
                    style={{ marginLeft: 12 }}>
-                • {a.label}: {a.recommended_valve_type || 'no valve'}
-                {a.valve ? ` on ${a.valve}` : ''}
+                • {a.label}{a.valve ? ` → wire to ${a.valve}` : ''}
                 {a.type === 'double_acting'
-                  && ` (hold-on-loss: ${a.hold_on_loss ? 'yes' : 'no'})`}
+                  && (a.hold_on_loss
+                       ? ' (keeps holding on power loss)'
+                       : ' (lets go on power loss)')}
+                {a.type === 'vacuum' && a.holds_via === 'check_valve'
+                  && ' (keeps holding on air loss)'}
+                {a.type === 'vacuum' && a.holds_via !== 'check_valve'
+                  && ' (lets go on air loss)'}
               </div>
             ))}
             <div><b>Sensors:</b> {sensorCount}
               {resolved.required_inputs.length > 0
-                && ` on ${resolved.required_inputs.join(', ')}`}
+                && ` → wire to ${resolved.required_inputs.join(', ')}`}
             </div>
           </div>
           <GuidanceBlock port={resolved} />
@@ -1069,8 +1150,8 @@ function CustomEOATFlow({
             // handing control back to the parent picker.
             setSavedEntry(null); setSaveErr(null)
             setStep(0); setName('')
-            setActuatorCount(1)
-            setActuators([_defaultActuator()])
+            setCapabilities(new Set())
+            setActuators([])
             setSensorCount(0)
             onSetupAnother?.()
           }}
@@ -1109,29 +1190,30 @@ function CustomEOATFlow({
   )
 }
 
+// Per-selection confirmation card (2026-10-02 plain-register directive).
+//
+// Each capability picked on the multi-select step renders ONE card
+// here with only the question(s) relevant to that capability. No
+// four-way type picker, no cross-reference to internal vocab — the
+// capability field carries the mapping to the actuator type (set
+// at capability-select time in actuatorsFromCapabilities).
+//
+// Capability → question map:
+//   grips_fingers  → "If the robot suddenly stops, should this keep
+//                     holding the part?" (Yes/No; Yes preselected)
+//   holds_suction  → "If the air supply is lost, does your suction
+//                     tool keep holding?" (Yes / No / I'm not sure)
+//   blows_air      → no question (one-line explanatory note)
+//   something_else → the four-way fallback picker (uses plain-
+//                     language labels, technical terms in why-expanders)
 function ActuatorCard({
   index, total, value, resolved, onChange, btnGhost,
 }) {
-  const options = [
-    { key: 'single_acting',
-      label: 'Pneumatic — single-acting (spring return)',
-      desc: 'One coil + spring; snaps to home on power loss.' },
-    { key: 'double_acting',
-      label: 'Pneumatic — double-acting (two coils)',
-      desc: 'Two coils; holds last position or snaps home '
-            + 'depending on which valve you pick.' },
-    { key: 'vacuum',
-      label: 'Vacuum',
-      desc: 'Uses a 3/2 Normally Closed valve; default off, '
-            + 'pulse to draw vacuum.' },
-    { key: 'electric_none',
-      label: 'Electric / no actuation',
-      desc: 'No pneumatic valve required (motor-driven, '
-            + 'sensor-only, or passive tool).' },
-  ]
+  const cap = capabilityDef(value.capability)
   return (
     <div data-testid="custom-eoat-actuator-card"
          data-actuator-index={String(index)}
+         data-capability-key={value.capability || ''}
          style={{
            padding: 12, background: '#fff',
            border: '1px solid #E5E7EB', borderRadius: 8,
@@ -1141,178 +1223,248 @@ function ActuatorCard({
         textTransform: 'uppercase', color: '#6B7280',
         marginBottom: 8,
       }}>
-        Actuator {index + 1} of {total}
+        {cap ? cap.label : `Choice ${index + 1} of ${total}`}
       </div>
-      <ActuationChoice
-        value={value.type}
-        onChange={(t) => onChange({
-          type: t,
-          // Preselect per the 2026-10-02 hold-on-loss default
-          // directive — doing nothing yields the safe answer:
-          //   double_acting → holdOnLoss=true (STAY CLAMPED → 5/2 DS)
-          //   vacuum        → hasCheckValve=true (NeuRobots standard)
-          //   anything else → both cleared (no hold question applies)
-          holdOnLoss:    t === 'double_acting' ? true : null,
-          hasCheckValve: t === 'vacuum'        ? true : null,
-        })}
-        options={options}
-      />
-      {value.type === 'double_acting' && (
-        <div data-testid="custom-eoat-hold-question"
-             data-actuator-index={String(index)}
-             data-preselected-hold="true"
-             style={{
-               marginTop: 10, padding: 12,
-               background: '#F9FAFB',
-               border: '1px solid #E5E7EB', borderRadius: 8,
-             }}>
-          <div style={{ fontSize: 13, fontWeight: 600,
-                        color: '#111827', marginBottom: 6 }}>
-            Should this actuator HOLD its position if power or air
-            is lost?
-          </div>
-          <div style={{ fontSize: 12, color: '#6B7280',
-                        marginBottom: 10 }}>
-            Choose "Yes" if letting go would drop a part or damage
-            something. Choose "No" if you want it to release
-            automatically when power drops.
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              data-testid="custom-eoat-hold-yes"
-              data-actuator-index={String(index)}
-              onClick={() => onChange({ holdOnLoss: true })}
-              style={{
-                ...btnGhost,
-                background: value.holdOnLoss === true ? '#DCFCE7' : '#fff',
-                borderColor: value.holdOnLoss === true ? '#22C55E' : '#d1d5db',
-              }}>
-              Yes — hold last position (5/2 DS)
-            </button>
-            <button
-              data-testid="custom-eoat-hold-no"
-              data-actuator-index={String(index)}
-              onClick={() => onChange({ holdOnLoss: false })}
-              style={{
-                ...btnGhost,
-                background: value.holdOnLoss === false ? '#DBEAFE' : '#fff',
-                borderColor: value.holdOnLoss === false ? '#2563EB' : '#d1d5db',
-              }}>
-              No — snap home on loss (5/2 SS)
-            </button>
-          </div>
-          {value.holdOnLoss === true && (
-            <div data-testid="custom-eoat-hold-recommended-copy"
-                 style={{
-                   marginTop: 8, fontSize: 12, color: '#065F46',
-                 }}>
-              Recommended — the part won't drop if power or air
-              is lost.
-            </div>
-          )}
-        </div>
+      {value.capability === 'grips_fingers' && (
+        <HoldQuestion value={value} onChange={onChange} btnGhost={btnGhost} />
       )}
-      {value.type === 'vacuum' && (
-        <div data-testid="custom-eoat-vacuum-check-valve"
-             data-actuator-index={String(index)}
-             data-preselected-check-valve="true"
-             style={{
-               marginTop: 10, padding: 12,
-               background: '#F9FAFB',
-               border: '1px solid #E5E7EB', borderRadius: 8,
-             }}>
-          <div style={{ fontSize: 13, fontWeight: 600,
-                        color: '#111827', marginBottom: 6 }}>
-            Does this tool have a vacuum check valve?
-          </div>
-          <div style={{ fontSize: 12, color: '#6B7280',
-                        marginBottom: 10 }}>
-            A check valve holds the part when the air drops. NeuRobots
-            vacuum tools ship with one — custom cups wired without
-            one will release on air loss.
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              data-testid="custom-eoat-check-valve-yes"
-              data-actuator-index={String(index)}
-              onClick={() => onChange({ hasCheckValve: true })}
-              style={{
-                ...btnGhost,
-                background: value.hasCheckValve === true ? '#DCFCE7' : '#fff',
-                borderColor: value.hasCheckValve === true ? '#22C55E' : '#d1d5db',
-              }}>
-              Yes — has a check valve
-            </button>
-            <button
-              data-testid="custom-eoat-check-valve-no"
-              data-actuator-index={String(index)}
-              onClick={() => onChange({ hasCheckValve: false })}
-              style={{
-                ...btnGhost,
-                background: value.hasCheckValve === false ? '#DBEAFE' : '#fff',
-                borderColor: value.hasCheckValve === false ? '#2563EB' : '#d1d5db',
-              }}>
-              No — no check valve
-            </button>
-          </div>
-          {value.hasCheckValve === true && (
-            <div data-testid="custom-eoat-check-valve-recommended-copy"
-                 style={{
-                   marginTop: 8, fontSize: 12, color: '#065F46',
-                 }}>
-              Recommended — the part won't drop if power or air
-              is lost.
-            </div>
-          )}
-          {value.hasCheckValve === false && (
-            <div data-testid="custom-eoat-check-valve-release-copy"
-                 style={{
-                   marginTop: 8, fontSize: 12, color: '#7F1D1D',
-                 }}>
-              Parts will release if air is lost.
-            </div>
-          )}
-        </div>
+      {value.capability === 'holds_suction' && (
+        <SuctionHoldQuestion value={value} onChange={onChange}
+                             btnGhost={btnGhost} />
+      )}
+      {value.capability === 'blows_air' && (
+        <BlowOffNote />
+      )}
+      {value.capability === 'something_else' && (
+        <SomethingElsePicker value={value} onChange={onChange}
+                             btnGhost={btnGhost} />
       )}
       {resolved && resolved.recommended_valve_type && (
-        <div data-testid="custom-eoat-actuation-rec"
-             data-actuator-index={String(index)}
-             style={{
-               marginTop: 10,
-               padding: '10px 12px', background: '#EFF6FF',
-               border: '1px solid #BFDBFE', borderRadius: 6,
-               color: '#1E3A8A', fontSize: 13, lineHeight: 1.5,
-             }}>
-          <b>Recommended valve:</b> {resolved.recommended_valve_type}.
-          <br />
-          <span style={{ color: '#374151' }}>
-            Why: {resolved.recommended_valve_why}
-          </span>
-          {resolved.valve && (
-            <div style={{ marginTop: 6 }}>
-              Free SPARE slot on your map: <b>{resolved.valve}</b>.
-            </div>
-          )}
-        </div>
+        <WhyExpander
+          label="Which part did we pick?"
+          testId="custom-eoat-actuation-rec">
+          Recommended part: {resolved.recommended_valve_type}.
+          {' '}{resolved.recommended_valve_why}
+          {resolved.valve
+            ? ` Spare slot assigned: ${resolved.valve}.`
+            : ''}
+        </WhyExpander>
       )}
     </div>
   )
 }
 
-function ActuationChoice({ value, onChange, options }) {
+function HoldQuestion({ value, onChange, btnGhost }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+    <div data-testid="custom-eoat-hold-question"
+         data-preselected-hold="true"
+         style={{
+           marginTop: 4, padding: 12,
+           background: '#F9FAFB',
+           border: '1px solid #E5E7EB', borderRadius: 8,
+         }}>
+      <div style={{ fontSize: 13, fontWeight: 600,
+                    color: '#111827', marginBottom: 6 }}>
+        If the robot suddenly stops, should this keep holding
+        the part?
+      </div>
+      <div style={{ fontSize: 12, color: '#6B7280',
+                    marginBottom: 10 }}>
+        Pick "Yes" if letting go would drop a part or damage
+        something. Pick "No" if you want it to open on its own
+        when power drops.
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button
+          data-testid="custom-eoat-hold-yes"
+          onClick={() => onChange({ holdOnLoss: true })}
+          style={{
+            ...btnGhost,
+            background: value.holdOnLoss === true ? '#DCFCE7' : '#fff',
+            borderColor: value.holdOnLoss === true ? '#22C55E' : '#d1d5db',
+          }}>
+          Yes — keep holding
+        </button>
+        <button
+          data-testid="custom-eoat-hold-no"
+          onClick={() => onChange({ holdOnLoss: false })}
+          style={{
+            ...btnGhost,
+            background: value.holdOnLoss === false ? '#DBEAFE' : '#fff',
+            borderColor: value.holdOnLoss === false ? '#2563EB' : '#d1d5db',
+          }}>
+          No — let go
+        </button>
+      </div>
+      {value.holdOnLoss === true && (
+        <div data-testid="custom-eoat-hold-recommended-copy"
+             style={{
+               marginTop: 8, fontSize: 12, color: '#065F46',
+             }}>
+          Recommended — the part won't drop.
+        </div>
+      )}
+      <WhyExpander
+        label="Why does this matter?"
+        testId="custom-eoat-hold-why">
+        "Yes" installs a 5/2 double-solenoid (DS) valve so the
+        gripper remembers the last commanded position when power
+        drops. "No" installs a 5/2 single-solenoid (SS) valve with
+        a spring that returns the gripper to its home position on
+        power loss.
+      </WhyExpander>
+    </div>
+  )
+}
+
+function SuctionHoldQuestion({ value, onChange, btnGhost }) {
+  // "I'm not sure" records false with the safe-assumption copy, per
+  // the 2026-10-02 directive: a customer who cannot tell gets the
+  // honest "we'll assume it releases" record so programs do not
+  // over-promise on hardware they cannot verify.
+  const picked = value.hasCheckValve
+  return (
+    <div data-testid="custom-eoat-vacuum-check-valve"
+         data-preselected-check-valve="true"
+         style={{
+           marginTop: 4, padding: 12,
+           background: '#F9FAFB',
+           border: '1px solid #E5E7EB', borderRadius: 8,
+         }}>
+      <div style={{ fontSize: 13, fontWeight: 600,
+                    color: '#111827', marginBottom: 6 }}>
+        If the air supply is lost, does your suction tool keep
+        holding?
+      </div>
+      <div style={{ fontSize: 12, color: '#6B7280',
+                    marginBottom: 10 }}>
+        NeuRobots suction tools keep holding when air is lost.
+        If you built your own suction head, you may need to pick
+        a different answer.
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button
+          data-testid="custom-eoat-check-valve-yes"
+          onClick={() => onChange({ hasCheckValve: true })}
+          style={{
+            ...btnGhost,
+            background: picked === true ? '#DCFCE7' : '#fff',
+            borderColor: picked === true ? '#22C55E' : '#d1d5db',
+          }}>
+          Yes — keeps holding
+        </button>
+        <button
+          data-testid="custom-eoat-check-valve-no"
+          onClick={() => onChange({ hasCheckValve: false })}
+          style={{
+            ...btnGhost,
+            background: picked === false ? '#DBEAFE' : '#fff',
+            borderColor: picked === false ? '#2563EB' : '#d1d5db',
+          }}>
+          No — lets go
+        </button>
+        <button
+          data-testid="custom-eoat-check-valve-unsure"
+          onClick={() => onChange({ hasCheckValve: false })}
+          style={{
+            ...btnGhost,
+            background: '#fff',
+            borderColor: '#d1d5db',
+          }}>
+          I'm not sure
+        </button>
+      </div>
+      {picked === true && (
+        <div data-testid="custom-eoat-check-valve-recommended-copy"
+             style={{
+               marginTop: 8, fontSize: 12, color: '#065F46',
+             }}>
+          Recommended — the part won't drop.
+        </div>
+      )}
+      {picked === false && (
+        <div data-testid="custom-eoat-check-valve-release-copy"
+             style={{
+               marginTop: 8, fontSize: 12, color: '#7F1D1D',
+             }}>
+          We'll assume it releases, to be safe.
+        </div>
+      )}
+      <WhyExpander
+        label="Why does this matter?"
+        testId="custom-eoat-check-valve-why">
+        A vacuum check valve traps the vacuum inside the suction cup
+        when the air supply drops, so the part stays attached until
+        the program commands a release. Without a check valve, the
+        vacuum vents on air loss and the part falls.
+      </WhyExpander>
+    </div>
+  )
+}
+
+function BlowOffNote() {
+  return (
+    <div data-testid="custom-eoat-blow-note"
+         style={{
+           marginTop: 4, padding: 10,
+           background: '#F0F9FF',
+           border: '1px solid #BAE6FD', borderRadius: 8,
+           color: '#0C4A6E', fontSize: 13, lineHeight: 1.5,
+         }}>
+      The air pulses on when the program says so, and stops
+      the moment the program stops. Nothing to hold here.
+      <WhyExpander
+        label="Which part did we pick?"
+        testId="custom-eoat-blow-why">
+        A blow-off uses a 3/2 N/C (Normally Closed) valve — default
+        off, pulses on command. Same physical valve class as suction;
+        your controller treats blow and suction as separate actions.
+      </WhyExpander>
+    </div>
+  )
+}
+
+// Fallback picker for the "Something else" capability — the operator
+// still picks a type, but every label is plain-register. Technical
+// terms live only in the why-expander below.
+function SomethingElsePicker({ value, onChange, btnGhost }) {
+  const options = [
+    { key: 'single_acting',
+      label: 'Pushes one way, springs back',
+      desc: 'Opens on command, snaps shut on its own when power drops.' },
+    { key: 'double_acting',
+      label: 'Pushes both ways',
+      desc: 'Opens and closes on command. We will ask whether it '
+            + 'keeps holding if power drops.' },
+    { key: 'vacuum',
+      label: 'Draws a vacuum',
+      desc: 'Suction cup or ejector. We will ask whether it keeps '
+            + 'holding if air drops.' },
+    { key: 'electric_none',
+      label: 'Runs on electricity (no air)',
+      desc: 'Motor-driven, battery, or passive — no air line needed.' },
+  ]
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+         data-testid="custom-eoat-something-else-picker">
+      <div style={{ fontSize: 13, color: '#374151' }}>
+        Which best describes what this tool does?
+      </div>
       {options.map((o) => (
         <button
           key={o.key}
           data-testid="custom-eoat-actuation"
           data-value={o.key}
-          data-selected={String(value === o.key)}
-          onClick={() => onChange(o.key)}
+          data-selected={String(value.type === o.key)}
+          onClick={() => onChange({
+            type: o.key,
+            holdOnLoss:    o.key === 'double_acting' ? true : null,
+            hasCheckValve: o.key === 'vacuum'        ? true : null,
+          })}
           style={{
             textAlign: 'left', padding: '10px 12px',
-            background: value === o.key ? '#DBEAFE' : '#fff',
-            border: `1px solid ${value === o.key ? '#2563EB' : '#d1d5db'}`,
+            background: value.type === o.key ? '#DBEAFE' : '#fff',
+            border: `1px solid ${value.type === o.key ? '#2563EB' : '#d1d5db'}`,
             borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
           }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: '#111827' }}>
@@ -1323,6 +1475,21 @@ function ActuationChoice({ value, onChange, options }) {
           </div>
         </button>
       ))}
+      {value.type === 'double_acting' && (
+        <HoldQuestion value={value} onChange={onChange} btnGhost={btnGhost} />
+      )}
+      {value.type === 'vacuum' && (
+        <SuctionHoldQuestion value={value} onChange={onChange}
+                             btnGhost={btnGhost} />
+      )}
+      <WhyExpander
+        label="What do these mean?"
+        testId="custom-eoat-something-else-why">
+        "Pushes one way, springs back" → 5/2 SS valve (spring return).
+        "Pushes both ways" → 5/2 DS or SS depending on whether you
+        want it to hold on power loss. "Draws a vacuum" → 3/2 N/C
+        valve. "Runs on electricity" → no pneumatic valve needed.
+      </WhyExpander>
     </div>
   )
 }
@@ -1552,7 +1719,7 @@ function _standardCellEntry({ toolKey, name, port, sensorCount }) {
         hold_on_loss: true,
         holds_via:    null,
         valve,
-        label:        'actuator',
+        label:        'gripper',
       }]
     }
   }

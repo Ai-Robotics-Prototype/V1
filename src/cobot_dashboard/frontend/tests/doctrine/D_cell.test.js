@@ -1397,9 +1397,12 @@ test('MyCellSection renders review-chip for flagged entries', () => {
     v('MyCellSection must render a review-recommended chip with '
       + 'data-testid="my-cell-entry-review-chip" for legacy hold '
       + 'entries.'))
-  assert.ok(/Review recommended — hold-on-loss not set/.test(myCellSrc),
-    v('Chip must carry the "Review recommended — hold-on-loss not '
-      + 'set" plain-copy label.'))
+  // 2026-10-02 plain-register directive: the chip no longer uses
+  // the banned "hold-on-loss" phrase. It reads in operator language.
+  assert.ok(
+    /Review recommended — set what happens on power loss/.test(myCellSrc),
+    v('Chip must carry the "Review recommended — set what happens '
+      + 'on power loss" plain-copy label (2026-10-02 register).'))
   assert.ok(/import \{ shouldReviewHold \} from '\.\.\/lib\/cellReview'/
     .test(myCellSrc),
     v('MyCellSection must import shouldReviewHold from the shared '
@@ -1428,54 +1431,76 @@ test('NO silent migration: backend never rewrites hold_on_loss on legacy entries
 
 // ── 2026-10-02 EOAT wizard: per-actuator preselects + vacuum copy ──
 
-test('EOAT wizard custom path preselects holdOnLoss=true on double_acting', () => {
-  // The ActuationChoice onChange handler sets holdOnLoss=true when
-  // the operator picks double_acting (and clears it to null for
-  // every other type).
+test('EOAT wizard custom path preselects holdOnLoss=true on grips_fingers capability', () => {
+  // 2026-10-02 plain-register directive: the per-actuator type picker
+  // was replaced by a multi-select "What does this tool do?" step.
+  // Each capability catalog entry carries its own preselect — the
+  // compilation-equivalence pin below guarantees the resulting
+  // actuator record matches the old flow's output.
+  const capSrc = readSrc('lib/eoatCapabilities.js')
+  assert.ok(/key: 'grips_fingers'/.test(capSrc),
+    v('Capability catalog must include grips_fingers.'))
   assert.ok(
-    /holdOnLoss:\s*t === 'double_acting' \? true : null/.test(eoatWizSrc),
-    v('ActuationChoice onChange handler must preselect holdOnLoss='
-      + 'true for double_acting per the 2026-10-02 safety default.'))
+    /actuatorType:\s*'double_acting',[\s\S]*?preselect:\s*\{\s*holdOnLoss:\s*true\s*\}/
+      .test(capSrc),
+    v('grips_fingers capability must map to actuatorType=double_acting '
+      + 'with preselect holdOnLoss=true (2026-10-02 safety default).'))
   assert.ok(/data-preselected-hold="true"/.test(eoatWizSrc),
     v('Custom-eoat-hold-question block must carry '
       + 'data-preselected-hold="true" so the preselect is testable.'))
 })
 
-test('EOAT wizard custom path preselects hasCheckValve=true on vacuum', () => {
+test('EOAT wizard custom path preselects hasCheckValve=true on holds_suction capability', () => {
+  const capSrc = readSrc('lib/eoatCapabilities.js')
+  assert.ok(/key: 'holds_suction'/.test(capSrc),
+    v('Capability catalog must include holds_suction.'))
   assert.ok(
-    /hasCheckValve:\s*t === 'vacuum'\s*\? true : null/.test(eoatWizSrc),
-    v('ActuationChoice onChange handler must preselect hasCheckValve='
-      + 'true for vacuum (NeuRobots standard includes check valve).'))
+    /actuatorType:\s*'vacuum',[\s\S]*?preselect:\s*\{\s*hasCheckValve:\s*true\s*\}/
+      .test(capSrc),
+    v('holds_suction capability must map to actuatorType=vacuum with '
+      + 'preselect hasCheckValve=true (NeuRobots standard).'))
   assert.ok(/data-preselected-check-valve="true"/.test(eoatWizSrc),
     v('Custom-eoat vacuum check-valve block must carry '
       + 'data-preselected-check-valve="true".'))
 })
 
-test('EOAT wizard renders the exact check-valve copy strings', () => {
+test('EOAT wizard renders plain-register check-valve question + answers', () => {
   const normalized = eoatWizSrc.replace(/\s+/g, ' ')
-  // YES copy (NeuRobots standard note).
+  // Plain-register question — the operator never has to know the
+  // phrase "check valve" exists; the question is about what happens
+  // when air is lost.
   assert.ok(
-    normalized.includes('NeuRobots vacuum tools ship with one'),
-    v('Custom-vacuum copy must explain the NeuRobots standard '
-      + 'check-valve inclusion to the operator.'))
-  // NO copy — "Parts will release if air is lost." (exact).
+    normalized.includes(
+      "If the air supply is lost, does your suction tool keep holding?"),
+    v('Custom-vacuum question must read in plain register '
+      + '("If the air supply is lost, does your suction tool keep '
+      + 'holding?").'))
+  // "I'm not sure" answer button is required so the operator with
+  // no visibility into the hardware is not forced to guess YES.
+  assert.ok(normalized.includes("I'm not sure"),
+    v('Custom-vacuum question must offer an "I\'m not sure" button '
+      + 'that records holds_on_loss=false with the safe-assumption '
+      + 'copy.'))
+  // NO / unsure branch copy — the exact "We'll assume it releases"
+  // string is required so operators see an honest safe-assumption.
   assert.ok(
-    normalized.includes('Parts will release if air is lost.'),
-    v('Custom-vacuum NO branch must render the honest "Parts will '
-      + 'release if air is lost." plain copy.'))
+    normalized.includes("We'll assume it releases, to be safe."),
+    v('"I\'m not sure" + "No" branch must render the exact "We\'ll '
+      + 'assume it releases, to be safe." plain copy.'))
 })
 
-test('EOAT wizard standard-vacuum confirm renders check-valve note', () => {
+test('EOAT wizard standard-vacuum confirm renders plain hold note', () => {
   // The copy is split across JSX whitespace — normalize for the
-  // match without weakening the content pin. The exact prose, with
-  // whitespace collapsed, must appear verbatim.
+  // match without weakening the content pin. 2026-10-02 register:
+  // the technical "check valve" phrase moved into the WhyExpander
+  // below; the operator-visible note is plain English.
   const normalized = eoatWizSrc.replace(/\s+/g, ' ')
   assert.ok(
     normalized.includes(
-      'Your NeuRobots vacuum tool includes a check valve '
-      + '— parts stay held if air is lost.'),
-    v('Standard vacuum confirm step must render the exact check-'
-      + 'valve inclusion note.'))
+      'Your NeuRobots suction tool keeps holding the part '
+      + 'if the air supply is lost.'),
+    v('Standard vacuum confirm step must render the plain-register '
+      + 'hold note under the glowing map.'))
   assert.ok(/data-testid="hardware-setup-vacuum-check-valve-note"/.test(eoatWizSrc),
     v('Standard vacuum note must carry a stable data-testid for '
       + 'future RTL render-pass tests.'))
@@ -1551,4 +1576,232 @@ test('vacuumHoldMetadata records holds_via distinct from valve-class holding', (
     v('vacuumHoldMetadata must map the YES/preselect-default to '
       + "holds_on_loss:true + holds_via:'check_valve' — provenance "
       + 'stays truthful (hardware does the holding, not the valve).'))
+})
+
+
+// ── 2026-10-02 plain-register pins ──────────────────────────────────
+//
+// Three load-bearing invariants for the plain-language pass:
+//   (a) banned-word grep — no "actuator", "5/2", "N/C", "hold-on-loss"
+//       etc. in operator-visible copy (WhyExpander subtrees exempt).
+//   (b) compilation-equivalence — multi-select capability picks
+//       compile to the same actuator records as the old flow.
+//   (c) why-expander coverage — every recommendation surface has an
+//       adjacent WhyExpander so technical detail is reachable.
+
+const _REGISTER_BANNED = [
+  'actuator', 'actuation', 'solenoid', 'pneumatic',
+  'single-acting', 'double-acting', 'spring return',
+  'check valve', 'hold-on-loss', 'discrete', 'continuous',
+  'N/C', 'N/O', '5/2', '3/2', 'HI/LO', 'PNP', 'OSSD',
+]
+const _REGISTER_BANNED_ACRONYMS = ['DS', 'SS', 'DI', 'DO']
+
+function _stripWhyExpanders(src) {
+  let out = src, prev
+  do {
+    prev = out
+    out = out.replace(/<WhyExpander\b[^>]*>[\s\S]*?<\/WhyExpander>/g, '')
+  } while (out !== prev)
+  return out
+}
+function _stripBacktickLiterals(src) {
+  return src.replace(/`(?:[^`\\]|\\.)*`/g, '``')
+}
+function _stripSrcComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/([^:'"`])\/\/.*$/gm, '$1')
+}
+
+function _operatorStringLiterals(src) {
+  // Only sentence-shaped strings count as operator copy — short
+  // snake_case tokens are internal data values that may legitimately
+  // mention 'actuation' / 'vacuum' / 'double_acting' etc.
+  const literals = []
+  const re = /'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"/g
+  let m
+  while ((m = re.exec(src))) {
+    const s = m[1] || m[2]
+    if (s && /\s/.test(s) && /[a-z]{3,}/.test(s)) literals.push(s)
+  }
+  return literals
+}
+
+function _registerSweep(src) {
+  const cleaned = _stripBacktickLiterals(_stripWhyExpanders(
+    _stripSrcComments(src)))
+  const strings = _operatorStringLiterals(cleaned)
+  const hits = []
+  for (const s of strings) {
+    for (const b of _REGISTER_BANNED) {
+      const r = new RegExp('\\b' + b.replace(/[/.]/g, '\\$&') + '\\b', 'i')
+      if (r.test(s)) hits.push({ word: b, text: s })
+    }
+    for (const a of _REGISTER_BANNED_ACRONYMS) {
+      if (new RegExp('\\b' + a + '\\b').test(s)) {
+        hits.push({ word: a, text: s })
+      }
+    }
+  }
+  return hits
+}
+
+test('plain-register pin: EOAT wizard operator copy is free of banned words', () => {
+  const hits = _registerSweep(eoatWizSrc)
+  assert.equal(hits.length, 0,
+    v('EOATSetupWizard operator copy contains banned register words. '
+      + 'Hits: ' + hits.map((h) =>
+        `[${h.word}] ${h.text.substring(0, 80)}`).join(' | ')))
+})
+
+test('plain-register pin: fixture wizard operator copy is free of banned words', () => {
+  const hits = _registerSweep(fixWizSrc)
+  assert.equal(hits.length, 0,
+    v('ExternalFixtureWizard operator copy contains banned register '
+      + 'words. Hits: ' + hits.map((h) =>
+        `[${h.word}] ${h.text.substring(0, 80)}`).join(' | ')))
+})
+
+test('plain-register pin: fixturesData operator-visible copy is free of banned words', () => {
+  const dataSrc = readSrc('lib/fixturesData.js')
+  const hits = _registerSweep(dataSrc)
+  assert.equal(hits.length, 0,
+    v('fixturesData.js operator-visible copy contains banned register '
+      + 'words. Hits: ' + hits.map((h) =>
+        `[${h.word}] ${h.text.substring(0, 80)}`).join(' | ')))
+})
+
+test('plain-register pin: My Cell section operator copy is free of banned words', () => {
+  const hits = _registerSweep(myCellSrc)
+  assert.equal(hits.length, 0,
+    v('MyCellSection operator copy contains banned register words. '
+      + 'Hits: ' + hits.map((h) =>
+        `[${h.word}] ${h.text.substring(0, 80)}`).join(' | ')))
+})
+
+// ── Compilation-equivalence pins ────────────────────────────────────
+//
+// The multi-select capability flow MUST produce the same actuator
+// records as the old per-actuator picker would have produced for the
+// same operator intent. Pin each capability → record mapping.
+
+test('compilation-equivalence: grips_fingers → one double_acting actuator (hold preselected)', async () => {
+  const { actuatorsFromCapabilities } = await import(
+    '../../src/lib/eoatCapabilities.js')
+  const acts = actuatorsFromCapabilities(new Set(['grips_fingers']))
+  assert.equal(acts.length, 1,
+    v('One capability selected → one actuator in the compiled record.'))
+  assert.equal(acts[0].type, 'double_acting',
+    v('grips_fingers → actuator type double_acting.'))
+  assert.equal(acts[0].holdOnLoss, true,
+    v('grips_fingers preselects holdOnLoss=true (safety default).'))
+  assert.equal(acts[0].capability, 'grips_fingers',
+    v('Compiled actuator carries the originating capability key.'))
+})
+
+test('compilation-equivalence: holds_suction → one vacuum actuator (check-valve preselected)', async () => {
+  const { actuatorsFromCapabilities } = await import(
+    '../../src/lib/eoatCapabilities.js')
+  const acts = actuatorsFromCapabilities(new Set(['holds_suction']))
+  assert.equal(acts.length, 1)
+  assert.equal(acts[0].type, 'vacuum')
+  assert.equal(acts[0].hasCheckValve, true,
+    v('holds_suction preselects hasCheckValve=true (NeuRobots standard).'))
+})
+
+test('compilation-equivalence: blows_air → one blow_off actuator (no hold question)', async () => {
+  const { actuatorsFromCapabilities } = await import(
+    '../../src/lib/eoatCapabilities.js')
+  const acts = actuatorsFromCapabilities(new Set(['blows_air']))
+  assert.equal(acts.length, 1)
+  assert.equal(acts[0].type, 'blow_off')
+  // No preselect for hold or check-valve — blow has no hold state.
+  assert.equal(acts[0].holdOnLoss, null)
+  assert.equal(acts[0].hasCheckValve, null)
+})
+
+test('compilation-equivalence: multi-select combinations preserve order + count', async () => {
+  const { actuatorsFromCapabilities } = await import(
+    '../../src/lib/eoatCapabilities.js')
+  const acts = actuatorsFromCapabilities(
+    new Set(['grips_fingers', 'blows_air']))
+  assert.equal(acts.length, 2,
+    v('Two capabilities selected → two actuators in the compiled record.'))
+  // Catalog order (grips_fingers before blows_air) must be preserved
+  // regardless of insertion order — the record stays deterministic
+  // across runs.
+  assert.equal(acts[0].capability, 'grips_fingers',
+    v('Catalog order wins over insertion order.'))
+  assert.equal(acts[1].capability, 'blows_air')
+})
+
+test('compilation-equivalence: capability-shape matches the resolve-pipeline contract', async () => {
+  // resolveCustomEOATRecord expects actuators[i] with fields
+  // {type, holdOnLoss|hold_on_loss, hasCheckValve|has_check_valve,
+  //  label?} and treats blow_off / vacuum / double_acting / anything-
+  // else per its branches. The capability compiler must produce
+  // records that satisfy EVERY one of those shape expectations so
+  // the end-to-end path (capabilities → compiled → resolved) stays
+  // byte-stable with what the old flow produced. Pinned by source
+  // grep because toolPortMap.js imports SynapsePage.jsx and cannot
+  // load under node:test's non-JSX loader.
+  const toolPortSrc = readSrc('lib/toolPortMap.js')
+  // The resolver reads a.holdOnLoss ?? a.hold_on_loss.
+  assert.ok(/a\.holdOnLoss\s*\?\?\s*a\.hold_on_loss/.test(toolPortSrc),
+    v('resolveCustomEOATRecord must read holdOnLoss (new flow) OR '
+      + 'hold_on_loss (legacy) so the capability compiler stays '
+      + 'compatible without needing a field rename.'))
+  // The resolver reads a.hasCheckValve ?? a.has_check_valve.
+  assert.ok(
+    /a\.hasCheckValve\s*\?\?\s*a\.has_check_valve/.test(toolPortSrc),
+    v('resolveCustomEOATRecord must read hasCheckValve (new flow) '
+      + 'OR has_check_valve (legacy).'))
+  // blow_off branch exists and records hold_on_loss=false.
+  assert.ok(/type === 'blow_off'/.test(toolPortSrc),
+    v('resolveCustomEOATRecord must branch on blow_off — the new '
+      + 'capability catalog introduces this actuator type.'))
+  const { actuatorsFromCapabilities } = await import(
+    '../../src/lib/eoatCapabilities.js')
+  const acts = actuatorsFromCapabilities(
+    new Set(['grips_fingers', 'holds_suction', 'blows_air']))
+  // The compiled actuator fields must be in the shape the resolver
+  // consumes above — holdOnLoss / hasCheckValve, not snake_case.
+  assert.ok(Object.prototype.hasOwnProperty.call(acts[0], 'holdOnLoss'))
+  assert.ok(Object.prototype.hasOwnProperty.call(acts[1], 'hasCheckValve'))
+  assert.equal(acts[2].type, 'blow_off')
+})
+
+// ── Why-expander coverage pin ───────────────────────────────────────
+//
+// Every operator-facing RECOMMENDATION surface must sit adjacent to
+// a <WhyExpander> so the technical detail is reachable without
+// cluttering the question. The pin counts WhyExpander instances —
+// a drop below the baseline means a recommendation lost its
+// explainer.
+
+test('why-expander coverage: EOAT wizard carries explainers at each recommendation', () => {
+  const count = (eoatWizSrc.match(/<WhyExpander\b/g) || []).length
+  assert.ok(count >= 5,
+    v('EOATSetupWizard must carry at least 5 WhyExpander instances '
+      + '(hold question, suction question, blow note, something-else '
+      + 'picker, standard-finger note, standard-vacuum note, sensor '
+      + 'definition). Found: ' + count))
+})
+
+test('why-expander coverage: fixture wizard carries explainers at each recommendation', () => {
+  const count = (fixWizSrc.match(/<WhyExpander\b/g) || []).length
+  assert.ok(count >= 2,
+    v('ExternalFixtureWizard must carry at least 2 WhyExpander '
+      + 'instances (hold question + wants-done question). Found: '
+      + count))
+})
+
+test('WhyExpander component defines the data-why-expander marker', () => {
+  const src = readSrc('components/WhyExpander.jsx')
+  assert.ok(/data-why-expander="1"/.test(src),
+    v('WhyExpander must render data-why-expander="1" on its outer '
+      + 'div — the banned-word pin uses this marker to carve the '
+      + 'subtree out of the sweep.'))
 })
