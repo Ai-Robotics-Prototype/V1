@@ -1515,21 +1515,48 @@ test('EOAT wizard custom confirm step offers NO hold-on-loss questions', () => {
       + 'card must be removed (operator order 2026-10-05).'))
 })
 
-test('EOAT wizard standard-vacuum confirm renders plain hold note', () => {
-  // The copy is split across JSX whitespace — normalize for the
-  // match without weakening the content pin. 2026-10-02 register:
-  // the technical "check valve" phrase moved into the WhyExpander
-  // below; the operator-visible note is plain English.
-  const normalized = eoatWizSrc.replace(/\s+/g, ' ')
+test('EOAT wizard hookup/guidance screen: suction check-valve explainer retired', () => {
+  // 2026-10-05 operator order: the explainer box under the vacuum
+  // GuidanceBlock on the hookup/guidance screen was noise on the
+  // wiring view. Retired. Strip comments so a breadcrumb that
+  // mentions the retired copy doesn't trip the pin.
+  const stripped = eoatWizSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, '')
+  assert.equal(
+    /data-testid="hardware-setup-vacuum-check-valve-note"/.test(stripped),
+    false,
+    v('The hardware-setup-vacuum-check-valve-note box must be '
+      + 'removed from the hookup/guidance screen (2026-10-05).'))
+  assert.equal(
+    /data-testid="hardware-setup-vacuum-why"/.test(stripped), false,
+    v('The companion "How?" WhyExpander (testId=hardware-setup-'
+      + 'vacuum-why) must be removed with the explainer box.'))
+  const normalized = stripped.replace(/\s+/g, ' ')
+  assert.equal(
+    normalized.includes('Standard inclusion, not an upsell.'), false,
+    v('The retired "Standard inclusion, not an upsell." copy must '
+      + 'be absent from the hookup/guidance screen.'))
+  // The CONFIRM-step AlwaysHoldsNote line stays — the directive
+  // explicitly scoped the removal to the hookup/guidance surface.
+  // Positive proof the record-truth path is unchanged.
   assert.ok(
-    normalized.includes(
-      'Your NeuRobots suction tool keeps holding the part '
-      + 'if the air supply is lost.'),
-    v('Standard vacuum confirm step must render the plain-register '
-      + 'hold note under the glowing map.'))
-  assert.ok(/data-testid="hardware-setup-vacuum-check-valve-note"/.test(eoatWizSrc),
-    v('Standard vacuum note must carry a stable data-testid for '
-      + 'future RTL render-pass tests.'))
+    /<AlwaysHoldsNote\s+tool="suction"\s*\/>/.test(stripped),
+    v('The confirm-step AlwaysHoldsNote (tool="suction") must stay '
+      + '— the operator order removed the hookup/guidance box only.'))
+})
+
+test('standard-vacuum cell entry still records holds_via=check_valve', () => {
+  // Record truth is unchanged — only the on-screen explainer was
+  // retired. The _standardCellEntry helper for vacuum still produces
+  // hold_on_loss=true + holds_via='check_valve' so programs built
+  // against the standard vacuum tool keep behaving the same.
+  assert.ok(
+    /type:\s*'vacuum',\s*hold_on_loss:\s*true,\s*holds_via:\s*'check_valve',\s*valve,/
+      .test(eoatWizSrc),
+    v('_standardCellEntry for vacuum must still record '
+      + "hold_on_loss=true + holds_via='check_valve' — the on-screen "
+      + 'explainer removal is UI-only, no data change.'))
 })
 
 test('standard-path cell entry: finger records double_acting + hold_on_loss=true', () => {

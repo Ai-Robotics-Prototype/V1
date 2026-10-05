@@ -481,26 +481,14 @@ export default function EOATSetupWizard({
                   />
                 )}
                 <GuidanceBlock port={guidancePortMap} />
-                {activeTool.key === 'vacuum' && (
-                  <div data-testid="hardware-setup-vacuum-check-valve-note"
-                       style={{
-                         padding: '8px 12px', marginBottom: 10,
-                         background: '#ECFDF5', border: '1px solid #6EE7B7',
-                         borderRadius: 6, color: '#065F46',
-                         fontSize: 12, lineHeight: 1.5,
-                       }}>
-                    Your NeuRobots suction tool keeps holding the part
-                    if the air supply is lost.
-                    <WhyExpander
-                      label="How?"
-                      testId="hardware-setup-vacuum-why">
-                      The tool ships with a vacuum check valve — the
-                      vacuum stays trapped in the cup until the program
-                      commands a release. Standard inclusion, not an
-                      upsell.
-                    </WhyExpander>
-                  </div>
-                )}
+                {/* 2026-10-05 operator order: the suction check-valve
+                    explainer box (data-testid=hardware-setup-vacuum-
+                    check-valve-note) is retired from the hookup /
+                    guidance screen — it was noise on the wiring view.
+                    The always-holds behavior stays recorded on the
+                    tool (holds_on_loss=true + holds_via='check_valve'
+                    in _standardCellEntry, 247cda8) and the confirm-
+                    step read-only line is unchanged. */}
                 {activeTool.key === 'finger' && (
                   <div data-testid="hardware-setup-finger-hold-note"
                        style={{
