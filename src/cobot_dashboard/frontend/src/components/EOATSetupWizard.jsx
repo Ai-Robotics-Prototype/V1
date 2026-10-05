@@ -1227,11 +1227,10 @@ function ActuatorCard({
         {cap ? cap.label : `Choice ${index + 1} of ${total}`}
       </div>
       {value.capability === 'grips_fingers' && (
-        <HoldQuestion value={value} onChange={onChange} btnGhost={btnGhost} />
+        <AlwaysHoldsNote tool="finger" />
       )}
       {value.capability === 'holds_suction' && (
-        <SuctionHoldQuestion value={value} onChange={onChange}
-                             btnGhost={btnGhost} />
+        <AlwaysHoldsNote tool="suction" />
       )}
       {value.capability === 'blows_air' && (
         <BlowOffNote />
@@ -1240,168 +1239,47 @@ function ActuatorCard({
         <SomethingElsePicker value={value} onChange={onChange}
                              btnGhost={btnGhost} />
       )}
-      {resolved && resolved.recommended_valve_type && (
-        <WhyExpander
-          label="Which part did we pick?"
-          testId="custom-eoat-actuation-rec">
-          Recommended part: {resolved.recommended_valve_type}.
-          {' '}{resolved.recommended_valve_why}
-          {resolved.valve
-            ? ` Spare slot assigned: ${portDisplayName(resolved.valve)}.`
-            : ''}
-        </WhyExpander>
-      )}
+      {/* 2026-10-05 operator order: the "Which part did we pick?"
+          why-expander is retired alongside the hold questions. The
+          saved hookup receipt still names the recommended valve
+          type + the allocated slot, so the detail still lands in
+          front of the operator where it belongs. */}
     </div>
   )
 }
 
-function HoldQuestion({ value, onChange, btnGhost }) {
+// 2026-10-05 operator order: finger + suction custom tools ALWAYS
+// hold the part on power / air loss. The hold-on-loss question is
+// retired on the confirm step; this read-only line surfaces the
+// decision so the operator can see what the record says without
+// having to interact. The behavior-truth copy differs per tool
+// (finger holds via DS valve; suction holds via inline check valve)
+// so the operator reads the honest reason, not a canned sentence.
+function AlwaysHoldsNote({ tool }) {
+  const copy = tool === 'suction'
+    ? 'This suction tool keeps holding the part if the air supply '
+      + 'is lost.'
+    : 'This gripper keeps holding the part if power is lost.'
   return (
-    <div data-testid="custom-eoat-hold-question"
-         data-preselected-hold="true"
+    <div data-testid="custom-eoat-always-holds-note"
+         data-tool={tool}
          style={{
            marginTop: 4, padding: 12,
-           background: '#F9FAFB',
-           border: '1px solid #E5E7EB', borderRadius: 8,
+           background: '#F0FDF4',
+           border: '1px solid #86EFAC', borderRadius: 8,
+           color: '#166534', fontSize: 13, lineHeight: 1.5,
          }}>
-      <div style={{ fontSize: 13, fontWeight: 600,
-                    color: '#111827', marginBottom: 6 }}>
-        If the robot suddenly stops, should this keep holding
-        the part?
-      </div>
-      <div style={{ fontSize: 12, color: '#6B7280',
-                    marginBottom: 10 }}>
-        Pick "Yes" if letting go would drop a part or damage
-        something. Pick "No" if you want it to open on its own
-        when power drops.
-      </div>
-      <div style={{ display: 'flex', gap: 8 }}>
-        <button
-          data-testid="custom-eoat-hold-yes"
-          onClick={() => onChange({ holdOnLoss: true })}
-          style={{
-            ...btnGhost,
-            background: value.holdOnLoss === true ? '#DCFCE7' : '#fff',
-            borderColor: value.holdOnLoss === true ? '#22C55E' : '#d1d5db',
-          }}>
-          Yes — keep holding
-        </button>
-        <button
-          data-testid="custom-eoat-hold-no"
-          onClick={() => onChange({ holdOnLoss: false })}
-          style={{
-            ...btnGhost,
-            background: value.holdOnLoss === false ? '#DBEAFE' : '#fff',
-            borderColor: value.holdOnLoss === false ? '#2563EB' : '#d1d5db',
-          }}>
-          No — let go
-        </button>
-      </div>
-      {value.holdOnLoss === true && (
-        <div data-testid="custom-eoat-hold-recommended-copy"
-             style={{
-               marginTop: 8, fontSize: 12, color: '#065F46',
-             }}>
-          Recommended — the part won't drop.
-        </div>
-      )}
-      <WhyExpander
-        label="Why does this matter?"
-        testId="custom-eoat-hold-why">
-        "Yes" installs a 5/2 double-solenoid (DS) valve so the
-        gripper remembers the last commanded position when power
-        drops. "No" installs a 5/2 single-solenoid (SS) valve with
-        a spring that returns the gripper to its home position on
-        power loss.
-      </WhyExpander>
+      {copy}
     </div>
   )
 }
 
-function SuctionHoldQuestion({ value, onChange, btnGhost }) {
-  // "I'm not sure" records false with the safe-assumption copy, per
-  // the 2026-10-02 directive: a customer who cannot tell gets the
-  // honest "we'll assume it releases" record so programs do not
-  // over-promise on hardware they cannot verify.
-  const picked = value.hasCheckValve
-  return (
-    <div data-testid="custom-eoat-vacuum-check-valve"
-         data-preselected-check-valve="true"
-         style={{
-           marginTop: 4, padding: 12,
-           background: '#F9FAFB',
-           border: '1px solid #E5E7EB', borderRadius: 8,
-         }}>
-      <div style={{ fontSize: 13, fontWeight: 600,
-                    color: '#111827', marginBottom: 6 }}>
-        If the air supply is lost, does your suction tool keep
-        holding?
-      </div>
-      <div style={{ fontSize: 12, color: '#6B7280',
-                    marginBottom: 10 }}>
-        NeuRobots suction tools keep holding when air is lost.
-        If you built your own suction head, you may need to pick
-        a different answer.
-      </div>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <button
-          data-testid="custom-eoat-check-valve-yes"
-          onClick={() => onChange({ hasCheckValve: true })}
-          style={{
-            ...btnGhost,
-            background: picked === true ? '#DCFCE7' : '#fff',
-            borderColor: picked === true ? '#22C55E' : '#d1d5db',
-          }}>
-          Yes — keeps holding
-        </button>
-        <button
-          data-testid="custom-eoat-check-valve-no"
-          onClick={() => onChange({ hasCheckValve: false })}
-          style={{
-            ...btnGhost,
-            background: picked === false ? '#DBEAFE' : '#fff',
-            borderColor: picked === false ? '#2563EB' : '#d1d5db',
-          }}>
-          No — lets go
-        </button>
-        <button
-          data-testid="custom-eoat-check-valve-unsure"
-          onClick={() => onChange({ hasCheckValve: false })}
-          style={{
-            ...btnGhost,
-            background: '#fff',
-            borderColor: '#d1d5db',
-          }}>
-          I'm not sure
-        </button>
-      </div>
-      {picked === true && (
-        <div data-testid="custom-eoat-check-valve-recommended-copy"
-             style={{
-               marginTop: 8, fontSize: 12, color: '#065F46',
-             }}>
-          Recommended — the part won't drop.
-        </div>
-      )}
-      {picked === false && (
-        <div data-testid="custom-eoat-check-valve-release-copy"
-             style={{
-               marginTop: 8, fontSize: 12, color: '#7F1D1D',
-             }}>
-          We'll assume it releases, to be safe.
-        </div>
-      )}
-      <WhyExpander
-        label="Why does this matter?"
-        testId="custom-eoat-check-valve-why">
-        A vacuum check valve traps the vacuum inside the suction cup
-        when the air supply drops, so the part stays attached until
-        the program commands a release. Without a check valve, the
-        vacuum vents on air loss and the part falls.
-      </WhyExpander>
-    </div>
-  )
-}
+// HoldQuestion + SuctionHoldQuestion deleted 2026-10-05 (operator
+// order: neither should be an option — both tools always hold).
+// Their behavior is now the record default from eoatCapabilities
+// preselects (grips_fingers → holdOnLoss:true; holds_suction →
+// hasCheckValve:true). The AlwaysHoldsNote component (above)
+// surfaces the decision as read-only copy.
 
 function BlowOffNote() {
   return (
@@ -1414,13 +1292,6 @@ function BlowOffNote() {
          }}>
       The air pulses on when the program says so, and stops
       the moment the program stops. Nothing to hold here.
-      <WhyExpander
-        label="Which part did we pick?"
-        testId="custom-eoat-blow-why">
-        A blow-off uses a 3/2 N/C (Normally Closed) valve — default
-        off, pulses on command. Same physical valve class as suction;
-        your controller treats blow and suction as separate actions.
-      </WhyExpander>
     </div>
   )
 }
@@ -1435,12 +1306,12 @@ function SomethingElsePicker({ value, onChange, btnGhost }) {
       desc: 'Opens on command, snaps shut on its own when power drops.' },
     { key: 'double_acting',
       label: 'Pushes both ways',
-      desc: 'Opens and closes on command. We will ask whether it '
-            + 'keeps holding if power drops.' },
+      desc: 'Opens and closes on command. Keeps holding if power '
+            + 'drops.' },
     { key: 'vacuum',
       label: 'Draws a vacuum',
-      desc: 'Suction cup or ejector. We will ask whether it keeps '
-            + 'holding if air drops.' },
+      desc: 'Suction cup or ejector. Keeps holding if the air '
+            + 'supply drops.' },
     { key: 'electric_none',
       label: 'Runs on electricity (no air)',
       desc: 'Motor-driven, battery, or passive — no air line needed.' },
@@ -1476,21 +1347,19 @@ function SomethingElsePicker({ value, onChange, btnGhost }) {
           </div>
         </button>
       ))}
-      {value.type === 'double_acting' && (
-        <HoldQuestion value={value} onChange={onChange} btnGhost={btnGhost} />
+      {/* 2026-10-05 operator order: the double_acting / vacuum
+          follow-up hold questions are retired. The type-select
+          click handler above already seeds holdOnLoss=true for
+          double_acting and hasCheckValve=true for vacuum, so the
+          actuator is complete the moment the operator picks a
+          type. The AlwaysHoldsNote surfaces the always-hold
+          decision on the primary (non-"something else") paths;
+          here, picking the type IS the commitment, no second
+          question needed. */}
+      {(value.type === 'double_acting' || value.type === 'vacuum') && (
+        <AlwaysHoldsNote
+          tool={value.type === 'vacuum' ? 'suction' : 'finger'} />
       )}
-      {value.type === 'vacuum' && (
-        <SuctionHoldQuestion value={value} onChange={onChange}
-                             btnGhost={btnGhost} />
-      )}
-      <WhyExpander
-        label="What do these mean?"
-        testId="custom-eoat-something-else-why">
-        "Pushes one way, springs back" → 5/2 SS valve (spring return).
-        "Pushes both ways" → 5/2 DS or SS depending on whether you
-        want it to hold on power loss. "Draws a vacuum" → 3/2 N/C
-        valve. "Runs on electricity" → no pneumatic valve needed.
-      </WhyExpander>
     </div>
   )
 }

@@ -1437,6 +1437,12 @@ test('EOAT wizard custom path preselects holdOnLoss=true on grips_fingers capabi
   // Each capability catalog entry carries its own preselect — the
   // compilation-equivalence pin below guarantees the resulting
   // actuator record matches the old flow's output.
+  //
+  // 2026-10-05 operator order: the hold-question UI is retired —
+  // both finger and suction custom tools ALWAYS hold the part on
+  // power/air loss. The preselect in the capability catalog is now
+  // the record-truth source (no operator toggle); AlwaysHoldsNote
+  // surfaces the decision as read-only copy.
   const capSrc = readSrc('lib/eoatCapabilities.js')
   assert.ok(/key: 'grips_fingers'/.test(capSrc),
     v('Capability catalog must include grips_fingers.'))
@@ -1444,10 +1450,14 @@ test('EOAT wizard custom path preselects holdOnLoss=true on grips_fingers capabi
     /actuatorType:\s*'double_acting',[\s\S]*?preselect:\s*\{\s*holdOnLoss:\s*true\s*\}/
       .test(capSrc),
     v('grips_fingers capability must map to actuatorType=double_acting '
-      + 'with preselect holdOnLoss=true (2026-10-02 safety default).'))
-  assert.ok(/data-preselected-hold="true"/.test(eoatWizSrc),
-    v('Custom-eoat-hold-question block must carry '
-      + 'data-preselected-hold="true" so the preselect is testable.'))
+      + 'with preselect holdOnLoss=true — this is now the ONLY source '
+      + 'for the record (the hold-question toggle is retired).'))
+  // Read-only AlwaysHoldsNote with tool="finger" surfaces the decision
+  // on the confirm card.
+  assert.ok(/<AlwaysHoldsNote\s+tool="finger"\s*\/>/.test(eoatWizSrc),
+    v('ActuatorCard for grips_fingers must render '
+      + '<AlwaysHoldsNote tool="finger" /> — the read-only line '
+      + 'that replaced the retired HoldQuestion toggle.'))
 })
 
 test('EOAT wizard custom path preselects hasCheckValve=true on holds_suction capability', () => {
@@ -1458,35 +1468,51 @@ test('EOAT wizard custom path preselects hasCheckValve=true on holds_suction cap
     /actuatorType:\s*'vacuum',[\s\S]*?preselect:\s*\{\s*hasCheckValve:\s*true\s*\}/
       .test(capSrc),
     v('holds_suction capability must map to actuatorType=vacuum with '
-      + 'preselect hasCheckValve=true (NeuRobots standard).'))
-  assert.ok(/data-preselected-check-valve="true"/.test(eoatWizSrc),
-    v('Custom-eoat vacuum check-valve block must carry '
-      + 'data-preselected-check-valve="true".'))
+      + 'preselect hasCheckValve=true (NeuRobots standard holds via '
+      + 'inline check valve).'))
+  assert.ok(/<AlwaysHoldsNote\s+tool="suction"\s*\/>/.test(eoatWizSrc),
+    v('ActuatorCard for holds_suction must render '
+      + '<AlwaysHoldsNote tool="suction" /> — the read-only line '
+      + 'that replaced the retired SuctionHoldQuestion toggle.'))
 })
 
-test('EOAT wizard renders plain-register check-valve question + answers', () => {
+test('EOAT wizard custom confirm step offers NO hold-on-loss questions', () => {
+  // 2026-10-05 operator order: neither finger nor suction hold
+  // questions should be an option on the custom confirm step. Pin
+  // the retired UI (components + testids + button copy) is GONE.
+  assert.equal(/function\s+HoldQuestion\s*\(/.test(eoatWizSrc), false,
+    v('HoldQuestion component must be deleted — the finger hold '
+      + 'question is retired (operator order 2026-10-05).'))
+  assert.equal(/function\s+SuctionHoldQuestion\s*\(/.test(eoatWizSrc),
+    false,
+    v('SuctionHoldQuestion component must be deleted — the suction '
+      + 'hold question is retired.'))
   const normalized = eoatWizSrc.replace(/\s+/g, ' ')
-  // Plain-register question — the operator never has to know the
-  // phrase "check valve" exists; the question is about what happens
-  // when air is lost.
-  assert.ok(
+  assert.equal(
     normalized.includes(
       "If the air supply is lost, does your suction tool keep holding?"),
-    v('Custom-vacuum question must read in plain register '
-      + '("If the air supply is lost, does your suction tool keep '
-      + 'holding?").'))
-  // "I'm not sure" answer button is required so the operator with
-  // no visibility into the hardware is not forced to guess YES.
-  assert.ok(normalized.includes("I'm not sure"),
-    v('Custom-vacuum question must offer an "I\'m not sure" button '
-      + 'that records holds_on_loss=false with the safe-assumption '
-      + 'copy.'))
-  // NO / unsure branch copy — the exact "We'll assume it releases"
-  // string is required so operators see an honest safe-assumption.
-  assert.ok(
-    normalized.includes("We'll assume it releases, to be safe."),
-    v('"I\'m not sure" + "No" branch must render the exact "We\'ll '
-      + 'assume it releases, to be safe." plain copy.'))
+    false,
+    v('The suction hold-on-loss question copy must be removed — the '
+      + 'operator no longer makes this choice.'))
+  assert.equal(
+    normalized.includes(
+      "If the robot suddenly stops, should this keep holding"),
+    false,
+    v('The finger hold-on-loss question copy must be removed.'))
+  // "I'm not sure" button retired alongside the suction question.
+  assert.equal(/data-testid="custom-eoat-check-valve-unsure"/
+    .test(eoatWizSrc), false,
+    v('The "I\'m not sure" button is retired with the suction '
+      + 'question — the record is always holds_on_loss=true.'))
+  // "Which part did we pick?" expander retired per the directive —
+  // strip JSX comments (/* ... */) so a breadcrumb note that mentions
+  // the retired copy doesn't trip the pin.
+  const stripped = eoatWizSrc.replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, '')
+  assert.equal(
+    /Which part did we pick\?/.test(stripped), false,
+    v('The "Which part did we pick?" why-expander on the actuator '
+      + 'card must be removed (operator order 2026-10-05).'))
 })
 
 test('EOAT wizard standard-vacuum confirm renders plain hold note', () => {
@@ -1786,11 +1812,17 @@ test('compilation-equivalence: capability-shape matches the resolve-pipeline con
 // explainer.
 
 test('why-expander coverage: EOAT wizard carries explainers at each recommendation', () => {
+  // 2026-10-05 operator order dropped the hold-question WhyExpanders
+  // (finger + suction + blow-off "which part" + something-else).
+  // The remaining explainers cover the standard-finger note, the
+  // standard-vacuum note, and the sensor-definition — plus any
+  // future recommendation surface that adds its own. Floor at 2 so
+  // a regression that strips the standard-path explainers still
+  // fails loudly.
   const count = (eoatWizSrc.match(/<WhyExpander\b/g) || []).length
-  assert.ok(count >= 5,
-    v('EOATSetupWizard must carry at least 5 WhyExpander instances '
-      + '(hold question, suction question, blow note, something-else '
-      + 'picker, standard-finger note, standard-vacuum note, sensor '
+  assert.ok(count >= 2,
+    v('EOATSetupWizard must carry at least 2 WhyExpander instances '
+      + '(standard-finger note, standard-vacuum note, sensor '
       + 'definition). Found: ' + count))
 })
 
