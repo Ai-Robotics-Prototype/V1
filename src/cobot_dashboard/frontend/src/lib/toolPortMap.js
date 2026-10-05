@@ -26,6 +26,9 @@
 // /cmd call. Live verify-connection is a later directive.
 
 import { VALVE_TYPE_INFO } from '../pages/SynapsePage'
+import {
+  valveTypeForActuation, allocateValveForType,
+} from './valveMapping.js'
 
 // Fixed built-in tool port mappings. Free-slot resolution for
 // Custom EOAT happens at runtime (see resolveCustomEOATRecord
@@ -238,13 +241,12 @@ export function resolveCustomEOATRecord({
          ? [{ type: actuation, holdOnLoss }]
          : [])
 
-  // Valves available for new allocation — SPARE slots that no OTHER
-  // custom tool has claimed. The flow walks actuators in order and
-  // assigns the next free SPARE to each electric-less actuator.
-  const spareValveIds = ['V05', 'V10']
-  const freeSpares = spareValveIds.filter((v) => !claimedValves.has(v))
-
-  let spareCursor = 0
+  // Walk actuators in order and assign each one a free slot whose
+  // declared type matches the recommended valve class. Falls back to
+  // SPARE slots when no direct-type slot is free. Each allocation
+  // extends `runningClaimed` so a second actuator in the same tool
+  // can't double-pick the slot the first actuator took.
+  const runningClaimed = new Set(claimedValves)
   const resolvedActuators = acts.map((a, i) => {
     const type = a.type
     const rawHold = a.holdOnLoss ?? a.hold_on_loss
@@ -269,7 +271,10 @@ export function resolveCustomEOATRecord({
       hold = rawHold ?? null
     }
     const rec = recommendValveType(type, hold)
-    const valve = rec ? (freeSpares[spareCursor++] || null) : null
+    const valve = rec
+      ? allocateValveForType(rec.type, runningClaimed)
+      : null
+    if (valve) runningClaimed.add(valve)
     const label = a.label
       || _defaultActuatorLabel(type, i, acts.length)
     return {
@@ -345,48 +350,26 @@ export function resolveCustomEOATRecord({
 // Never duplicate copy — reference VALVE_TYPE_INFO so a copy
 // edit there flows through here automatically.
 export function recommendValveType(actuation, holdOnLoss) {
-  if (actuation === 'single_acting') {
-    const info = VALVE_TYPE_INFO['5/2 SS'] || {}
-    return {
-      type: '5/2 SS',
-      why:  info.best_use || 'Fail-safe: spring return to home on '
-                            + 'power or air loss.',
-      notes: info.plain_explanation || '',
-    }
+  // 2026-10-05 unification: route through shared
+  // valveMapping.valveTypeForActuation so the EOAT wizard and the
+  // fixture wizard CANNOT drift on the safety-relevant hold-on-loss
+  // → DS/SS mapping. Both actuation vocabularies (short-form
+  // 'single'/'double' from the fixture wizard, long-form
+  // 'single_acting'/'double_acting' from the EOAT wizard) normalize
+  // in the shared resolver.
+  const type = valveTypeForActuation({ actuation, holdOnLoss })
+  if (!type) return null
+  const info = VALVE_TYPE_INFO[type] || {}
+  const fallbackWhy = type === '5/2 SS'
+    ? 'Spring return to home on power or air loss.'
+    : type === '5/2 DS'
+      ? 'Holds last position when power drops.'
+      : 'Default-off — pulses on demand.'
+  return {
+    type,
+    why:  info.best_use || fallbackWhy,
+    notes: info.plain_explanation || '',
   }
-  if (actuation === 'double_acting') {
-    // 2026-10-02 operator directive (hold-on-loss default): on no
-    // answer we recommend 5/2 DS so doing nothing yields the
-    // "part won't drop" valve class. The operator can still pick
-    // "No" at the actuator card to flip to 5/2 SS.
-    if (holdOnLoss === false) {
-      const info = VALVE_TYPE_INFO['5/2 SS'] || {}
-      return {
-        type: '5/2 SS',
-        why:  info.best_use || 'Spring return to home on power or air loss.',
-        notes: info.plain_explanation || '',
-      }
-    }
-    const info = VALVE_TYPE_INFO['5/2 DS'] || {}
-    return {
-      type: '5/2 DS',
-      why:  info.best_use || 'Holds last position when power drops.',
-      notes: info.plain_explanation || '',
-    }
-  }
-  if (actuation === 'vacuum' || actuation === 'blow_off') {
-    // Same valve class — default-off, pulses on command. Separate
-    // actuator TYPE so the record stays truthful (a blow-off is not
-    // a vacuum cup), but the valve recommendation collapses to the
-    // single physical choice.
-    const info = VALVE_TYPE_INFO['HI/LO 3/2 N/C'] || {}
-    return {
-      type: 'HI/LO 3/2 N/C',
-      why:  info.best_use || 'Default-off — pulses on demand.',
-      notes: info.plain_explanation || '',
-    }
-  }
-  return null
 }
 
 // Vacuum hold-on-loss is a HARDWARE property of the vacuum path, not

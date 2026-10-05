@@ -1526,33 +1526,37 @@ test('standard-path cell entry: vacuum records holds_on_loss=true + holds_via=ch
       + 'the standard:vacuum cell entry.'))
 })
 
-test('recommendValveType defaults to 5/2 DS on unanswered double_acting', () => {
-  // toolPortMap.js pulls VALVE_TYPE_INFO from pages/SynapsePage (JSX),
-  // which node:test cannot import without a loader. Pin the branch
-  // ordering via source grep instead so a regression (reversing the
-  // if-chain so unanswered goes to 5/2 SS) fails loudly.
-  const toolPortSrc = readSrc('lib/toolPortMap.js')
-  // The 'false' branch must come FIRST inside the double_acting
-  // block, and the fallthrough must land on 5/2 DS. Match the two
-  // adjacent return statements in order.
-  const dblBlock = toolPortSrc.match(
-    /if \(actuation === 'double_acting'\)[\s\S]*?\n  \}/)
-  assert.ok(dblBlock,
-    v('recommendValveType must declare a double_acting block.'))
-  assert.ok(
-    /holdOnLoss === false[\s\S]*?type:\s*'5\/2 SS'/.test(dblBlock[0]),
-    v('double_acting block must handle holdOnLoss === false FIRST '
-      + 'and return 5/2 SS (explicit opt-out).'))
-  assert.ok(/type:\s*'5\/2 DS'/.test(dblBlock[0]),
-    v('double_acting block must fall through to 5/2 DS as the '
-      + 'default — "default-yields-DS" pin per 2026-10-02.'))
-  // The fall-through order: once the explicit-false branch is first,
-  // every other value (undefined/null/true) lands on 5/2 DS.
-  const dsIdx = dblBlock[0].indexOf("'5/2 DS'")
-  const ssIdx = dblBlock[0].indexOf("'5/2 SS'")
-  assert.ok(dsIdx > ssIdx && ssIdx !== -1,
-    v('5/2 SS branch must appear BEFORE 5/2 DS fallthrough so the '
-      + 'default lands on DS when no explicit false is given.'))
+test('recommendValveType defaults to 5/2 DS on unanswered double_acting', async () => {
+  // 2026-10-05 unification: both wizards' recommendValveType routes
+  // through the shared valveMapping.valveTypeForActuation. Pin the
+  // behavior directly on the shared resolver (pure .js, no JSX
+  // loader needed) instead of the old if-chain source grep.
+  const { valveTypeForActuation } = await import(
+    '../../src/lib/valveMapping.js')
+  // Explicit false → SS (operator opted out of hold).
+  assert.equal(
+    valveTypeForActuation({ actuation: 'double_acting', holdOnLoss: false }),
+    '5/2 SS',
+    v('double_acting + holdOnLoss=false must resolve to 5/2 SS '
+      + '(spring returns home on power loss — operator opt-out).'))
+  // Explicit true → DS (holds last state).
+  assert.equal(
+    valveTypeForActuation({ actuation: 'double_acting', holdOnLoss: true }),
+    '5/2 DS',
+    v('double_acting + holdOnLoss=true must resolve to 5/2 DS '
+      + '(holds last state on power loss — the operator asked to '
+      + 'stay clamped).'))
+  // Default (null / undefined) → DS (2026-10-02 directive: no answer
+  // yields the part-wont-drop valve class).
+  assert.equal(
+    valveTypeForActuation({ actuation: 'double_acting', holdOnLoss: null }),
+    '5/2 DS',
+    v('double_acting + no answer must default to 5/2 DS so a '
+      + 'half-filled wizard record still asks for the holding valve.'))
+  assert.equal(
+    valveTypeForActuation({ actuation: 'double_acting' }),
+    '5/2 DS',
+    v('double_acting + undefined holdOnLoss must default to 5/2 DS.'))
 })
 
 test('vacuumHoldMetadata records holds_via distinct from valve-class holding', () => {

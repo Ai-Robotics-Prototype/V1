@@ -10,6 +10,21 @@
 //     / .out) so we never double-assign a port.
 //   * The wizard NEVER emits IO writes; assignments are guidance
 //     only until the operator wires and confirms.
+//
+// 2026-10-05 operator directive (stay-clamped on loss → DS valve):
+//   * Valve TYPE resolution now routes through the shared
+//     ../lib/valveMapping.valveTypeForActuation so the fixture
+//     wizard and the EOAT wizard can never diverge on the safety-
+//     relevant hold-on-loss → DS/SS mapping.
+//   * Allocation is TYPE-AWARE via allocateValveForType — a 5/2 DS
+//     requirement never lands on an SS-only slot. Prefers a free
+//     slot whose declared type EQUALS the requirement (e.g. V09
+//     for DS), falls back to SPARE 1/2 (operator wires matching
+//     valve there), refuses when neither is free.
+
+import {
+  valveTypeForActuation, allocateValveForType, slotAcceptsType,
+} from './valveMapping.js'
 
 // Valve-explainer copy — the SAME plain-language strings the Synapse
 // page's ValveInfoPanel shows, kept here as a small local subset so
@@ -30,6 +45,10 @@ const _VALVE_TYPE_WHY = Object.freeze({
     'Default off. The valve pulses only when the program commands '
     + 'it — perfect for on-demand air like a blow-off or ejector.',
 })
+
+// Re-export for consumers that want to introspect slot acceptance
+// (D-level pin tests + any UI widget that wants to flag a mismatch).
+export { slotAcceptsType }
 
 // ── Device types ────────────────────────────────────────────────────
 //
@@ -165,6 +184,10 @@ export const FIXTURE_TYPE_KEYS = Object.freeze(
 //                (string) per the record schema at the bottom of this
 //                file.
 
+// SPARE_VALVES retained only as a historical fallback for callers
+// that compute "no spare slots left" prose; actual allocation now
+// routes through valveMapping.allocateValveForType which considers
+// EVERY slot and selects by matching type → SPARE fallback.
 const SPARE_VALVES = Object.freeze(['V05', 'V10'])
 const ALL_INPUTS   = Object.freeze(
   Array.from({ length: 10 }, (_, i) => `IN${String(i + 1).padStart(2, '0')}`))
@@ -209,6 +232,7 @@ export function claimedOutputIds(tools, fixtures) {
 
 export function allocateFixturePorts({
   needsValve = false, needsOut = false, needsIn = false,
+  valveType = null,
   tools = [], fixtures = [],
 } = {}) {
   const cValve = claimedValveIds(tools, fixtures)
@@ -216,7 +240,11 @@ export function allocateFixturePorts({
   const cOut   = claimedOutputIds(tools, fixtures)
   const out = {}
   if (needsValve) {
-    out.valve = SPARE_VALVES.find((v) => !cValve.has(v)) || null
+    // Type-aware allocation (2026-10-05 directive): a fixture that
+    // needs 5/2 DS must land on a slot whose declared type is 5/2 DS
+    // (or SPARE as the operator-wired fallback). Never on an SS-only
+    // slot — that silently dumps clamped parts on power loss.
+    out.valve = allocateValveForType(valveType, cValve)
   }
   if (needsOut) {
     out.out = ALL_OUTPUTS.find((o) => !cOut.has(o)) || null
@@ -236,21 +264,9 @@ export function allocateFixturePorts({
 // as on the Synapse page.
 
 export function recommendValveType({ actuation, holdOnLoss }) {
-  if (actuation === 'blow_off') {
-    return { type: 'HI/LO 3/2 N/C', why: _VALVE_TYPE_WHY['HI/LO 3/2 N/C'] }
-  }
-  if (actuation === 'double') {
-    if (holdOnLoss === true) {
-      return { type: '5/2 DS', why: _VALVE_TYPE_WHY['5/2 DS'] }
-    }
-    if (holdOnLoss === false) {
-      return { type: '5/2 SS', why: _VALVE_TYPE_WHY['5/2 SS'] }
-    }
-  }
-  if (actuation === 'single') {
-    return { type: '5/2 SS', why: _VALVE_TYPE_WHY['5/2 SS'] }
-  }
-  return null
+  const type = valveTypeForActuation({ actuation, holdOnLoss })
+  if (!type) return null
+  return { type, why: _VALVE_TYPE_WHY[type] || '' }
 }
 
 // ── Compile answers → fixture record ────────────────────────────────
@@ -296,7 +312,12 @@ export function compileFixtureRecord(answers, { tools = [], fixtures = [] } = {}
                   || (power === 'own_controller' && answers.wants_done === true)
 
   const alloc = allocateFixturePorts({
-    needsValve, needsOut, needsIn, tools, fixtures,
+    needsValve, needsOut, needsIn,
+    // Thread the recommended valve type into allocation so the
+    // chosen slot can actually carry it (safety: a DS requirement
+    // cannot land on an SS slot).
+    valveType: rec ? rec.type : null,
+    tools, fixtures,
   })
 
   return {

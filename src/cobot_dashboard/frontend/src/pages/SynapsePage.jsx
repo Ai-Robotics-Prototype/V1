@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
 import IOPortMap from '../components/IOPortMap'
 import MyCellSection from '../components/MyCellSection'
+import { VALVE_SLOTS as _VALVE_SLOTS } from '../lib/valveMapping'
 
 // Synapse — Connection Map (2026-09-21 operator directive).
 //
@@ -147,18 +148,10 @@ export const VALVE_TYPE_INFO = {
 // slot. Every valve entry ends up with { id, label, type, title,
 // plain_explanation, best_use } — the data-completeness pin asserts
 // non-empty explanation + best_use on every entry.
-const _VALVE_SLOTS = [
-  { id: 'V01', label: 'Valve 01', type: '5/2 SS' },
-  { id: 'V02', label: 'Valve 02', type: '5/2 SS' },
-  { id: 'V03', label: 'Valve 03', type: 'HI/LO 3/2 N/C' },
-  { id: 'V04', label: 'Valve 04', type: 'HI/LO 2/2 N/C' },
-  { id: 'V05', label: 'Valve 05', type: 'SPARE 1' },
-  { id: 'V06', label: 'Valve 06', type: '5/3' },
-  { id: 'V07', label: 'Valve 07', type: 'HI/LO 3/2 N/O' },
-  { id: 'V08', label: 'Valve 08', type: 'HI/LO 3/2 N/C' },
-  { id: 'V09', label: 'Valve 09', type: '5/2 DS' },
-  { id: 'V10', label: 'Valve 10', type: 'SPARE 2' },
-]
+// _VALVE_SLOTS is imported above from ../lib/valveMapping so the
+// lib-level allocator can read the registry without a JSX import.
+// VALVES stays as the UI-decorated projection (slot + its
+// VALVE_TYPE_INFO copy fields merged in).
 
 export const VALVES = _VALVE_SLOTS.map((v) => ({
   ...v,

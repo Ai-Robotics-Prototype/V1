@@ -67,33 +67,39 @@ test('App.jsx routes activeTab="synapse" to <SynapsePage />', () => {
 // ── (2) Section counts + (3) labels match the data ──────────────────
 
 test('SynapsePage defines 10 valve slots + 8 valve-type entries', () => {
-  // 2026-09-21 valve-info directive: valve rows now live on
-  // `_VALVE_SLOTS` (id/label/type triples) and derive final
-  // `VALVES` by merging in the per-type copy from
-  // `VALVE_TYPE_INFO`. Pin both.
-  const slots = pageSrc.match(/const _VALVE_SLOTS = \[([\s\S]*?)\]/)
-  assert.ok(slots, v('_VALVE_SLOTS array not found'))
+  // 2026-10-05 directive: VALVE_SLOTS registry moved into
+  // ../lib/valveMapping so lib-level allocation can read it without
+  // a JSX import. SynapsePage re-exports via import-as. Pin BOTH the
+  // registry's location AND the SynapsePage derivation of VALVES.
+  const mappingSrc = readSrc('lib/valveMapping.js')
+  const slots = mappingSrc.match(/VALVE_SLOTS = Object\.freeze\(\[([\s\S]*?)\]\)/)
+  assert.ok(slots, v('VALVE_SLOTS array not found in lib/valveMapping.js'))
   const slotEntries = slots[1].match(/\{\s*id:/g) || []
   assert.equal(slotEntries.length, 10,
-    v(`_VALVE_SLOTS must have 10 entries — found ${slotEntries.length}. `
+    v(`VALVE_SLOTS must have 10 entries — found ${slotEntries.length}. `
       + `The mock's pneumatic section is 2 rows of 5.`))
-  // VALVES is derived; must be built via .map so id/label/type
-  // + title/plain_explanation/best_use all end up on each entry.
+  // SynapsePage pulls the registry in and projects VALVES by merging
+  // the per-type copy from VALVE_TYPE_INFO. Pin the shape.
+  assert.ok(
+    /from\s+['"]\.\.\/lib\/valveMapping['"]/.test(pageSrc),
+    v('SynapsePage must import VALVE_SLOTS from ../lib/valveMapping '
+      + '— the lib owns the registry so allocation can read it.'))
   assert.ok(/const VALVES = _VALVE_SLOTS\.map/.test(pageSrc),
     v('VALVES must be `_VALVE_SLOTS.map((v) => ({ ...v, ...(VALVE_TYPE_INFO[v.type] || {}) }))` '
       + 'so per-type copy attaches without duplicating slot data.'))
 })
 
 test('VALVES types match the mock exactly', () => {
-  // Byte-pinned type strings — mock's exact table.
+  // Byte-pinned type strings — mock's exact table. Registry lives
+  // in lib/valveMapping now (2026-10-05); grep there.
+  const mappingSrc = readSrc('lib/valveMapping.js')
   for (const expected of [
     '5/2 SS', 'HI/LO 3/2 N/C', 'HI/LO 2/2 N/C', 'SPARE 1',
     '5/3', 'HI/LO 3/2 N/O', '5/2 DS', 'SPARE 2',
   ]) {
-    // Escape / for regex.
     const esc = expected.replace(/[/]/g, '\\/')
-    assert.ok(new RegExp(`type:\\s*['"]${esc}['"]`).test(pageSrc),
-      v(`VALVES must include type="${expected}" — mock exact match.`))
+    assert.ok(new RegExp(`type:\\s*['"]${esc}['"]`).test(mappingSrc),
+      v(`VALVE_SLOTS must include type="${expected}" — mock exact match.`))
   }
 })
 
@@ -1136,10 +1142,19 @@ test('actuator-count-drives-n-valves: resolveCustomEOATRecord assigns one SPARE 
               .test(portMapSrc),
     v('required_valves must be built from resolvedActuators.map(a => a.valve) '
       + '— the N-valve union with no silent drops.'))
-  // 4) spareCursor advances per allocation — no two actuators share a slot.
-  assert.ok(/freeSpares\[spareCursor\+\+\]/.test(portMapSrc),
-    v('Per-actuator allocation must cursor through freeSpares so each '
-      + 'actuator claims a DIFFERENT free SPARE.'))
+  // 4) Per-actuator allocation routes through the shared
+  //    valveMapping.allocateValveForType (2026-10-05 type-aware
+  //    allocator) and extends a runningClaimed set per actuator so
+  //    two actuators in the same tool can't double-pick a slot.
+  assert.ok(/allocateValveForType\(rec\.type,\s*runningClaimed\)/
+              .test(portMapSrc),
+    v('Per-actuator allocation must call allocateValveForType('
+      + 'rec.type, runningClaimed) — the shared type-aware allocator '
+      + 'that NEVER lands a DS requirement on an SS-only slot.'))
+  assert.ok(/runningClaimed\.add\(valve\)/.test(portMapSrc),
+    v('Per-actuator allocation must extend runningClaimed with each '
+      + 'assigned valve so two actuators in the same tool cannot '
+      + 'both land on the same slot.'))
   // 5) assignedValveIds unions actuators[*].valve so a prior tool's
   //    multi-valve claim is visible to the next allocation.
   assert.ok(/if\s*\(Array\.isArray\(cfg\.actuators\)\)/.test(portMapSrc),
