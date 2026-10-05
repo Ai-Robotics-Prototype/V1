@@ -238,12 +238,17 @@ test('displayNameForSynapse: pure string formatter', () => {
 // Synapse display helpers.
 
 test('program-editor detailLine routes io_id through the Synapse map', () => {
-  // The helper now accepts a third arg and renders through
-  // displayNameForRaw when the portmap is present.
-  assert.ok(/function\s+detailLine\(step,\s*ioLabels,\s*synapsePortmap\)/
-              .test(progEdSrc),
-    v('detailLine must accept (step, ioLabels, synapsePortmap) — '
-      + 'the Synapse portmap is the third arg per the directive.'))
+  // 2026-10-05 cell-rebind: detailLine grew two trailing args
+  // (program, cell) so cell-bound steps can prefer the cell's
+  // current valve over the stored raw io_id reverse-lookup. The
+  // portmap is still the third arg; the two new args are optional
+  // (legacy callers passing only three still work via the raw
+  // reverse-lookup path).
+  assert.ok(
+    /function\s+detailLine\(step,\s*ioLabels,\s*synapsePortmap[^)]*\)/
+      .test(progEdSrc),
+    v('detailLine must accept (step, ioLabels, synapsePortmap, ...) '
+      + '— the Synapse portmap is the third arg per the directive.'))
   assert.ok(/displayNameForRaw\(synapsePortmap,\s*id\)/.test(progEdSrc),
     v('detailLine ioName helper must call displayNameForRaw so raw '
       + 'io_ids render as Synapse names in the operator detail line.'))

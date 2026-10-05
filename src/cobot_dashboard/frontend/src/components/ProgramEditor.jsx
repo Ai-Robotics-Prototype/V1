@@ -17,6 +17,9 @@ import { useIOPortmap, portmapLabels, portmapToOptions }
   from '../lib/ioPortmap'
 import { useSynapsePortmap, displayNameForRaw }
   from '../lib/synapsePortmap'
+import { displayIoForStep, rebindProgramToCell, stepsNeedingRebind }
+  from '../lib/programCellRebind'
+import { getCell } from '../lib/cellStore'
 import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
          palletFrameStatus, firstUntaughtPalletRole, PALLET_ROLE_ORDER,
          TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove }
@@ -381,18 +384,34 @@ function actionFor(step) {
 // Raw position data (taught_joints, taught_tcp, joints, position) is
 // intentionally NOT included here — that lives in the collapsible
 // "position data" block triggered by the "View position data" link.
-function detailLine(step, ioLabels, synapsePortmap) {
+function detailLine(step, ioLabels, synapsePortmap, program, cell) {
   // 2026-10-01 Synapse Addressing Doctrine: operator-facing step
   // detail renders Synapse names ("Valve 03", "IN 06"), with the
   // operator-assigned nickname appended when present. Raw channel
   // ids survive only in the diagnostic/exception surfaces (the
   // Main Internal Robot Controller I/O panel). Unmapped raw
   // channels render as "Unmapped channel DOx" via displayNameForRaw.
-  const ioName = (id) => {
+  //
+  // 2026-10-05 cell-rebind: when the program is cell-bound AND the
+  // step plays a cell-eoat role (vacuum / magnet / blow_off), the
+  // row prefers the CELL's current valve over the stored raw io_id.
+  // This is the "displayed-port == cell-assigned-port" invariant —
+  // legacy programs whose stored io_id predates the cell binding
+  // (e.g. DO2 baked in at author time) render the cell's current
+  // assignment (e.g. "Valve 03") instead of the honest-but-stale
+  // reverse-lookup. The io_id itself is rewritten to agree with the
+  // display at program-load time by rebindProgramToCell, so wire
+  // follows display on the next save.
+  const ioName = (id, _step) => {
     if (!id) return id
-    const syn = synapsePortmap
-      ? displayNameForRaw(synapsePortmap, id)
-      : id
+    // Prefer the cell-rebound display when the step carries a role
+    // the rebinder knows about + the program is cell-bound.
+    const resolved = _step
+      ? displayIoForStep(_step, program, cell, synapsePortmap)
+      : null
+    const syn = resolved
+      ? resolved.display
+      : (synapsePortmap ? displayNameForRaw(synapsePortmap, id) : id)
     const lab = ioLabels && ioLabels[id]
     return lab ? `${syn} — ${lab}` : syn
   }
@@ -412,11 +431,11 @@ function detailLine(step, ioLabels, synapsePortmap) {
     bits.push('z' + (step.offset_z_mm >= 0 ? '+' : '') + step.offset_z_mm + 'mm')
   }
   if (step.speed_pct)   bits.push(step.speed_pct + '%')
-  if (step.io_id)       bits.push(ioName(step.io_id) + '=' + (step.value ? 'ON' : 'OFF'))
-  if (step.io_open)         bits.push('open→' + ioName(step.io_open))
-  if (step.io_open_confirm) bits.push('verify ' + ioName(step.io_open_confirm))
-  if (step.io_close)        bits.push('close→' + ioName(step.io_close))
-  if (step.io_close_confirm) bits.push('verify ' + ioName(step.io_close_confirm))
+  if (step.io_id)       bits.push(ioName(step.io_id, step) + '=' + (step.value ? 'ON' : 'OFF'))
+  if (step.io_open)         bits.push('open→' + ioName(step.io_open, step))
+  if (step.io_open_confirm) bits.push('verify ' + ioName(step.io_open_confirm, step))
+  if (step.io_close)        bits.push('close→' + ioName(step.io_close, step))
+  if (step.io_close_confirm) bits.push('verify ' + ioName(step.io_close_confirm, step))
   if (step.scan_height_mm)      bits.push('scan@' + step.scan_height_mm + 'mm')
   if (step.scan_speed_pct)      bits.push('scan ' + step.scan_speed_pct + '%')
   if (step.settle_time_ms)      bits.push('settle ' + step.settle_time_ms + 'ms')
@@ -3979,6 +3998,43 @@ export default function ProgramEditor() {
   // Synapse portmap for operator-facing name translation
   // (2026-10-01 Synapse Addressing Doctrine).
   const synapsePortmap     = useSynapsePortmap()
+  // Cell registry — used by detailLine to re-resolve a cell-bound
+  // step's io_id against the cell's CURRENT valve (2026-10-05 fix
+  // for legacy programs whose stored io_id predates the cell
+  // binding). Loaded once on mount; a cell edit while the editor is
+  // open re-triggers the migration via the effect below when the
+  // store updates.
+  const [cellRegistry, setCellRegistry] = useState(null)
+  useEffect(() => {
+    let alive = true
+    getCell().then((c) => { if (alive) setCellRegistry(c) })
+             .catch(() => {})
+    return () => { alive = false }
+  }, [])
+  // One-shot rebind per (program-id + cell + portmap) change. When
+  // the loaded program carries a cell_eoat_id AND some cell-role
+  // step's io_id disagrees with the cell's current valve, rewrite
+  // io_id to agree. The migration is deterministic + idempotent
+  // (see rebindProgramToCell doc). Marking unsaved:true kicks the
+  // debounced edit-through so the wire follows display on the next
+  // tick without the operator having to notice. The _rebindFiredRef
+  // keyed by `pid:cellRev:portmapRev` ensures we don't re-trigger
+  // on every subsequent patch of the SAME program.
+  const _rebindFiredRef = useRef('')
+  useEffect(() => {
+    if (!currentProgram?.id) return
+    if (!cellRegistry) return
+    if (!synapsePortmap) return
+    const key = `${currentProgram.id}:${cellRegistry?.meta?.rev ?? ''}`
+                + `:${synapsePortmap?.rev ?? ''}`
+    if (_rebindFiredRef.current === key) return
+    _rebindFiredRef.current = key
+    const rebound = rebindProgramToCell(
+      currentProgram, cellRegistry, synapsePortmap)
+    if (rebound === currentProgram) return
+    setCurrentProgram({ steps: rebound.steps, unsaved: true })
+  }, [currentProgram?.id, cellRegistry, synapsePortmap,
+      currentProgram, setCurrentProgram])
 
   // Editor identity / steps / unsaved all live in the store now so a
   // tab swap unmount-and-remount doesn't reset them.
@@ -6388,7 +6444,8 @@ export default function ProgramEditor() {
                     fontSize: 13, color: '#6b7280',
                     wordBreak: 'break-word', whiteSpace: 'normal',
                   }}>
-                    {detailLine(step, ioLabels, synapsePortmap)}
+                    {detailLine(step, ioLabels, synapsePortmap,
+                                currentProgram, cellRegistry)}
                   </span>
                   {isTeachable(step, currentProgram) && hasPositionData(step) && (() => {
                     const open = openPosData.has(step.id)

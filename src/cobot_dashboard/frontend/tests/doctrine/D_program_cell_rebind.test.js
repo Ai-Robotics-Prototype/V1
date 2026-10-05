@@ -1,0 +1,306 @@
+// DOCTRINE — Program ↔ cell rebind (2026-10-05 operator directive).
+//
+// Field bug: a vacuum program created BEFORE 7052786 (the "wizard
+// emits cell-sourced io_ids" fix) still carries hardcoded io_id='DO2'
+// baked in by the pre-fix wizard's effectorVocab default. detailLine
+// honestly reverse-looks-up DO2 → "Valve 02" via the portmap — the
+// portmap display is correct per the panel wiring — but the program
+// is bound to a cell whose vacuum EOAT lives on V03, so the row
+// disagrees with the cell AND the executor fires the wrong wire.
+//
+// Fix shape — lib/programCellRebind.js owns the two helpers:
+//
+//   displayIoForStep(step, program, cell, portmap)
+//     → returns the Synapse display, preferring the cell's current
+//       valve when the step plays a cell-eoat role AND the program
+//       is cell-bound. source='cell' | 'legacy'. Used by detailLine
+//       so the editor shows "Valve 03" against a V03-vacuum cell
+//       even when the stored io_id is DO2.
+//
+//   rebindProgramToCell(program, cell, portmap)
+//     → pure, deterministic, idempotent. Walks the program's steps
+//       and rewrites io_id to match the cell's current valve for
+//       every cell-role step. Returns the SAME object reference
+//       when nothing changed (caller skips the store write).
+//
+// Pins:
+//   1. Shared module exports displayIoForStep + rebindProgramToCell
+//      + stepsNeedingRebind.
+//   2. ProgramEditor imports from the shared module (import-identity).
+//   3. detailLine takes program + cell as trailing args + threads
+//      the step into ioName so cell-role resolution kicks in.
+//   4. ProgramEditor loads the cell + runs rebindProgramToCell on
+//      program-id change (one-shot via _rebindFiredRef).
+//   5. Behavior: legacy program with io_id='DO2' + cell vacuum V03
+//      → displayIoForStep returns 'Valve 03' (cell source).
+//   6. Behavior: rebindProgramToCell rewrites that step's io_id to
+//      'DO3'; the migrated program is === itself on the second
+//      pass (idempotent).
+//   7. Behavior: step with no io_role and no cell binding is left
+//      verbatim (no silent invention).
+//   8. Behavior: unmapped channel still renders honest copy via
+//      displayNameForRaw fallthrough.
+//
+// Failure format:
+//   DOCTRINE PROGRAM_CELL_REBIND VIOLATED: <detail>
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname  = dirname(__filename)
+const FRONT_ROOT = join(__dirname, '..', '..')
+const readSrc = (rel) => readFileSync(join(FRONT_ROOT, 'src', rel), 'utf8')
+
+function v(msg) { return `DOCTRINE PROGRAM_CELL_REBIND VIOLATED: ${msg}` }
+
+const rebindSrc  = readSrc('lib/programCellRebind.js')
+const progEdSrc  = readSrc('components/ProgramEditor.jsx')
+
+
+// ── (1) Shared module exports ──────────────────────────────────────
+
+test('programCellRebind module exports displayIoForStep + rebindProgramToCell', () => {
+  for (const sym of [
+    'export function displayIoForStep',
+    'export function rebindProgramToCell',
+    'export function stepsNeedingRebind',
+  ]) {
+    assert.ok(rebindSrc.includes(sym),
+      v(`lib/programCellRebind.js must declare "${sym}" — the shared `
+        + 'cell-rebind helpers power both display + migration.'))
+  }
+  // Routes through the single-source portmap library.
+  assert.ok(/from\s+['"]\.\/synapsePortmap(?:\.js)?['"]/.test(rebindSrc),
+    v('programCellRebind must import from ./synapsePortmap — one '
+      + 'translator for every surface.'))
+})
+
+
+// ── (2) ProgramEditor import-identity ──────────────────────────────
+
+test('ProgramEditor imports from programCellRebind + cellStore', () => {
+  assert.ok(
+    /from\s+['"]\.\.\/lib\/programCellRebind['"]/.test(progEdSrc),
+    v('ProgramEditor.jsx must import from ../lib/programCellRebind — '
+      + 'detailLine + the open-time migration both route through the '
+      + 'shared helpers.'))
+  assert.ok(
+    /from\s+['"]\.\.\/lib\/cellStore['"]/.test(progEdSrc),
+    v('ProgramEditor.jsx must import from ../lib/cellStore — the '
+      + 'editor loads the cell registry so rebind has something to '
+      + 'resolve against.'))
+})
+
+
+// ── (3) detailLine accepts program + cell for cell-rebind ──────────
+
+test('detailLine threads step + program + cell into ioName', () => {
+  // Signature: (step, ioLabels, synapsePortmap, program, cell).
+  assert.ok(
+    /function\s+detailLine\(step,\s*ioLabels,\s*synapsePortmap,\s*program,\s*cell\)/
+      .test(progEdSrc),
+    v('detailLine must accept (step, ioLabels, synapsePortmap, '
+      + 'program, cell) — the two trailing args carry the cell-'
+      + 'rebind context.'))
+  // ioName must call displayIoForStep when a step is passed through.
+  assert.ok(/displayIoForStep\(_step,\s*program,\s*cell,\s*synapsePortmap\)/
+              .test(progEdSrc),
+    v('detailLine.ioName must call displayIoForStep(step, program, '
+      + 'cell, portmap) so cell-role steps prefer the cell\'s '
+      + 'current valve over the stored raw io_id reverse.'))
+  // The call site passes currentProgram + cellRegistry.
+  assert.ok(
+    /detailLine\(step,\s*ioLabels,\s*synapsePortmap,\s*\n?\s*currentProgram,\s*cellRegistry\)/
+      .test(progEdSrc),
+    v('ProgramEditor must call detailLine(step, ioLabels, portmap, '
+      + 'currentProgram, cellRegistry) at the step-row render.'))
+})
+
+
+// ── (4) Open-time rebind migration ─────────────────────────────────
+
+test('ProgramEditor runs rebindProgramToCell on program-id change', () => {
+  assert.ok(/rebindProgramToCell\(/.test(progEdSrc),
+    v('ProgramEditor must call rebindProgramToCell(program, cell, '
+      + 'portmap) in a useEffect — the open-time migration brings '
+      + 'wire into agreement with display for legacy programs.'))
+  // Guarded by a ref so repeat renders don't re-fire.
+  assert.ok(/_rebindFiredRef/.test(progEdSrc),
+    v('ProgramEditor must guard the rebind effect with '
+      + '_rebindFiredRef so it fires once per program+cell key — '
+      + 'the migration is idempotent but the setCurrentProgram '
+      + 'patch is a store write worth skipping.'))
+  // Migration marks unsaved so the debounced edit-through fires.
+  assert.ok(/setCurrentProgram\(\{\s*steps:\s*rebound\.steps,\s*unsaved:\s*true\s*\}\)/
+              .test(progEdSrc),
+    v('Rebind migration must set unsaved:true so the debounced '
+      + 'edit-through writes the patched io_ids back to the draft '
+      + '— wire follows display on the next tick.'))
+})
+
+
+// ── (5) displayIoForStep: cell overrides raw ───────────────────────
+
+test('displayIoForStep: cell-bound vacuum step shows Valve 03 for V03 tool', async () => {
+  const { displayIoForStep }
+    = await import('../../src/lib/programCellRebind.js')
+  const { _primeCacheForTests, canonSynapse }
+    = await import('../../src/lib/synapsePortmap.js')
+  const seed = {
+    version: 1,
+    rows: Array.from({ length: 10 }, (_, i) => ({
+      synapse: `V${String(i + 1).padStart(2, '0')}`,
+      kind: 'valve', raw: `DO${i + 1}`, verified: false,
+    })),
+  }
+  _primeCacheForTests(seed)
+  // Legacy step: stored io_id='DO2' (the pre-fix wizard default).
+  const legacyStep = {
+    action: 'set_io', label: 'Engage vacuum',
+    io_id: 'DO2', value: 1, io_role: 'vacuum',
+  }
+  // Program is cell-bound to a vacuum EOAT whose current valve is V03.
+  const program = { id: 'legacy-prog', config: { cell_eoat_id: 'eoat-A' } }
+  const cell = { eoats: [{ id: 'eoat-A', valve: 'V03',
+                           inputs: [], outputs: [] }] }
+  const res = displayIoForStep(legacyStep, program, cell, seed)
+  assert.equal(res.source, 'cell',
+    v('A cell-bound vacuum step must resolve its display via the '
+      + "cell's current valve — source='cell'."))
+  assert.equal(res.raw, 'DO3',
+    v(`Cell-bound display must return the cell's current raw channel `
+      + `(DO3 for V03). Got raw=${res.raw}.`))
+  assert.equal(res.display, 'Valve 03',
+    v('Cell-bound display must render "Valve 03" for a V03 vacuum '
+      + 'tool — the operator-facing name must agree with the cell.'))
+  // Legacy fallthrough: step with no io_role still reverses the
+  // stored raw channel honestly through the portmap.
+  const noRoleStep = {
+    action: 'set_io', label: 'Hand-added set DO',
+    io_id: 'DO5', value: 1,
+  }
+  const res2 = displayIoForStep(noRoleStep, program, cell, seed)
+  assert.equal(res2.source, 'legacy',
+    v("No-role step must fall through to source='legacy' — the "
+      + 'honest raw reverse-lookup.'))
+  assert.equal(res2.raw, 'DO5',
+    v('Legacy source must return the stored io_id verbatim.'))
+})
+
+
+// ── (6) rebindProgramToCell: writes io_id + idempotent ─────────────
+
+test('rebindProgramToCell rewrites legacy vacuum io_id + is idempotent', async () => {
+  const { rebindProgramToCell, stepsNeedingRebind }
+    = await import('../../src/lib/programCellRebind.js')
+  const { _primeCacheForTests }
+    = await import('../../src/lib/synapsePortmap.js')
+  const seed = {
+    version: 1,
+    rows: Array.from({ length: 10 }, (_, i) => ({
+      synapse: `V${String(i + 1).padStart(2, '0')}`,
+      kind: 'valve', raw: `DO${i + 1}`, verified: false,
+    })),
+  }
+  _primeCacheForTests(seed)
+  const legacyProgram = {
+    id: 'p1',
+    config: { cell_eoat_id: 'eoat-A' },
+    steps: [
+      { action: 'move_home', label: 'Home' },
+      { action: 'set_io', label: 'Vacuum off (ready)',
+        io_id: 'DO2', value: 0, io_role: 'vacuum' },
+      { action: 'set_io', label: 'Engage vacuum',
+        io_id: 'DO2', value: 1, io_role: 'vacuum' },
+      { action: 'set_io', label: 'Disengage vacuum',
+        io_id: 'DO2', value: 0, io_role: 'vacuum' },
+      { action: 'set_io', label: 'Hand-authored set',
+        io_id: 'DO7', value: 1 },   // no io_role → left alone
+    ],
+  }
+  const cell = { eoats: [{ id: 'eoat-A', valve: 'V03',
+                           inputs: [], outputs: [] }] }
+
+  // stepsNeedingRebind flags the three vacuum steps.
+  const needing = stepsNeedingRebind(legacyProgram, cell, seed)
+  assert.equal(needing.length, 3,
+    v(`stepsNeedingRebind must flag the 3 legacy vacuum steps — got `
+      + `${needing.length}.`))
+  assert.ok(needing.every((n) => n.stored === 'DO2' && n.cell === 'DO3'),
+    v('Every flagged step must report stored=DO2 + cell=DO3.'))
+
+  const rebound = rebindProgramToCell(legacyProgram, cell, seed)
+  assert.notEqual(rebound, legacyProgram,
+    v('rebindProgramToCell must return a NEW program object when '
+      + 'any io_id changed.'))
+  // All vacuum steps carry the cell's raw channel now.
+  for (const i of [1, 2, 3]) {
+    assert.equal(rebound.steps[i].io_id, 'DO3',
+      v(`Step ${i} must have io_id='DO3' after rebind — got `
+        + `'${rebound.steps[i].io_id}'.`))
+  }
+  // Hand-authored no-role step is left verbatim.
+  assert.equal(rebound.steps[4].io_id, 'DO7',
+    v('Hand-authored set_io without io_role must be left verbatim '
+      + '(no silent invention).'))
+  // move_home has no io_id at all — passes through.
+  assert.equal(rebound.steps[0].action, 'move_home')
+
+  // Idempotence: running rebind on the output of itself returns the
+  // SAME object reference (nothing to change).
+  const twice = rebindProgramToCell(rebound, cell, seed)
+  assert.equal(twice, rebound,
+    v('rebindProgramToCell must be idempotent — re-running on the '
+      + 'rebound output must return the same reference (no-op).'))
+  // And stepsNeedingRebind now reports zero.
+  assert.equal(stepsNeedingRebind(rebound, cell, seed).length, 0,
+    v('After rebind, stepsNeedingRebind must return [] (every '
+      + 'cell-role step agrees with the cell).'))
+})
+
+
+// ── (7) Non-cell programs + no cell_eoat_id → no changes ───────────
+
+test('rebindProgramToCell: no cell binding → identity (no mutation)', async () => {
+  const { rebindProgramToCell }
+    = await import('../../src/lib/programCellRebind.js')
+  const seed = {
+    version: 1,
+    rows: [{ synapse: 'V03', kind: 'valve', raw: 'DO3', verified: false }],
+  }
+  const prog = {
+    id: 'cell-less',
+    config: {},   // no cell_eoat_id
+    steps: [
+      { action: 'set_io', io_id: 'DO2', value: 1, io_role: 'vacuum' },
+    ],
+  }
+  const cell = { eoats: [] }
+  const out = rebindProgramToCell(prog, cell, seed)
+  assert.equal(out, prog,
+    v('A program with no cell_eoat_id must pass through rebind '
+      + 'unchanged — identity preserved so callers can skip the '
+      + 'store write.'))
+})
+
+
+// ── (8) Unmapped-channel honest copy still works ───────────────────
+
+test('displayIoForStep: unmapped channel falls back to honest copy', async () => {
+  const { displayIoForStep }
+    = await import('../../src/lib/programCellRebind.js')
+  const emptyPm = { version: 1, rows: [] }
+  const step = { action: 'set_io', io_id: 'DO9', value: 1 }
+  const res = displayIoForStep(step, { config: {} }, { eoats: [] },
+    emptyPm)
+  assert.equal(res.source, 'legacy',
+    v('No cell-role step must take the legacy branch.'))
+  assert.equal(res.display, 'Unmapped channel DO9',
+    v('Legacy branch must render the honest "Unmapped channel X" '
+      + 'copy via displayNameForRaw — never silently invent a '
+      + 'Synapse name.'))
+})
