@@ -8,6 +8,7 @@ import ToolFromCellStep from './ToolFromCellStep'
 import { QuestionCard } from './WizardStepCard'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { useSynapsePortmap, displayNameForRaw } from '../lib/synapsePortmap'
+import { getCell, findCellEoat } from '../lib/cellStore'
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
          clampWorkpiece, unclampWorkpiece,
@@ -2828,7 +2829,7 @@ function buildPalletConfig(answers) {
 // XYZ at runtime; pick / place taught TCPs (and their lift/approach
 // offsets) are baked into normal move_linear steps with absolute TCPs
 // since they're fixed once the operator records them.
-function buildPalletizeSteps(answers) {
+function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
   const spd = answers.speed || 40
   const slow = Math.min(spd, 30)
   const medium = Math.min(spd, 40)
@@ -2869,6 +2870,7 @@ function buildPalletizeSteps(answers) {
   const _vocabOpts = {
     spd, gripW, gripF, customActivate, customConfirm,
     withBlowOff: answers.blow_off_enabled !== false,
+    ..._cellVocabOpts(cellEoat, synapsePortmap),
   }
   const engageSteps = (labelOverride) =>
     effectorEngage({ effector: gripType }, { ..._vocabOpts, labelOverride })
@@ -2992,11 +2994,41 @@ function buildPalletizeSteps(answers) {
   return steps.map((s, i) => ({ ...s, step: i + 1 }))
 }
 
-function buildSteps(answers, portmap = null) {
+// Cell-sourced vocab options — resolves the picked EOAT entry's
+// Synapse valve/input assignments into the overrides that effector
+// Vocab.effectorReady/Engage/Disengage consult. When no cell entry
+// is bound (cold-boot flow / cell-less programs), returns an empty
+// options object so emitters fall back to their hardcoded defaults
+// (preserving every existing test's exact emission).
+//
+// 2026-10-05 field-bug fix: without this bridge, a wizard-authored
+// vacuum program emitted DO2 regardless of the operator's assigned
+// Synapse valve (field screenshot: cell says V03, step showed
+// Valve 02=ON). Now the picked entry's `valve` flows through to the
+// vacuum/magnet emitters and the row renderer (which already routes
+// via displayNameForRaw) renders "Valve 03" against a Valve-03 cell.
+function _cellVocabOpts(cellEoat, synapsePortmap) {
+  if (!cellEoat) return {}
+  const opts = { portmap: synapsePortmap || null }
+  if (cellEoat.valve) {
+    // Single-valve EOATs (vacuum, magnet, custom-tool-with-one-valve)
+    // all have one Synapse valve assignment on the entry. The emitter
+    // picks the right field by effector kind.
+    opts.vacuumValve = cellEoat.valve
+    opts.magnetValve = cellEoat.valve
+  }
+  opts.cellBinding = { eoat_id: cellEoat.id }
+  return opts
+}
+
+function buildSteps(answers, portmap = null,
+                    cellEoat = null, synapsePortmap = null) {
   // Pallet programs follow a totally different shape — their steps
   // come from buildPalletizeSteps so the editor and executor see the
   // move_to_pallet flow rather than the generic pick/place body.
-  if (answers.operation === 'palletize') return buildPalletizeSteps(answers)
+  if (answers.operation === 'palletize') {
+    return buildPalletizeSteps(answers, cellEoat, synapsePortmap)
+  }
 
   const steps = []
   const spd = answers.speed || 40
@@ -3029,6 +3061,7 @@ function buildSteps(answers, portmap = null) {
   const _vocabOpts = {
     spd, gripW, gripF, customActivate, customConfirm,
     withBlowOff: answers.blow_off_enabled !== false,
+    ..._cellVocabOpts(cellEoat, synapsePortmap),
   }
   const cfgEffector = { effector: answers.gripper_type }
 
@@ -3214,6 +3247,19 @@ export default function ProgramWizard({ onClose, onSaved }) {
   // steps land in the wizard's output only when the operator has
   // actually assigned the roles on the I/O page.
   const wizardPortmap = useIOPortmap()
+  const wizardSynapsePortmap = useSynapsePortmap()
+  // Cell registry (end-of-arm tools + fixtures). Loaded once on
+  // mount so buildSteps can resolve the picked cell_eoat_id to the
+  // operator's actual Synapse valve assignment — the fix for the
+  // 2026-10-05 "Valve 02 for Valve 03 tool" field bug (effectorVocab
+  // was hardcoding default DO2 regardless of the cell binding).
+  const [cellRegistry, setCellRegistry] = useState(null)
+  useEffect(() => {
+    let alive = true
+    getCell().then((c) => { if (alive) setCellRegistry(c) })
+             .catch(() => {})
+    return () => { alive = false }
+  }, [])
   const [pageIdx, setPageIdx] = useState(0)
   const [answers, setAnswers] = useState({
     // Silently-defaulted: the wizard no longer asks about speed or motion
@@ -3286,7 +3332,9 @@ export default function ProgramWizard({ onClose, onSaved }) {
     }
   }
 
-  const builtSteps = buildSteps(answers, wizardPortmap)
+  const builtCellEoat = findCellEoat(cellRegistry, answers.cell_eoat_id)
+  const builtSteps = buildSteps(
+    answers, wizardPortmap, builtCellEoat, wizardSynapsePortmap)
 
   const handleSave = async () => {
     setSaving(true)

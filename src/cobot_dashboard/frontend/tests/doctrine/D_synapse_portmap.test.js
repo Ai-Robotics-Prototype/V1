@@ -57,6 +57,7 @@ const eoatWizSrc    = readSrc('components/EOATSetupWizard.jsx')
 const fixWizSrc     = readSrc('components/ExternalFixtureWizard.jsx')
 const toolCellSrc   = readSrc('components/ToolFromCellStep.jsx')
 const cellDisplaySrc = readSrc('lib/cellEntryDisplay.js')
+const effectorSrc   = readSrc('lib/effectorVocab.js')
 const backendSrc    = readRepo(
   'src/cobot_dashboard/cobot_dashboard/dashboard_server.py')
 
@@ -420,6 +421,150 @@ test('typeLabel + entrySubtitle on a two-port record', async () => {
     type: 'vice', valve: 'V05', out: 'OUT02', in_done: 'IN07',
   }
   assert.equal(es(vice), 'Vice / Clamp · Valve 05 · OUT 02 · IN 07')
+})
+
+
+// ── (7) Program-editor step rows — cell-sourced IO correctness ─────
+//
+// 2026-10-05 operator field report (second screenshot): a vacuum
+// program whose cell EOAT is assigned Valve 03 rendered step rows
+// as "Valve 02=ON". detailLine was correctly routing DO2 through
+// displayNameForRaw to "Valve 02" — the bug was UPSTREAM: effector
+// Vocab emitters hardcoded `DO${V_DEFAULT_PORT}` = DO2 regardless
+// of the picked cell entry's valve. Fix: emitters accept Synapse
+// valve overrides (vacuumValve / magnetValve / blowOffValve) and
+// resolve via the shared portmap. ProgramWizard loads the cell
+// registry and passes the picked entry's valve into the vocab opts
+// via _cellVocabOpts(cellEoat, synapsePortmap).
+//
+// Pins:
+//   * effectorVocab exposes the cell-override hooks.
+//   * Wizard loads the cell + feeds the picked entry's valve into
+//     the vocab options.
+//   * Row renderers do not hardcode "Valve "/"DO"/"DI" prefixes in
+//     the step detail path — those strings MUST flow from the
+//     portmap helpers, not from a per-row template literal.
+//   * Displayed name ↔ emitted channel equivalence: a cell-sourced
+//     vacuum engage with vacuumValve='V03' emits io_id='DO3' which
+//     round-trips through displayNameForRaw to "Valve 03".
+
+test('effectorVocab accepts cell-sourced vacuum/magnet valve overrides', () => {
+  // The emitters must destructure vacuumValve / magnetValve /
+  // blowOffValve / cellBinding / portmap from opts so the wizard
+  // can feed cell-sourced assignments without touching the historic
+  // defaults that keep cold-boot tests deterministic.
+  for (const sym of [
+    'vacuumValve', 'magnetValve', 'blowOffValve',
+    'cellBinding', '_rawFromSynapseOrDefault',
+  ]) {
+    assert.ok(effectorSrc.includes(sym),
+      v(`effectorVocab must thread "${sym}" through the emitter opts `
+        + '— cell-sourced emission is the fix for the "Valve 02 on a '
+        + 'Valve 03 tool" field report.'))
+  }
+  // Blow-off collision guard: when blow-off resolves to the same raw
+  // channel as the vacuum valve, the triplet must NOT fire (would
+  // energize the vacuum valve during a "blow off" step on a cell
+  // where no distinct blow-off valve is assigned).
+  assert.ok(/blowOffRaw\s*!==\s*vacuumRaw/.test(effectorSrc),
+    v('effectorDisengage must skip the blow-off triplet when the '
+      + 'blow-off channel collides with the vacuum channel — '
+      + 'otherwise the "Blow off" step fires vacuum ON.'))
+})
+
+test('program-wizard loads the cell + feeds picked entry into vocab opts', () => {
+  assert.ok(/from\s+['"]\.\.\/lib\/cellStore['"]/.test(wizSrc),
+    v('ProgramWizard must import getCell / findCellEoat from '
+      + '../lib/cellStore so buildSteps can resolve the picked '
+      + 'cell_eoat_id.'))
+  assert.ok(/_cellVocabOpts\(/.test(wizSrc),
+    v('ProgramWizard must call _cellVocabOpts(cellEoat, synapsePortmap) '
+      + 'to derive the cell-sourced vacuum/magnet valve overrides.'))
+  assert.ok(/vacuumValve\s*=\s*cellEoat\.valve/.test(wizSrc)
+         || /opts\.vacuumValve\s*=\s*cellEoat\.valve/.test(wizSrc),
+    v('_cellVocabOpts must forward cellEoat.valve as vacuumValve so '
+      + 'the vacuum emitter fires the operator-assigned valve, not '
+      + 'the historical DO2 default.'))
+})
+
+test('pallet expansion preview routes IO details through displayNameForRaw', () => {
+  // The previous bug: substep details rendered as `DO${vacPort} = 1`
+  // (raw channel + bare integer value) which bypasses the portmap.
+  // Fix: route the IO prefix through _ioName (displayNameForRaw) and
+  // render ON/OFF rather than 1/0.
+  assert.ok(/function\s+PalletExpansionPreview\([^)]*synapsePortmap/
+              .test(progEdSrc),
+    v('PalletExpansionPreview must accept synapsePortmap so sub-step '
+      + 'IO details render Synapse names.'))
+  // No raw `DO${...}` template literal as a RENDERED detail — the
+  // fix uses `${_ioName(`DO${port}`)} = ON/OFF`, so the OUTER
+  // template string must call _ioName.
+  const palletBody = progEdSrc.slice(
+    progEdSrc.indexOf('function PalletExpansionPreview'),
+    progEdSrc.indexOf('function PalletExpansionPreview')
+      + 10000)
+  assert.equal(/detail:\s*`DO\$\{[a-zA-Z]+\}\s*=\s*[01]`/.test(palletBody),
+    false,
+    v('PalletExpansionPreview must not render raw `DO${n} = 0/1` as '
+      + 'sub-step detail — route through _ioName / displayNameForRaw '
+      + 'so operators see "Valve 03 = ON" against a Valve-03 tool.'))
+  assert.ok(/_ioName\(`DO\$\{[a-zA-Z]+\}`\)/.test(palletBody),
+    v('PalletExpansionPreview sub-step detail must call '
+      + '_ioName(`DO${port}`) to render through the portmap.'))
+})
+
+test('cell-sourced vacuum engage: emitted channel matches displayed name', async () => {
+  // Prime the portmap cache with the shipped seed so helpers resolve
+  // without a fetch. Then exercise the effector emitter + display
+  // helpers directly.
+  const {
+    effectorEngage: eng, effectorDisengage: dis,
+  } = await import('../../src/lib/effectorVocab.js')
+  const {
+    displayNameForRaw: disp, _primeCacheForTests: prime, rawForSynapse: raw,
+  } = await import('../../src/lib/synapsePortmap.js')
+  const seed = {
+    version: 1,
+    rows: Array.from({ length: 10 }, (_, i) => ({
+      synapse: `V${String(i + 1).padStart(2, '0')}`,
+      kind: 'valve', raw: `DO${i + 1}`, verified: false,
+    })),
+  }
+  prime(seed)
+  // Vacuum engage with vacuumValve='V03' (the operator's cell
+  // assignment per the standard-vacuum setup).
+  const steps = eng({ effector: 'vacuum' }, { vacuumValve: 'V03' })
+  const setIo = steps.find((s) => s.action === 'set_io')
+  assert.ok(setIo, v('effectorEngage(vacuum) must emit a set_io step.'))
+  // Emitted channel equals portmap-resolved raw for the cell valve.
+  assert.equal(setIo.io_id, raw(seed, 'V03'),
+    v(`emitted io_id (${setIo.io_id}) must equal rawForSynapse(V03) `
+      + `(${raw(seed, 'V03')}) — step fires the cell's assigned valve.`))
+  assert.equal(setIo.io_id, 'DO3',
+    v('vacuum engage against V03 must emit DO3 (not the hardcoded '
+      + 'DO2 default) — the field-reported bug.'))
+  // Displayed name round-trips to "Valve 03".
+  assert.equal(disp(seed, setIo.io_id), 'Valve 03',
+    v('displayNameForRaw(portmap, emitted io_id) must render '
+      + '"Valve 03" when the cell valve is V03.'))
+  // cell_binding threaded through so re-rendering sees the eoat id.
+  const bound = eng({ effector: 'vacuum' },
+    { vacuumValve: 'V03', cellBinding: { eoat_id: 'standard:vacuum' } })
+  const boundSetIo = bound.find((s) => s.action === 'set_io')
+  assert.deepEqual(boundSetIo.cell_binding,
+    { eoat_id: 'standard:vacuum' },
+    v('cellBinding must be attached to the emitted set_io step so a '
+      + 'future rebind flow can trace a step back to its cell entry.'))
+  // Blow-off collision guard: V03 vacuum with no distinct blow-off
+  // valve must NOT fire the hardcoded DO3 (= V03) during disengage.
+  const disSteps = dis({ effector: 'vacuum' },
+    { vacuumValve: 'V03', withBlowOff: true })
+  const blowSteps = disSteps.filter(
+    (s) => s.action === 'set_io' && s.io_role === 'blow_off')
+  assert.equal(blowSteps.length, 0,
+    v('When blow-off collides with the vacuum channel, the triplet '
+      + 'must be suppressed — the "Blow off" step would otherwise '
+      + 'fire vacuum ON mid-release.'))
 })
 
 

@@ -28,15 +28,58 @@
 // exact tokens the no-fork-truth guard flags. Any hardcoded use in
 // components/ or pages/ without importing this module fails CI.
 
-// Default IO ports — same values as program_composer.py's
-// _VACUUM_DEFAULT_PORT / _BLOWOFF_DEFAULT_PORT / _MAGNET_DEFAULT_PORT.
-// Operators can rewire via the I/O page (io_map.json); the backend
-// composer reads that file at compose time. The wizard emits the
-// defaults; the codegen path is the one that consults io_map.
+// Default IO ports — fallback ONLY when the caller does not pass a
+// cell-sourced Synapse valve id via opts.vacuumValve / opts.magnetValve
+// / opts.blowOffValve. Same values as program_composer.py's
+// _VACUUM_DEFAULT_PORT / _BLOWOFF_DEFAULT_PORT / _MAGNET_DEFAULT_PORT
+// so a cold-boot wizard (no cell entry yet) still emits deterministic
+// steps the backend composer agrees with.
+//
+// 2026-10-05 operator field report (vacuum program showed "Valve 02"
+// when the cell's vacuum EOAT is assigned to Valve 03): wizard
+// emitters now accept Synapse valve/input overrides derived from the
+// picked cell entry. When present, the emitter resolves raw channel
+// via the single-source portmap (rawForSynapse). Fallback to these
+// hardcoded defaults ONLY when no cell binding is provided.
 const V_DEFAULT_PORT = 2   // DO2 — vacuum
 const B_DEFAULT_PORT = 3   // DO3 — blow-off (must differ from V_PORT
                            //       for the disengage triplet)
 const M_DEFAULT_PORT = 3   // DO3 — magnet (single-DO effector)
+
+import { cachedPortmap, rawForSynapse } from './synapsePortmap.js'
+
+// Resolve a Synapse port id (e.g. 'V03') to the raw controller
+// channel (e.g. 'DO3') via the shared portmap. Returns `fallbackRaw`
+// when the Synapse id is null/empty or when portmap resolution
+// fails (unmapped id, cold boot before portmap fetch). The caller
+// supplies `fallbackRaw` so the historical hardcoded defaults still
+// apply for cell-less flows.
+function _rawFromSynapseOrDefault(synapseId, fallbackRaw, portmap) {
+  if (typeof synapseId !== 'string' || !synapseId) return fallbackRaw
+  const pm = portmap || cachedPortmap()
+  if (pm) {
+    const r = rawForSynapse(pm, synapseId)
+    if (r) return r
+  }
+  // Convention fallback — matches cellActions._rawFromPortmap so
+  // cell-sourced emission is deterministic even when the hook has
+  // not yet fetched the backend portmap (first-render case).
+  const v = synapseId.match(/^V(\d+)$/)
+  if (v) return `DO${Number(v[1])}`
+  const o = synapseId.match(/^OUT(\d+)$/)
+  if (o) return `DO${Number(o[1])}`
+  const i = synapseId.match(/^IN(\d+)$/)
+  if (i) return `DI${Number(i[1])}`
+  return fallbackRaw
+}
+
+// Attach cell_binding to a step record when the caller supplied one.
+// Keeps emitters pure when no cell is bound (existing tests + cold-
+// boot wizard flow unchanged).
+function _withBinding(step, cellBinding) {
+  if (!cellBinding) return step
+  return { ...step, cell_binding: cellBinding }
+}
 
 export const CANONICAL_EFFECTORS = ['finger', 'vacuum', 'magnetic', 'custom']
 
@@ -65,20 +108,30 @@ export function effectorDisplayName(cfg) {
 // READY at the start of the program (make sure effector is off/open).
 // Options carry per-flow tunings (speed, gripper width, custom port).
 export function effectorReady(cfg, opts = {}) {
-  const { spd = 60, gripW = 85, customActivate = 'DO3' } = opts
+  const { spd = 60, gripW = 85, customActivate = 'DO3',
+          vacuumValve = null, magnetValve = null,
+          cellBinding = null, portmap = null } = opts
   const e = effectorOf(cfg)
-  if (e === 'vacuum') return [{
-    action: 'set_io', label: 'Vacuum off (ready)',
-    io_id:  `DO${V_DEFAULT_PORT}`, value: 0, io_role: 'vacuum',
-  }]
-  if (e === 'magnetic') return [{
-    action: 'set_io', label: 'Magnet off (ready)',
-    io_id:  `DO${M_DEFAULT_PORT}`, value: 0, io_role: 'magnet',
-  }]
-  if (e === 'custom') return [{
+  if (e === 'vacuum') {
+    const io_id = _rawFromSynapseOrDefault(
+      vacuumValve, `DO${V_DEFAULT_PORT}`, portmap)
+    return [_withBinding({
+      action: 'set_io', label: 'Vacuum off (ready)',
+      io_id, value: 0, io_role: 'vacuum',
+    }, cellBinding)]
+  }
+  if (e === 'magnetic') {
+    const io_id = _rawFromSynapseOrDefault(
+      magnetValve, `DO${M_DEFAULT_PORT}`, portmap)
+    return [_withBinding({
+      action: 'set_io', label: 'Magnet off (ready)',
+      io_id, value: 0, io_role: 'magnet',
+    }, cellBinding)]
+  }
+  if (e === 'custom') return [_withBinding({
     action: 'set_io', label: 'Gripper off (ready)',
     io_id:  customActivate, value: 0,
-  }]
+  }, cellBinding)]
   return [{
     action:  'open_gripper', label: 'Open gripper',
     width_mm: gripW, speed_pct: spd,
@@ -102,27 +155,37 @@ export function effectorEngage(cfg, opts = {}) {
           // uses "Pick finished part" instead of "Grip part"). Only
           // the *label* changes; io + action are effector-driven.
           labelOverride = null,
-          customConfirm = null } = opts
+          customConfirm = null,
+          vacuumValve = null, magnetValve = null,
+          cellBinding = null, portmap = null } = opts
   const e = effectorOf(cfg)
-  if (e === 'vacuum') return [
-    { action: 'set_io',
-      label:  labelOverride || 'Engage vacuum',
-      io_id:  `DO${V_DEFAULT_PORT}`, value: 1, io_role: 'vacuum' },
-    { action: 'wait',
-      label:  'Wait for vacuum seal',
-      duration_s: 0.5 },
-  ]
-  if (e === 'magnetic') return [{
-    action: 'set_io',
-    label:  labelOverride || 'Engage magnet',
-    io_id:  `DO${M_DEFAULT_PORT}`, value: 1, io_role: 'magnet',
-  }]
-  if (e === 'custom') return [{
+  if (e === 'vacuum') {
+    const io_id = _rawFromSynapseOrDefault(
+      vacuumValve, `DO${V_DEFAULT_PORT}`, portmap)
+    return [
+      _withBinding({ action: 'set_io',
+        label:  labelOverride || 'Engage vacuum',
+        io_id, value: 1, io_role: 'vacuum' }, cellBinding),
+      { action: 'wait',
+        label:  'Wait for vacuum seal',
+        duration_s: 0.5 },
+    ]
+  }
+  if (e === 'magnetic') {
+    const io_id = _rawFromSynapseOrDefault(
+      magnetValve, `DO${M_DEFAULT_PORT}`, portmap)
+    return [_withBinding({
+      action: 'set_io',
+      label:  labelOverride || 'Engage magnet',
+      io_id, value: 1, io_role: 'magnet',
+    }, cellBinding)]
+  }
+  if (e === 'custom') return [_withBinding({
     action: 'set_io',
     label:  labelOverride || 'Gripper on',
     io_id:  customActivate, value: 1,
     ...(customConfirm ? { io_close_confirm: customConfirm } : {}),
-  }]
+  }, cellBinding)]
   return [{
     action: 'close_gripper',
     label:  labelOverride || 'Grip part',
@@ -135,37 +198,54 @@ export function effectorEngage(cfg, opts = {}) {
 // actively released; other effectors are single-step.
 export function effectorDisengage(cfg, opts = {}) {
   const { gripW = 85, customActivate = 'DO3',
-          withBlowOff = true, labelOverride = null } = opts
+          withBlowOff = true, labelOverride = null,
+          vacuumValve = null, blowOffValve = null,
+          magnetValve = null,
+          cellBinding = null, portmap = null } = opts
   const e = effectorOf(cfg)
   if (e === 'vacuum') {
-    const out = [{
+    const vacuumRaw = _rawFromSynapseOrDefault(
+      vacuumValve, `DO${V_DEFAULT_PORT}`, portmap)
+    const blowOffRaw = _rawFromSynapseOrDefault(
+      blowOffValve, `DO${B_DEFAULT_PORT}`, portmap)
+    const out = [_withBinding({
       action: 'set_io',
       label:  labelOverride || 'Disengage vacuum',
-      io_id:  `DO${V_DEFAULT_PORT}`, value: 0, io_role: 'vacuum',
-    }]
-    if (withBlowOff && B_DEFAULT_PORT !== V_DEFAULT_PORT) out.push(
-      { action: 'set_io',
+      io_id:  vacuumRaw, value: 0, io_role: 'vacuum',
+    }, cellBinding)]
+    // Only emit the blow-off triplet when the blow-off channel is
+    // DIFFERENT from the vacuum channel. On cell-sourced vacuum
+    // tools without a distinct blow-off valve the hardcoded default
+    // would collide with the vacuum valve and fire vacuum ON during
+    // the "blow off" step — skip the triplet in that case rather
+    // than emit a destructive side-effect.
+    if (withBlowOff && blowOffRaw && blowOffRaw !== vacuumRaw) out.push(
+      _withBinding({ action: 'set_io',
         label:  'Blow off',
-        io_id:  `DO${B_DEFAULT_PORT}`, value: 1, io_role: 'blow_off' },
+        io_id:  blowOffRaw, value: 1, io_role: 'blow_off' }, cellBinding),
       { action: 'wait',
         label:  'Wait for blow off',
         duration_s: 0.3 },
-      { action: 'set_io',
+      _withBinding({ action: 'set_io',
         label:  'Blow off stop',
-        io_id:  `DO${B_DEFAULT_PORT}`, value: 0, io_role: 'blow_off' },
+        io_id:  blowOffRaw, value: 0, io_role: 'blow_off' }, cellBinding),
     )
     return out
   }
-  if (e === 'magnetic') return [{
-    action: 'set_io',
-    label:  labelOverride || 'Disengage magnet',
-    io_id:  `DO${M_DEFAULT_PORT}`, value: 0, io_role: 'magnet',
-  }]
-  if (e === 'custom') return [{
+  if (e === 'magnetic') {
+    const io_id = _rawFromSynapseOrDefault(
+      magnetValve, `DO${M_DEFAULT_PORT}`, portmap)
+    return [_withBinding({
+      action: 'set_io',
+      label:  labelOverride || 'Disengage magnet',
+      io_id, value: 0, io_role: 'magnet',
+    }, cellBinding)]
+  }
+  if (e === 'custom') return [_withBinding({
     action: 'set_io',
     label:  labelOverride || 'Gripper off — release part',
     io_id:  customActivate, value: 0,
-  }]
+  }, cellBinding)]
   return [{
     action: 'open_gripper',
     label:  labelOverride || 'Release part',

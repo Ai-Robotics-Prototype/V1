@@ -608,7 +608,15 @@ function PalletSubStepInlineField({
 // the sub-steps stay COMPOSER-GENERATED so one edit updates every
 // cycle deterministically. Regeneration goes through the shared
 // `regenerateMoveToPalletSteps` so all cycles reflect the change.
-function PalletExpansionPreview({ step, palletCfg, onPatchPallet }) {
+function PalletExpansionPreview({ step, palletCfg, onPatchPallet, synapsePortmap }) {
+  // Route the sub-step detail IO strings through the single-source
+  // Synapse portmap so the operator sees "Valve 03 = ON" instead of
+  // raw "DO3 = 1" (2026-10-05 subtitle leak sweep). Fallback keeps
+  // the raw form when the portmap hasn't resolved yet so cold-boot
+  // renders stay legible.
+  const _ioName = (raw) => synapsePortmap
+    ? displayNameForRaw(synapsePortmap, raw)
+    : raw
   const grip = String(step?.gripper_type || 'vacuum').toLowerCase()
   const vacPort = Number(step?.vacuum_port_do ?? palletCfg?.vacuum_port_do ?? 2)
   const blowPortRaw = (step?.blow_off_port_do ?? palletCfg?.blow_off_port_do)
@@ -662,7 +670,7 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet }) {
     { verb: 'movL', label: 'Linear down to pick contact',
       detail: 'from approach → taught pick pose' },
     { verb: 'setDO', label: 'Vacuum ON',
-      detail: `DO${vacPort} = 1`,
+      detail: `${_ioName(`DO${vacPort}`)} = ON`,
       field: { label: 'DO', value: vacPort, unit: '', min: 0, max: 63,
                width: 42,
                testId: 'pallet-substep-vacuum-port-do',
@@ -704,7 +712,7 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet }) {
     { verb: 'movL', label: 'Linear down to slot (place)',
       detail: 'from place approach → slot pose' },
     { verb: 'setDO', label: 'Vacuum OFF (release)',
-      detail: `DO${vacPort} = 0`,
+      detail: `${_ioName(`DO${vacPort}`)} = OFF`,
       // Same field object as vacuum ON — one write, both rows reflect.
       field: { label: 'DO', value: vacPort, unit: '', min: 0, max: 63,
                width: 42,
@@ -714,7 +722,7 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet }) {
   if (blowPort !== null) {
     substeps.push({ verb: 'setDO',
       label: 'Blow-off pulse start',
-      detail: `DO${blowPort} = 1`,
+      detail: `${_ioName(`DO${blowPort}`)} = ON`,
       field: { label: 'DO', value: blowPort, unit: '', min: 0, max: 63,
                width: 42,
                testId: 'pallet-substep-blow-port-do',
@@ -729,7 +737,7 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet }) {
                onCommit: (v) => patch('blow_off_pulse_ms', v) } })
     substeps.push({ verb: 'setDO',
       label: 'Blow-off pulse end',
-      detail: `DO${blowPort} = 0` })
+      detail: `${_ioName(`DO${blowPort}`)} = OFF` })
   }
   substeps.push({ verb: 'movL',
     label: 'Linear up (retract) to place approach',
@@ -6606,6 +6614,7 @@ export default function ProgramEditor() {
                   step={step}
                   palletCfg={currentProgram?.config?.pallet || {}}
                   onPatchPallet={commitPalletPatch}
+                  synapsePortmap={synapsePortmap}
                 />
               )}
 
