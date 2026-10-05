@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { getCell } from '../lib/cellStore'
-import { typeLabel, portDisplayName } from '../lib/cellEntryDisplay'
+import { typeLabel } from '../lib/cellEntryDisplay'
 import { QuestionCard } from './WizardStepCard'
 import EOATSetupWizard from './EOATSetupWizard'
 
@@ -197,18 +197,11 @@ export default function ToolFromCellStep({
                       {typeLabel(e)}
                     </span>
                   </div>
-                  <div style={{ marginTop: 6, display: 'flex', gap: 6,
-                                flexWrap: 'wrap' }}>
-                    {e.valve && (
-                      <span data-testid="tool-from-cell-card-port"
-                            style={_portChip}>{portDisplayName(e.valve)}</span>
-                    )}
-                    {(e.inputs || []).map((i) => (
-                      <span key={i}
-                            data-testid="tool-from-cell-card-port"
-                            style={_portChip}>{portDisplayName(i)}</span>
-                    ))}
-                  </div>
+                  {/* 2026-10-05 operator order: port chips removed from
+                      the tool-selection card. Ports are not relevant
+                      at tool-pick time — they live on My Cell rows and
+                      the hookup/guidance screens where the operator
+                      wires them. Card is name + type badge only. */}
                 </button>
               )
             })}
@@ -278,9 +271,4 @@ const _typeBadge = {
   fontSize: 10, fontWeight: 700, letterSpacing: 0.4,
   textTransform: 'uppercase', color: '#3730A3',
   background: '#EEF2FF', padding: '2px 8px', borderRadius: 999,
-}
-const _portChip = {
-  fontFamily: 'var(--font-mono, monospace)',
-  fontSize: 11, color: '#065F46',
-  background: '#D1FAE5', padding: '2px 6px', borderRadius: 4,
 }
