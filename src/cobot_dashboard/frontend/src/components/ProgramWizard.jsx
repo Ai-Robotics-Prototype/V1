@@ -2801,14 +2801,15 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
   // when the effector was vacuum. See lib/effectorVocab for the
   // single source of truth (2026-07-30 audit instance #4).
   //
-  // 2026-09-08 blow-off audit: withBlowOff surfaces to the vocab
-  // as the operator's explicit choice on the hookup page (default
-  // true — preserves prior behavior). Off = effectorDisengage's
-  // vacuum branch skips the blow-off triplet AND the hookup
-  // guide filters out the vacuum-blow-off instruction card.
+  // 2026-10-05 capability-driven blow-off: withBlowOff is derived
+  // from the picked cell EOAT's actuators[] inside _cellVocabOpts
+  // (true iff the record carries a {type:'blow_off', valve:...}
+  // actuator). The wizard NO LONGER asks "will there be blow-off?"
+  // — the tool declares its own capability in EOAT Setup; the
+  // program contributes the capability's action at the correct
+  // sequence anchor. No question, no branch state.
   const _vocabOpts = {
     spd, gripW, gripF, customActivate, customConfirm,
-    withBlowOff: answers.blow_off_enabled !== false,
     ..._cellVocabOpts(cellEoat, synapsePortmap),
   }
   const engageSteps = (labelOverride) =>
@@ -2948,7 +2949,13 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
 // vacuum/magnet emitters and the row renderer (which already routes
 // via displayNameForRaw) renders "Valve 03" against a Valve-03 cell.
 function _cellVocabOpts(cellEoat, synapsePortmap) {
-  if (!cellEoat) return {}
+  // 2026-10-05 capability-driven blow-off: even without a cell
+  // binding, the wizard emits NO blow-off unless the picked EOAT
+  // declares a blow_off actuator. Explicit withBlowOff:false
+  // overrides effectorDisengage's historical default (true) so a
+  // cell-less wizard run can't ship a program that fires an
+  // uncommanded blow-off step.
+  if (!cellEoat) return { withBlowOff: false }
   const opts = { portmap: synapsePortmap || null }
   if (cellEoat.valve) {
     // Single-valve EOATs (vacuum, magnet, custom-tool-with-one-valve)
@@ -2956,6 +2963,23 @@ function _cellVocabOpts(cellEoat, synapsePortmap) {
     // picks the right field by effector kind.
     opts.vacuumValve = cellEoat.valve
     opts.magnetValve = cellEoat.valve
+  }
+  // 2026-10-05 capability-driven blow-off: a tool emits a blow-off
+  // step at the CLEAR anchor (after release, before retreat-place)
+  // ONLY when its cell record carries a distinct blow_off actuator.
+  // The multi-actuator custom-EOAT flow (actuatorsFromCapabilities)
+  // produces { type: 'blow_off', valve: '<spare>' } for the "blows
+  // air" capability; _standardCellEntry for finger/vacuum does NOT
+  // carry one. The wizard no longer asks "will there be blow-off?"
+  // — tool capability is the ONLY source.
+  const blowActuator = (cellEoat.actuators || [])
+    .find((a) => a && String(a.type || '').toLowerCase() === 'blow_off'
+                 && a.valve)
+  if (blowActuator) {
+    opts.withBlowOff = true
+    opts.blowOffValve = blowActuator.valve
+  } else {
+    opts.withBlowOff = false
   }
   opts.cellBinding = { eoat_id: cellEoat.id }
   return opts
@@ -2995,12 +3019,13 @@ function buildSteps(answers, portmap = null,
   // the backend and the Add Step palette uses in the editor — one
   // vocabulary, all authoring surfaces (audit instance #4).
   //
-  // 2026-09-08 blow-off audit: withBlowOff = operator's explicit
-  // choice on the hookup page (default true). See _vocabOpts in
-  // buildPalletizeSteps above for the same wiring.
+  // 2026-10-05 capability-driven blow-off: withBlowOff flows from
+  // the cell EOAT's actuators[] (see _cellVocabOpts). The wizard
+  // does not ask the operator — the tool declares its capability
+  // in EOAT Setup; the program contributes the capability at the
+  // correct sequence anchor.
   const _vocabOpts = {
     spd, gripW, gripF, customActivate, customConfirm,
-    withBlowOff: answers.blow_off_enabled !== false,
     ..._cellVocabOpts(cellEoat, synapsePortmap),
   }
   const cfgEffector = { effector: answers.gripper_type }
