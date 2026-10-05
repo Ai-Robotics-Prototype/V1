@@ -8,6 +8,7 @@ import {
   programsReferencingCellId,
 } from '../lib/cellActions'
 import { shouldReviewHold } from '../lib/cellReview'
+import { entrySubtitle } from '../lib/cellEntryDisplay'
 import { useStore } from '../store/useStore'
 
 // My Cell — read-only summary of the cell registry, with per-entry
@@ -252,9 +253,7 @@ function _EntryRow({
   programsReferencing,
   ...rest
 }) {
-  const portsLine = [entry.valve, entry.out, entry.in_done,
-                     ...(entry.inputs || [])]
-    .filter(Boolean).join(' · ')
+  const subtitle = entrySubtitle(entry)
   return (
     <div data-testid="my-cell-entry"
          data-cell-id={entry.id}
@@ -314,8 +313,9 @@ function _EntryRow({
                 {entry.name}
               </div>
             )}
-            <div style={{ fontSize: 12, color: '#6B7280' }}>
-              {entry.type}{portsLine ? ` · ${portsLine}` : ''}
+            <div style={{ fontSize: 12, color: '#6B7280' }}
+                 data-testid="my-cell-entry-subtitle">
+              {subtitle}
             </div>
           </div>
           <span style={{

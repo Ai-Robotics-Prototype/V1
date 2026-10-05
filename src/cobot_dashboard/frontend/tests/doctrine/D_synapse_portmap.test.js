@@ -52,6 +52,11 @@ const cellActionSrc = readSrc('lib/cellActions.js')
 const progEdSrc     = readSrc('components/ProgramEditor.jsx')
 const wizSrc        = readSrc('components/ProgramWizard.jsx')
 const ioPortMapSrc  = readSrc('components/IOPortMap.jsx')
+const myCellSrc     = readSrc('components/MyCellSection.jsx')
+const eoatWizSrc    = readSrc('components/EOATSetupWizard.jsx')
+const fixWizSrc     = readSrc('components/ExternalFixtureWizard.jsx')
+const toolCellSrc   = readSrc('components/ToolFromCellStep.jsx')
+const cellDisplaySrc = readSrc('lib/cellEntryDisplay.js')
 const backendSrc    = readRepo(
   'src/cobot_dashboard/cobot_dashboard/dashboard_server.py')
 
@@ -263,6 +268,158 @@ test('program-wizard MachineIOBody dropdown shows Synapse name', () => {
   assert.ok(/displayNameForRaw\(synapsePortmap,\s*o\.id\)/.test(wizSrc),
     v('MachineIOBody synDisplay must call displayNameForRaw so the '
       + 'operator picks "Valve 03 (DO3)" not bare "DO3".'))
+})
+
+
+// ── (6) Subtitle leak sweep — shared cellEntryDisplay formatter ────
+//
+// 2026-10-05 operator field report (My Cell subtitles): End-of-Arm
+// Tools rows rendered "vacuum · V03 · IN04" — raw type slug + raw
+// Synapse ids concatenated. The subtitle must render DISPLAY
+// language only: operator-plain type label + portmap display names.
+//
+// Fix shape: ONE shared formatter in src/lib/cellEntryDisplay.js
+// (typeLabel + portsLine + entrySubtitle + portDisplayName +
+// portListDisplay). Every surface that renders cell records
+// (MyCellSection, EOATSetupWizard summary + SavedScreen, External
+// FixtureWizard list + receipt, ToolFromCellStep cards, ProgramWizard
+// summary gripper line) imports from this one source.
+//
+// Pins:
+//   * Shared-formatter module exists and exports the public API.
+//   * Every cell-rendering surface imports from cellEntryDisplay
+//     (import-identity grep).
+//   * No raw Synapse tokens (V0\d, IN0\d, OUT0\d) rendered as JSX
+//     prose anywhere operator-facing; the one sanctioned exception
+//     is IOPortMap.jsx (controller-native diagnostic view).
+//   * No raw EOAT type slug ('vacuum', 'finger', 'magnet',
+//     'magnetic', 'custom') rendered as JSX prose; the formatter's
+//     typeLabel is the only path.
+
+test('cellEntryDisplay module exports the shared API', () => {
+  for (const sym of [
+    'export function typeLabel',
+    'export function portsLine',
+    'export function entrySubtitle',
+    'export function portDisplayName',
+    'export function portListDisplay',
+  ]) {
+    assert.ok(cellDisplaySrc.includes(sym),
+      v(`src/lib/cellEntryDisplay.js must declare "${sym}" — the shared `
+        + 'formatter is the single-source for cell-entry display copy.'))
+  }
+  // And it must route ports through the Synapse portmap library
+  // (shared with displayNameForSynapse so there is ONE translator).
+  assert.ok(/from\s+['"]\.\/synapsePortmap(?:\.js)?['"]/.test(cellDisplaySrc),
+    v('cellEntryDisplay must import from ./synapsePortmap — one '
+      + 'translator powers both program steps and cell-entry subtitles.'))
+})
+
+test('every cell-rendering surface imports cellEntryDisplay (import-identity)', () => {
+  const surfaces = [
+    ['components/MyCellSection.jsx',          myCellSrc],
+    ['components/EOATSetupWizard.jsx',        eoatWizSrc],
+    ['components/ExternalFixtureWizard.jsx',  fixWizSrc],
+    ['components/ToolFromCellStep.jsx',       toolCellSrc],
+    ['components/ProgramWizard.jsx',          wizSrc],
+  ]
+  for (const [path, src] of surfaces) {
+    assert.ok(
+      /from\s+['"]\.\.\/lib\/cellEntryDisplay['"]/.test(src),
+      v(`${path} must import from '../lib/cellEntryDisplay' — the `
+        + 'shared formatter is the ONLY path for rendering cell '
+        + 'records in operator-facing surfaces.'))
+  }
+})
+
+// Raw-Synapse-id prose: match a token (V03/IN04/OUT05) sitting inside
+// a JSX text node (after a `>` or inside a backtick-template string)
+// but exclude normal attribute values, data-* attrs, keys, and the
+// IOPortMap diagnostic surface (sanctioned exception).
+const RAW_SYNAPSE_PROSE = /(?:>\s*|·\s*|:\s*|\s)(V|IN|OUT)0\d\b/
+const LC_TYPE_SLUG_PROSE = /(?:>|·|:)\s*(vacuum|finger|magnet|magnetic|custom)\b/
+
+function _stripNoiseLines(src) {
+  // Keep only lines that could reasonably be operator-facing JSX text.
+  // Drop import lines, data-testid lines, comparison expressions
+  // (a.type === 'vacuum'), and comment-only lines.
+  return src.split('\n').filter((line) => {
+    const l = line.trim()
+    if (!l) return false
+    if (l.startsWith('//')) return false
+    if (l.startsWith('*')) return false
+    if (l.startsWith('import ')) return false
+    if (/data-[a-z-]+=/.test(l)) return false
+    if (/===\s*['"]/.test(l)) return false
+    if (/!==\s*['"]/.test(l)) return false
+    if (/const\s+_?[A-Z_]+\s*=/.test(l)) return false
+    return true
+  }).join('\n')
+}
+
+test('no raw Synapse tokens as JSX prose in cell-rendering surfaces', () => {
+  const surfaces = [
+    ['components/MyCellSection.jsx',          myCellSrc],
+    ['components/EOATSetupWizard.jsx',        eoatWizSrc],
+    ['components/ExternalFixtureWizard.jsx',  fixWizSrc],
+    ['components/ToolFromCellStep.jsx',       toolCellSrc],
+  ]
+  for (const [path, src] of surfaces) {
+    const prose = _stripNoiseLines(src)
+    const hit = prose.match(RAW_SYNAPSE_PROSE)
+    assert.equal(hit, null,
+      v(`${path} must not render raw Synapse ids as prose — found `
+        + `${hit && hit[0]}. Route through portDisplayName / `
+        + 'portListDisplay / entrySubtitle. IOPortMap is the one '
+        + 'sanctioned exception.'))
+  }
+})
+
+test('no lowercase EOAT type slug as JSX prose in cell-rendering surfaces', () => {
+  const surfaces = [
+    ['components/MyCellSection.jsx',          myCellSrc],
+    ['components/ToolFromCellStep.jsx',       toolCellSrc],
+    ['components/ExternalFixtureWizard.jsx',  fixWizSrc],
+  ]
+  for (const [path, src] of surfaces) {
+    const prose = _stripNoiseLines(src)
+    const hit = prose.match(LC_TYPE_SLUG_PROSE)
+    assert.equal(hit, null,
+      v(`${path} must not render a lowercase type slug as prose — `
+        + `found "${hit && hit[0]}". Route through typeLabel so the `
+        + 'operator sees "Vacuum tool" not "vacuum".'))
+  }
+})
+
+test('typeLabel + entrySubtitle on a two-port record', async () => {
+  const { typeLabel: tl, entrySubtitle: es, portsLine: pl }
+    = await import('../../src/lib/cellEntryDisplay.js')
+  // Vacuum EOAT with a valve + one input — exactly the shape the
+  // operator field report flagged.
+  const vac = {
+    id: 'standard:vacuum', name: 'Vacuum A',
+    type: 'vacuum', valve: 'V03', inputs: ['IN04'], outputs: [],
+  }
+  assert.equal(tl(vac), 'Vacuum tool',
+    v('typeLabel({type:"vacuum"}) must render "Vacuum tool".'))
+  assert.equal(pl(vac), 'Valve 03 · IN 04',
+    v('portsLine on a two-port vacuum record must render '
+      + '"Valve 03 · IN 04" — portmap display names, no raw ids.'))
+  assert.equal(es(vac), 'Vacuum tool · Valve 03 · IN 04',
+    v('entrySubtitle must join typeLabel + portsLine with " · " and '
+      + 'contain NO raw tokens.'))
+  // Finger gripper with valve + two inputs (classic 5/2 finger).
+  const fin = {
+    id: 'standard:finger', name: 'Finger A',
+    type: 'finger', valve: 'V01', inputs: ['IN01', 'IN02'],
+  }
+  assert.equal(es(fin), 'Finger gripper · Valve 01 · IN 01 · IN 02')
+  // Fixture: vice with valve + out + in_done.
+  const vice = {
+    id: 'vice:1', name: 'Vice 1',
+    type: 'vice', valve: 'V05', out: 'OUT02', in_done: 'IN07',
+  }
+  assert.equal(es(vice), 'Vice / Clamp · Valve 05 · OUT 02 · IN 07')
 })
 
 

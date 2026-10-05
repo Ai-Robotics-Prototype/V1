@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { getCell } from '../lib/cellStore'
+import { typeLabel, portDisplayName } from '../lib/cellEntryDisplay'
 import { QuestionCard } from './WizardStepCard'
 import EOATSetupWizard from './EOATSetupWizard'
 
@@ -193,19 +194,19 @@ export default function ToolFromCellStep({
                     </div>
                     <span data-testid="tool-from-cell-card-type-badge"
                           style={_typeBadge}>
-                      {e.type}
+                      {typeLabel(e)}
                     </span>
                   </div>
                   <div style={{ marginTop: 6, display: 'flex', gap: 6,
                                 flexWrap: 'wrap' }}>
                     {e.valve && (
                       <span data-testid="tool-from-cell-card-port"
-                            style={_portChip}>{e.valve}</span>
+                            style={_portChip}>{portDisplayName(e.valve)}</span>
                     )}
                     {(e.inputs || []).map((i) => (
                       <span key={i}
                             data-testid="tool-from-cell-card-port"
-                            style={_portChip}>{i}</span>
+                            style={_portChip}>{portDisplayName(i)}</span>
                     ))}
                   </div>
                 </button>

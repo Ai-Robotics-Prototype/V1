@@ -12,6 +12,9 @@ import { listTools } from '../lib/toolsApi'
 import {
   saveCellFixture, deleteCellFixture,
 } from '../lib/cellStore'
+import {
+  portDisplayName, portListDisplay, entrySubtitle, typeLabel,
+} from '../lib/cellEntryDisplay'
 import { useKeyboardInset, scrollFocusedIntoView } from '../lib/keyboardInset'
 
 // External Fixture Wizard (2026-09-22 operator directive).
@@ -401,11 +404,9 @@ function FixturePicker({ fixtures, onNew, onEdit, onDelete }) {
                 <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
                   {f.name}
                 </div>
-                <div style={{ fontSize: 12, color: '#6B7280' }}>
-                  {FIXTURE_TYPES[f.type]?.label || f.type}
-                  {f.valve && ` · ${f.valve}`}
-                  {f.out && ` · ${f.out}`}
-                  {f.in_done && ` · ${f.in_done}`}
+                <div style={{ fontSize: 12, color: '#6B7280' }}
+                     data-testid="external-fixture-picker-row-subtitle">
+                  {entrySubtitle(f)}
                 </div>
               </div>
               <button
@@ -738,7 +739,7 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
         border: '1px solid #E5E7EB', borderRadius: 8,
         fontSize: 13, color: '#111827', lineHeight: 1.6,
       }} data-testid="fixture-summary-record">
-        <div><b>Kind:</b> {FIXTURE_TYPES[record.type]?.label || record.type}</div>
+        <div><b>Kind:</b> {typeLabel(record)}</div>
         <div><b>How it works:</b> {_powerLabel(record.power_mode)}</div>
         {record.hold_on_loss !== null && (
           <div>
@@ -747,13 +748,13 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
           </div>
         )}
         {record.valve && (
-          <div><b>Wire air line to:</b> {record.valve}</div>
+          <div><b>Wire air line to:</b> {portDisplayName(record.valve)}</div>
         )}
         {record.out && (
-          <div><b>Wire start signal to:</b> {record.out}</div>
+          <div><b>Wire start signal to:</b> {portDisplayName(record.out)}</div>
         )}
         {record.in_done && (
-          <div><b>Wire done sensor to:</b> {record.in_done}</div>
+          <div><b>Wire done sensor to:</b> {portDisplayName(record.in_done)}</div>
         )}
         <div>
           <b>Robot waits by:</b>{' '}

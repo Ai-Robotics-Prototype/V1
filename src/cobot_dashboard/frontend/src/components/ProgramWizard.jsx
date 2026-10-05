@@ -12,6 +12,7 @@ import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
          clampWorkpiece, unclampWorkpiece,
          startMachineCycle, waitMachineCycle } from '../lib/effectorVocab'
+import { typeLabel } from '../lib/cellEntryDisplay'
 
 /*
  * Conversational Program Wizard
@@ -2687,7 +2688,10 @@ const PAGES = [
           border: '1px solid #e5e7eb', marginBottom: 16, fontSize: 13,
         }}>
           <div style={{ fontWeight: 600, color: '#374151', marginBottom: 8 }}>Settings</div>
-          <div style={{ color: '#6b7280' }}>Gripper: {answers.gripper_type}</div>
+          <div style={{ color: '#6b7280' }}
+               data-testid="program-wizard-summary-gripper">
+            Gripper: {typeLabel({ type: answers.gripper_type }) || '—'}
+          </div>
           {/* Speed and motion profile are defaulted at save time (see save handler).
               They are tuned from the Program tab's motion profile card after creation. */}
           {isPallet ? (

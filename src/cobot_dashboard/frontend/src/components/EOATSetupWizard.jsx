@@ -15,6 +15,7 @@ import {
 } from '../lib/cellStore'
 import { useKeyboardInset } from '../lib/keyboardInset'
 import { useStore } from '../store/useStore'
+import { portDisplayName, portListDisplay } from '../lib/cellEntryDisplay'
 import WhyExpander from './WhyExpander'
 import {
   CAPABILITY_CATALOG as _CAPABILITY_CATALOG,
@@ -1088,7 +1089,7 @@ function CustomEOATFlow({
                    color: '#166534', fontSize: 13, lineHeight: 1.5,
                  }}>
               Wire your sensors to: <b>
-                {resolved.required_inputs.join(', ')}
+                {portListDisplay(resolved.required_inputs)}
               </b>.
               These are the next free input ports on your controller.
             </div>
@@ -1111,7 +1112,7 @@ function CustomEOATFlow({
             {(resolved.actuators || []).map((a, i) => (
               <div key={i} data-testid="custom-eoat-summary-actuator"
                    style={{ marginLeft: 12 }}>
-                • {a.label}{a.valve ? ` → wire to ${a.valve}` : ''}
+                • {a.label}{a.valve ? ` → wire to ${portDisplayName(a.valve)}` : ''}
                 {a.type === 'double_acting'
                   && (a.hold_on_loss
                        ? ' (keeps holding on power loss)'
@@ -1124,7 +1125,7 @@ function CustomEOATFlow({
             ))}
             <div><b>Sensors:</b> {sensorCount}
               {resolved.required_inputs.length > 0
-                && ` → wire to ${resolved.required_inputs.join(', ')}`}
+                && ` → wire to ${portListDisplay(resolved.required_inputs)}`}
             </div>
           </div>
           <GuidanceBlock port={resolved} />
@@ -1246,7 +1247,7 @@ function ActuatorCard({
           Recommended part: {resolved.recommended_valve_type}.
           {' '}{resolved.recommended_valve_why}
           {resolved.valve
-            ? ` Spare slot assigned: ${resolved.valve}.`
+            ? ` Spare slot assigned: ${portDisplayName(resolved.valve)}.`
             : ''}
         </WhyExpander>
       )}
@@ -1597,11 +1598,12 @@ function SavedScreen({ entry, onViewInMyCell, onSetupAnother, onDone }) {
         It will appear as a card in the Program Wizard's tool step
         and in <b>My Cell</b> on the Synapse tab.
         {(valves.length > 0 || inputs.length > 0) && (
-          <div style={{ marginTop: 6, fontSize: 13, color: '#047857' }}>
+          <div style={{ marginTop: 6, fontSize: 13, color: '#047857' }}
+               data-testid="hardware-setup-saved-ports">
             Ports claimed:{' '}
-            {valves.length > 0 && <b>{valves.join(', ')}</b>}
+            {valves.length > 0 && <b>{portListDisplay(valves)}</b>}
             {valves.length > 0 && inputs.length > 0 && ' · '}
-            {inputs.length > 0 && <b>{inputs.join(', ')}</b>}
+            {inputs.length > 0 && <b>{portListDisplay(inputs)}</b>}
           </div>
         )}
       </div>
