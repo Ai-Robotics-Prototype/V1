@@ -47,26 +47,68 @@ const _CELL_EOAT_ROLES = Object.freeze(new Set([
   'vacuum', 'magnet', 'blow_off',
 ]))
 
+// Map io_role → cell EOAT type the role implies. Used to infer a
+// cell binding for LEGACY programs that pre-date the cell_eoat_id
+// field (pre-7052786 wizard output) but still carry a gripper_type
+// in config. When exactly one cell EOAT of that type exists, the
+// rebinder treats it as if the operator had bound the program to it.
+const _ROLE_TO_EOAT_TYPE = Object.freeze({
+  vacuum:   'vacuum',
+  magnet:   'magnetic',
+  // blow_off has no distinct cell entry today — handled downstream.
+})
+
+// Resolve the cell EOAT entry a step should bind to. Prefers (in
+// order):
+//   1. explicit program.config.cell_eoat_id (set by the wizard
+//      since 7052786 via ToolFromCellStep).
+//   2. step.cell_binding.eoat_id (set by cellActions-compiled
+//      primitives + effectorVocab emit path).
+//   3. INFERENCE for legacy programs: when the step's io_role maps
+//      to an EOAT type AND exactly ONE cell EOAT of that type
+//      exists AND the program's config.gripper_type agrees, use
+//      that lone entry. The Poopyyy field case: gripper_type=vacuum
+//      + exactly one standard:vacuum entry on V03 → infer the
+//      binding, display + wire both resolve to V03.
+//
+// Returns the cell entry object (so callers can read .valve etc)
+// or null when no binding can be inferred.
+function _resolveCellEntry(step, program, cell) {
+  const eoats = (cell && cell.eoats) || []
+  const explicitId = program?.config?.cell_eoat_id
+    || step?.cell_binding?.eoat_id
+  if (explicitId) {
+    return eoats.find((e) => e.id === explicitId) || null
+  }
+  const role = String(step?.io_role || '').toLowerCase()
+  const impliedType = _ROLE_TO_EOAT_TYPE[role]
+  if (!impliedType) return null
+  const programGripType = String(
+    program?.config?.gripper_type || '').toLowerCase()
+  // Only infer when the program's own gripper_type agrees — don't
+  // guess across effector mismatches (a magnet step in a 'finger'
+  // program stays legacy).
+  if (programGripType && programGripType !== impliedType) return null
+  const matches = eoats.filter(
+    (e) => String(e.type || '').toLowerCase() === impliedType)
+  if (matches.length !== 1) return null   // ambiguous or absent
+  return matches[0]
+}
+
 // Look up the cell's current valve for the role the step plays.
-// Returns the raw controller channel ('DO3') or null when the
-// program has no cell binding, the cell entry is absent, or the
-// role isn't one we rebind.
+// Returns the raw controller channel ('DO3') or null when nothing
+// to rebind against.
 function _cellRawForRole(step, program, cell, portmap) {
   const role = String(step?.io_role || '').toLowerCase()
   if (!_CELL_EOAT_ROLES.has(role)) return null
-  const eoatId = program?.config?.cell_eoat_id
-    || step?.cell_binding?.eoat_id
-  if (!eoatId) return null
-  const entry = (cell?.eoats || []).find((e) => e.id === eoatId)
-  if (!entry) return null
-  // Vacuum + magnet live on entry.valve. Blow-off uses a distinct
-  // valve on tools that carry one; today's standard vacuum entry
-  // has no distinct blow-off slot, so we return null for blow_off
-  // and let the row fall back to the stored io_id (operator sees
-  // the raw-channel reverse until a blow-off valve lands on the
-  // cell record).
+  // Blow-off uses a distinct valve on tools that carry one; today's
+  // standard vacuum entry has no distinct blow-off slot, so we
+  // return null for blow_off and let the row fall back to the
+  // stored io_id (operator sees the raw-channel reverse until a
+  // blow-off valve lands on the cell record).
   if (role === 'blow_off') return null
-  if (!entry.valve) return null
+  const entry = _resolveCellEntry(step, program, cell)
+  if (!entry || !entry.valve) return null
   const raw = rawForSynapse(portmap, entry.valve)
   return raw || null
 }

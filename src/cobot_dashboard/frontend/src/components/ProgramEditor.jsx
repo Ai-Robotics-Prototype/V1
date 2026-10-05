@@ -3626,7 +3626,10 @@ function TeachOverlay({
 //   stop-condition (see luaenginelib.json). When the format is
 //   resolved, "declare carried mass at grip" becomes a codegen
 //   emission and THIS panel becomes its source of truth.
-function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
+function ToolAndPayloadSection({
+  program, onPatch, controllerPayloadKg,
+  cell = null, onCellReload = null,
+}) {
   const payload = readPayload(program)
   // Collapsed by default per the 2026-07-31 directive. The chip
   // on the header carries enough signal that the operator can
@@ -3637,8 +3640,19 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
   // 2026-09-08 hookup guide: modal open/close for the read-only
   // reopen path from this section's header button.
   const [_showHookup, _setShowHookup] = useState(false)
+  // 2026-10-05 operator directive (Item 3): the Tool & Payload
+  // section becomes the operator's point to SELECT a different EOAT
+  // for this program. Opens EOATSetupWizard editable when the
+  // operator picks "Set up a new tool"; selecting an existing cell
+  // tool patches program.config.cell_eoat_id + gripper_type by id.
+  const [_showSetup, _setShowSetup] = useState(false)
   const _gripperType = (program && program.config && (
     program.config.gripper_type || program.config.gripper?.type)) || 'finger'
+  const _cellEoatId = program?.config?.cell_eoat_id || null
+  const _eoats = (cell && cell.eoats) || []
+  const _boundEntry = _cellEoatId
+    ? _eoats.find((e) => e.id === _cellEoatId) || null
+    : null
 
   // Live truth line — reads the shared resolver so mismatch /
   // unreadable states show consistent copy across surfaces.
@@ -3749,6 +3763,89 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
               </div>
             )
           })()}
+          {/* 2026-10-05 operator directive (Item 3): cell-driven
+              EOAT selector. Picking a saved tool rebinds the program
+              to it by id (cell_eoat_id); downstream rebind +
+              detailLine routing (618a86c) refresh io_ids + display
+              against the newly-bound cell valve. "Set up a new
+              tool" opens EOATSetupWizard editable. */}
+          <div data-testid="tool-and-payload-eoat-selector"
+               style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label style={{ fontSize: 12, color: '#374151', fontWeight: 600 }}>
+              End-of-arm tool for this program
+            </label>
+            <div style={{ display: 'flex', alignItems: 'center',
+                          gap: 8, flexWrap: 'wrap' }}>
+              <select
+                data-testid="tool-and-payload-eoat-select"
+                value={_cellEoatId || ''}
+                onChange={(e) => {
+                  const id = e.target.value || null
+                  if (!id) {
+                    onPatch({ cell_eoat_id: null })
+                    return
+                  }
+                  const entry = _eoats.find((x) => x.id === id)
+                  const type = String(entry?.type || '').toLowerCase()
+                  // Executor only knows finger/vacuum/magnetic;
+                  // 'custom' maps to magnetic single-DO behavior
+                  // same as the wizard's own tool-pick flow.
+                  const gt = (type === 'vacuum' || type === 'finger'
+                           || type === 'magnetic') ? type : 'custom'
+                  onPatch({
+                    cell_eoat_id: id,
+                    gripper_type: gt,
+                  })
+                }}
+                style={{
+                  padding: '6px 10px', fontSize: 13,
+                  border: '1px solid #d1d5db', borderRadius: 5,
+                  background: '#fff', color: '#111827',
+                  minWidth: 220, maxWidth: 320,
+                  fontFamily: 'inherit',
+                }}>
+                <option value="">— no tool bound —</option>
+                {_eoats.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                data-testid="tool-and-payload-setup-new"
+                onClick={() => _setShowSetup(true)}
+                title="Open the EOAT Setup wizard to add a new tool"
+                style={{
+                  padding: '6px 10px', fontSize: 12, fontWeight: 600,
+                  background: '#fff', color: '#2563EB',
+                  border: '1px dashed #93C5FD', borderRadius: 5,
+                  cursor: 'pointer', fontFamily: 'inherit',
+                }}>
+                + Set up a new tool
+              </button>
+              {_boundEntry && (
+                <span data-testid="tool-and-payload-bound-chip"
+                      data-cell-id={_boundEntry.id}
+                      style={{
+                        fontSize: 11, fontWeight: 700, letterSpacing: 0.4,
+                        textTransform: 'uppercase', color: '#065F46',
+                        background: '#ECFDF5',
+                        padding: '2px 8px', borderRadius: 999,
+                      }}>
+                  bound
+                </span>
+              )}
+            </div>
+            {_eoats.length === 0 && (
+              <div style={{ fontSize: 12, color: '#92400E',
+                            background: '#FEF3C7', padding: '6px 10px',
+                            border: '1px solid #FDE68A', borderRadius: 4 }}>
+                No tools in your cell yet. Click "Set up a new tool"
+                to register one; this program will stay unbound until
+                you pick it here.
+              </div>
+            )}
+          </div>
           {/* Tool mass — the whole first-row input, now mass-only.
               The retired "Tool name (optional)" input lived here
               alongside the mass field; it was deleted 2026-07-31. */}
@@ -3821,6 +3918,18 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
               : _gripperType
           }
           readOnly
+        />,
+        document.body)}
+      {_showSetup && createPortal(
+        <EOATSetupWizard
+          onClose={async () => {
+            _setShowSetup(false)
+            // Refresh the cell so the new tool appears in the
+            // selector on close.
+            if (typeof onCellReload === 'function') {
+              try { await onCellReload() } catch (_) { /* nop */ }
+            }
+          }}
         />,
         document.body)}
     </div>
@@ -5991,6 +6100,10 @@ export default function ProgramEditor() {
           themselves live inside the collapsible section below. */}
       <ToolAndPayloadSection
         program={currentProgram}
+        cell={cellRegistry}
+        onCellReload={async () => {
+          try { setCellRegistry(await getCell()) } catch (_) {}
+        }}
         onPatch={(patch) => setCurrentProgram({
           config: { ...(currentProgram?.config || {}), ...patch },
           unsaved: true,
