@@ -1537,65 +1537,11 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
 // hour in the cloud, gated on the RunPod account. The wizard surfaces
 // the training requirement per-part so the operator sees the story
 // before they hit Run and get an empty detection.
-const COCO_NATIVE_NAMES = new Set([
-  'bowl', 'cup', 'bottle', 'wine glass', 'fork', 'knife', 'spoon',
-  'banana', 'apple', 'orange', 'book', 'scissors', 'cell phone',
-  'laptop', 'keyboard', 'mouse', 'remote', 'clock',
-])
-
-function partIsCocoNative(part) {
-  const name = String(part?.name || '').toLowerCase().trim()
-  // Match against the canonical name AND any coco_alias the parts
-  // library carries (added when the operator uploads a STEP with a
-  // matching classifier hint).
-  if (COCO_NATIVE_NAMES.has(name)) return true
-  const alias = String(part?.coco_alias || '').toLowerCase().trim()
-  if (alias && COCO_NATIVE_NAMES.has(alias)) return true
-  return false
-}
-
-function WhichPartBody({ answers, setAnswer, goNext }) {
-  const [parts, setParts] = useState([])
-  useEffect(() => {
-    fetch('/api/parts').then(r => r.json()).then(d => setParts(d.parts || [])).catch(() => {})
-  }, [])
-  return (
-    <QuestionCard
-      question="Which part should the robot look for?"
-      description={
-        "Select a part from the library. The robot will only pick "
-        + "this type. Parts marked “training required” will "
-        + "not be detected until their model is trained — the "
-        + "Isaac ROS engine ships with COCO weights, and custom "
-        + "parts need a ~1-hour fine-tune (Phase 2, gated on the "
-        + "RunPod cloud pilot)."
-      }
-    >
-      {parts.length === 0 ? (
-        <div style={{ padding: 24, textAlign: 'center', color: '#6b7280', border: '2px dashed #d1d5db', borderRadius: 8 }}>
-          No parts in the library. Upload STEP files in Part Recognition first.
-        </div>
-      ) : parts.map(p => {
-        const cocoNative = partIsCocoNative(p)
-        const modelTrained = !!p.model_trained
-        const detectable = cocoNative || modelTrained
-        const trainingNote = detectable
-          ? null
-          : ' — training required (~1 hour in the cloud, Phase 2)'
-        return (
-          <ChoiceButton key={p.id} label={p.name + (detectable ? '' : ' ⚠')}
-            description={
-              `${p.extents_cm?.[0]} x ${p.extents_cm?.[1]} x ${p.extents_cm?.[2]} cm`
-              + (trainingNote || '')
-            }
-            selected={answers.target_part === p.id}
-            onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext({ target_part: p.id, target_part_name: p.name }) }}
-          />
-        )
-      })}
-    </QuestionCard>
-  )
-}
+// WhichPartBody + COCO_NATIVE_NAMES + partIsCocoNative deleted
+// 2026-10-05 along with the `which_part` PAGES entry (operator
+// directive: vision/detect is not in scope). The parts-library
+// endpoint still exists for the editor's palette-level detect step;
+// nothing else in the wizard consumed these helpers.
 
 function MachineIOBody({ answers, setAnswer, goNext }) {
   const portmap = useIOPortmap()
@@ -1770,20 +1716,13 @@ const PAGES = [
   // camera-detection option is an editor-level change; do not
   // reintroduce a wizard page for it without a fresh directive.
 
-  // 2: Which part? (only if Camera Detection selected on page 1)
-  //   Palletize skips this page: the operator forces source=camera_library
-  //   from the pallet_mode selector for runtime detect emission, but does
-  //   NOT want to pre-select a specific library part during setup — the
-  //   emitted `detect mode:'library'` step scans for any known part, and
-  //   the label falls back to "Find library part" when target_part_name
-  //   is absent. Non-palletize flows (pick_and_place / sort with camera
-  //   detection) still show this page.
-  {
-    id: 'which_part',
-    skip: (answers) => answers.operation === 'palletize'
-                    || answers.source !== 'camera_library',
-    render: WhichPartBody,
-  },
+  // which_part page RETIRED 2026-10-05 (operator directive: vision /
+  // detect is not in scope). The page only existed to pick the
+  // target_part the detect step would scan for; with the wizard no
+  // longer emitting a detect step, the page has no purpose and is
+  // removed from the flow. The parts-library endpoint + the editor's
+  // detect-step palette entry stay intact so legacy programs load
+  // and detect can be re-wired when vision is in scope.
 
   // 3: Which tool? (2026-09-22 "The Cell" tool-step directive)
   //
@@ -2891,10 +2830,11 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
   const loopStart = steps.length + 1
 
   if (mode === 'palletize') {
-    // Camera-driven pick: detect first using the parts library.
-    if ((answers.source || 'camera_library') === 'camera_library') {
-      steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
-    }
+    // 2026-10-05 operator directive: vision/detect is not in scope.
+    // The wizard no longer emits any `action:'detect'` step. The pick
+    // sequence goes straight to the taught approach + contact; the
+    // detect primitive stays available in the step palette for
+    // editor-level insertion when the vision stack lands.
 
     const pickPoint = readTaught(answers, 'taught_pick') || {}
     const pickTcp   = Array.isArray(pickPoint.tcp) ? pickPoint.tcp : null
@@ -3067,9 +3007,11 @@ function buildSteps(answers, portmap = null,
 
   steps.push(...effectorReady(cfgEffector, _vocabOpts))
 
-  if (answers.source === 'camera_library') {
-    steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
-  }
+  // 2026-10-05 operator directive: wizard emits ZERO detect steps.
+  // The detect primitive remains in the editor's step palette +
+  // ACTION_TYPES so legacy programs load and the capability can
+  // be re-wired when vision is in scope — just no new emits from
+  // the wizard's authoring paths.
 
   // Two-taught-poses-per-pair model (matches program_composer.py):
   //   approach (derived, +appH) → pick contact (TAUGHT) → engage →
