@@ -667,15 +667,16 @@ export default function JogControls({
   }, [jogRelease])
 
   // STEP-mode press: one increment per press. Joint uses the driver's
-  // time-boxed delta_deg path; Cartesian uses the fixed 150 ms mode:2
-  // pulse (see driver docstring for why duration is fixed until TCP
-  // velocity is characterized).
+  // time-boxed delta_deg path; Cartesian passes step_mm so the driver
+  // derives duration from the labelled distance (2026-10-06 fix for
+  // "every mm chip moves the same" — the pre-fix path hard-coded a
+  // 150 ms pulse and ignored the chip label).
   const tap = useCallback((axis, direction) => {
     if (modeRef.current === 'joint') {
       const deltaDeg = direction * stepRef.current
       jogIncrement(axis, deltaDeg)
     } else {
-      jogPulseCartesian(axis, direction, speedRef.current)
+      jogPulseCartesian(axis, direction, speedRef.current, stepRef.current)
     }
   }, [jogIncrement, jogPulseCartesian])
 

@@ -3002,6 +3002,15 @@ function TeachOverlay({
   // the release default (2026-08-03 §2); STEP is a one-click switch
   // for fine positioning where "1mm button moves 1mm" matters.
   const jogStyleShared    = useStore((s) => s.jogStyle) || 'CONTINUOUS'
+  // 2026-10-06 operator order (BUG 1): teach drawer MUST expose the
+  // same Step/Continuous toggle the main JogControls has at the
+  // bottom of the right rail (JogControls.jsx:1234-1245). Before this
+  // fix the drawer only READ `jogStyle` from the shared store — if
+  // the operator had never flipped it in the main pendant the drawer
+  // was stuck in whichever mode happened to be persisted, with no
+  // affordance to toggle. Pull the SHARED setter here so a flip in
+  // the drawer propagates to the pendant and vice-versa.
+  const setJogStyleShared = useStore((s) => s.setJogStyle)
   const homeRobot    = useStore((s) => s.homeRobot)
   // Live joint stream + driver-computed limit/headroom. Joint mode
   // reads these to render the per-joint live angle + limit range +
@@ -3071,18 +3080,17 @@ function TeachOverlay({
     return jogRelease(modeRef.current, meta)
   }, [jogRelease])
   // 2026-08-05 unify — STEP-mode tap: one increment per tap. Mirrors
-  // main JogControls.tap() (see JogControls.jsx:522) so drawer and
-  // pendant agree byte-for-byte on the STEP dispatch. Joint uses
-  // driver's time-boxed delta_deg path (angle-bounded, arm stops
-  // exactly at the delta); Cartesian uses jogPulseCartesian's fixed
-  // 150 ms mode:2 pulse (distance ≈ speed × 0.15 s; approximate but
-  // matches pendant behavior).
+  // main JogControls.tap() so drawer and pendant agree byte-for-byte
+  // on the STEP dispatch. Joint uses driver's time-boxed delta_deg
+  // path (angle-bounded, arm stops exactly at the delta); Cartesian
+  // passes stepRef.current (mm) so the driver derives duration from
+  // the labelled distance — see 2026-10-06 cart-step correctness fix.
   const tap = useCallback((axis, direction) => {
     if (modeRef.current === 'joint') {
       const deltaDeg = direction * stepRef.current
       jogIncrement(axis, deltaDeg)
     } else {
-      jogPulseCartesian(axis, direction, speedRef.current)
+      jogPulseCartesian(axis, direction, speedRef.current, stepRef.current)
     }
   }, [jogIncrement, jogPulseCartesian])
   // Wire helper: returns { onTap, onPressStart, onPressTick, onPressEnd }
@@ -3340,23 +3348,59 @@ function TeachOverlay({
           )}
         </div>
 
-        {/* Speed + step row */}
+        {/* Jog style + speed + step row */}
         <div style={{
           flex: '0 0 auto',
           width: '100%',
           display: 'flex', alignItems: 'center', gap: 18,
           justifyContent: 'space-evenly', flexWrap: 'wrap',
         }}>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          {/* 2026-10-06 BUG 1 fix: Step/Continuous toggle. Shared
+              setter + state with the main JogControls pendant so a
+              toggle here propagates and vice-versa. Step chips below
+              dim when CONTINUOUS is active (same affordance as the
+              pendant). */}
+          <div
+            data-testid="teach-drawer-jog-style-toggle"
+            data-jog-style={jogStyleShared}
+            style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ fontSize: 13, color: '#6b7280' }}>Mode:</span>
+            {['STEP', 'CONTINUOUS'].map((style) => (
+              <button
+                key={style}
+                data-testid="teach-drawer-jog-style-button"
+                data-jog-style={style}
+                data-active={String(jogStyleShared === style)}
+                onClick={() => setJogStyleShared(style)}
+                style={{
+                  padding: '10px 14px', minHeight: 44,
+                  fontSize: 13, fontWeight: 600, borderRadius: 6,
+                  cursor: 'pointer',
+                  background: jogStyleShared === style ? '#2563EB' : '#fff',
+                  color:      jogStyleShared === style ? '#fff'    : '#374151',
+                  border:     jogStyleShared === style ? 'none'    : '1px solid #d1d5db',
+                }}>
+                {style === 'STEP' ? 'Step' : 'Continuous'}
+              </button>
+            ))}
+          </div>
+          <div style={{
+            display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center',
+            opacity: jogStyleShared === 'STEP' ? 1 : 0.4,
+          }}>
             <span style={{ fontSize: 13, color: '#6b7280' }}>Step:</span>
             {[0.1, 0.5, 1, 5, 10].map((s) => (
-              <button key={s} onClick={() => setStepSize(s)} style={{
-                padding: '10px 14px', minHeight: 44,
-                fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
-                background: stepSize === s ? '#2563EB' : '#fff',
-                color:      stepSize === s ? '#fff'    : '#374151',
-                border:     stepSize === s ? 'none'    : '1px solid #d1d5db',
-              }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+              <button key={s}
+                onClick={() => { if (jogStyleShared === 'STEP') setStepSize(s) }}
+                disabled={jogStyleShared !== 'STEP'}
+                style={{
+                  padding: '10px 14px', minHeight: 44,
+                  fontSize: 13, fontWeight: 600, borderRadius: 6,
+                  cursor: jogStyleShared === 'STEP' ? 'pointer' : 'not-allowed',
+                  background: stepSize === s ? '#2563EB' : '#fff',
+                  color:      stepSize === s ? '#fff'    : '#374151',
+                  border:     stepSize === s ? 'none'    : '1px solid #d1d5db',
+                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
             ))}
           </div>
           <div style={{ flex: 1, minWidth: 240, maxWidth: 520 }}>

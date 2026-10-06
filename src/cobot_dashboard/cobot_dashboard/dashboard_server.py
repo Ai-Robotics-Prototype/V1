@@ -5055,14 +5055,34 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"error": "speed_pct must be in (0, 100]"}, status_code=400)
 
         if body.get("pulse") is True:
-            _publish_estun_jog({
+            # 2026-10-06 step-size correctness fix. Forward the UI's
+            # labelled step distance (mm) so the driver can derive
+            # duration + commanded speed to actually land near the
+            # requested distance. Pre-fix: the step chip was dropped
+            # at this seam and the driver ran a fixed 150 ms pulse at
+            # the slider speed, which made every chip (0.1/0.5/1/5/10)
+            # move the same amount — and that amount was set by the
+            # slider, not the label.
+            try:
+                step_mm = float(body.get("step_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                step_mm = 0.0
+            if step_mm < 0.0 or step_mm > 100.0:
+                return JSONResponse(
+                    {"error": "step_mm must be in [0, 100]"},
+                    status_code=400)
+            payload = {
                 "mode":      "cartesian",
                 "axis":      axis_1based,
                 "direction": direction,
                 "speed_pct": speed_pct,
                 "pulse":     True,
-            })
-            return {"ok": True, "action": "pulse"}
+            }
+            if step_mm > 0.0:
+                payload["step_mm"] = step_mm
+            _publish_estun_jog(payload)
+            return {"ok": True, "action": "pulse",
+                    "step_mm": step_mm if step_mm > 0 else None}
 
         payload = {
             "mode":      "cartesian",

@@ -113,6 +113,31 @@ _FITTED_DH_STD = [
 ]
 _FITTED_BASE_Z_MM = -139.89595
 
+# Cartesian step-jog constants (2026-10-06 step-size correctness fix).
+# `_CART_MANUAL_MAX_MMPS` sources the controller's Manual-mode TCP speed
+# ceiling — HARDWARE.md > "Robot-limit config" documents
+# manualCartOverSpeed = 250 mm/s. The step-jog duration is derived as
+#   duration = step_mm / (speed_frac * _CART_MANUAL_MAX_MMPS)
+# with `_CART_PULSE_MIN_DUR_S` as the floor (pulses below this are
+# swallowed by the drive's accel-ramp window, so the arm over-shoots
+# the labelled distance). When the floor binds, the driver scales the
+# commanded speed DOWN so the labelled distance survives — the chip
+# label is the source of truth, the slider becomes a ceiling.
+# `_CART_PULSE_MAX_DUR_S` is a defensive cap in case step_mm arrives
+# much larger than the UI chip set (never today — max chip is 10 mm).
+_CART_MANUAL_MAX_MMPS = 250.0
+_CART_PULSE_MIN_DUR_S = 0.060
+_CART_PULSE_MAX_DUR_S = 5.0
+
+# Joint step-jog floor (same rationale as the cart floor above): a
+# commanded 0.1° at the default jog_inc_speed_frac resolves to ~2 ms,
+# which the controller swallows. When the computed duration falls
+# below this floor we scale the signed_speed DOWN so the labelled
+# delta_deg survives at the floor duration. Operator reports "0.1°
+# does nothing" / "every step feels the same" come from this exact
+# regime.
+_JOINT_INC_MIN_DUR_S = 0.060
+
 
 class SingularityGuard:
     """Computes σ_min of the 6×6 geometric Jacobian from live joint angles,
@@ -3390,7 +3415,57 @@ class EstunCodroidDriver(Node):
             return
         effective_frac = min(speed_pct / 100.0, self._effective_speed_cap)
         signed_speed = direction * effective_frac
-        duration_s = 0.150  # fixed pulse; see method docstring.
+
+        # 2026-10-06 step-size correctness fix (operator field report):
+        # before, every mm chip collapsed to the same 150 ms pulse at
+        # the slider speed — the chip label was decoration. Now derive
+        # duration FROM the labelled distance:
+        #
+        #   want distance = step_mm
+        #   tcp cap      = _CART_MANUAL_MAX_MMPS (250 mm/s manual cap
+        #                   from HARDWARE.md > "manualCartOverSpeed")
+        #   effective    = effective_frac * tcp_cap  (mm/s at the wire)
+        #   duration     = step_mm / effective
+        #
+        # When step_mm is small enough that duration falls below the
+        # controller's stop-timer resolution floor (~60 ms — Robot/jog
+        # ramps the drive, and sub-60 ms pulses are swallowed by the
+        # accel-ramp window so the distance drifts upward), SCALE DOWN
+        # the commanded speed so the chip's labelled distance survives
+        # at the floor duration instead of over-shooting at a short
+        # pulse. For large step_mm / low speed the duration grows
+        # naturally — bounded by the operator (10 mm max chip at 1%
+        # speed = 10/2.5 = 4 s; the slider never ships at 1%).
+        #
+        # Omitted step_mm (<= 0) falls back to the pre-fix 150 ms
+        # pulse, same behaviour as before — a soft back-compat path
+        # for any caller that hasn't been updated to pass the chip.
+        try:
+            step_mm = float(d.get('step_mm', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            step_mm = 0.0
+        if step_mm > 0.0:
+            tcp_cap_mms = _CART_MANUAL_MAX_MMPS
+            effective_mms = max(1e-3, effective_frac * tcp_cap_mms)
+            duration_s = step_mm / effective_mms
+            if duration_s < _CART_PULSE_MIN_DUR_S:
+                # Honour the labelled distance by slowing down to the
+                # floor duration rather than over-shooting at a short
+                # pulse.
+                duration_s = _CART_PULSE_MIN_DUR_S
+                target_mms = step_mm / duration_s
+                scaled_frac = min(target_mms / tcp_cap_mms,
+                                  self._effective_speed_cap,
+                                  effective_frac)
+                scaled_frac = max(1e-4, scaled_frac)
+                signed_speed = direction * scaled_frac
+                effective_frac = scaled_frac
+            # Hard-cap the pulse: a mis-plumbed step_mm shouldn't
+            # strand the arm in a seconds-long move. The cap is well
+            # above any UI chip (max 10 mm / min 1% speed = 4 s).
+            duration_s = min(duration_s, _CART_PULSE_MAX_DUR_S)
+        else:
+            duration_s = 0.150  # legacy fallback — see docstring + comment above.
 
         # Pre-emptive limit check across all joints — we can't project
         # cartesian motion into joint space cheaply, so refuse when any
@@ -3551,6 +3626,20 @@ class EstunCodroidDriver(Node):
             speed_frac = min(self._jog_inc_speed_frac, self._effective_speed_cap)
             max_speed = self._max_joint_speed_degps[axis-1]
             duration_s = abs(delta_deg) / max(1e-3, speed_frac * max_speed)
+            # 2026-10-06 small-step correctness floor: when the computed
+            # duration falls below ~60 ms the drive's accel-ramp window
+            # swallows it and the arm over-shoots the labelled delta_deg
+            # (operator reports "every step feels the same"). Scale the
+            # commanded speed DOWN so the labelled distance survives at
+            # the floor duration — the chip label is the source of truth.
+            if duration_s < _JOINT_INC_MIN_DUR_S:
+                duration_s = _JOINT_INC_MIN_DUR_S
+                target_degps = abs(delta_deg) / duration_s
+                scaled_frac = min(target_degps / max_speed,
+                                  self._effective_speed_cap,
+                                  speed_frac)
+                scaled_frac = max(1e-4, scaled_frac)
+                speed_frac = scaled_frac
             signed_speed = (1.0 if delta_deg > 0.0 else -1.0) * speed_frac
 
             # NOTE on sign: /joint_states is a straight deg→rad passthrough

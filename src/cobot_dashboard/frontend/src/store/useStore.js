@@ -1695,13 +1695,26 @@ const storeDefinition = (set, get) => ({
     })
   },
 
-  jogPulseCartesian(axisLetter, direction, speedPct) {
-    return get()._postJog('jog_cartesian', {
+  // Tap → single-step Cartesian increment. Passes the operator's
+  // step-size selection to the driver so each labelled chip
+  // (0.1 / 0.5 / 1 / 5 / 10 mm) commands a DIFFERENT distance. Before
+  // 2026-10-06 the UI's step chip was vestigial on this path — the
+  // driver always ran a fixed 150 ms pulse regardless of label, so
+  // every chip felt identical and the actual distance tracked the
+  // speed slider, not the mm label (operator field report). Driver's
+  // _start_cart_pulse now reads `step_mm` and derives duration + a
+  // scaled-down speed_pct so the arm lands near the labelled mm.
+  jogPulseCartesian(axisLetter, direction, speedPct, stepMm) {
+    const payload = {
       axis: axisLetter,
       direction,
       speed_pct: speedPct,
       pulse: true,
-    })
+    }
+    if (typeof stepMm === 'number' && isFinite(stepMm) && stepMm > 0) {
+      payload.step_mm = stepMm
+    }
+    return get()._postJog('jog_cartesian', payload)
   },
 
   // ---------------------------------------------------------------------------
