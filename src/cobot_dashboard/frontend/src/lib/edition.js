@@ -52,12 +52,22 @@ export const FEATURE_MAP = Object.freeze({
   cameras_lidar:      EDITION_FULL,
   part_recognition:   EDITION_FULL,
   safety_page:        EDITION_FULL,
-  // 2026-09-04 Configure additions: the Configure tab is hidden
-  // entirely on basic devices, and cell-commissioning endpoints
-  // (POST/PUT/DELETE on /api/cells/*) refuse for basic. Cell STATE
-  // reads (GET /api/cells + GET /api/cells/active) stay open so
-  // Monitor + StatusBar keep working on basic.
-  configure:          EDITION_FULL,
+  // 2026-10-06 Configure-tab doctrine: Configure is a CORE setting
+  // surface (I/O hardware profile, collision guard, cell wizard
+  // launcher) and renders on BOTH editions. The 2026-09-04 decision
+  // to hide the tab on basic is SUPERSEDED — operators on basic
+  // devices still need the I/O interface control (declaring Synapse
+  // vs OEM is an installation-level choice, not a Full-tier affordance).
+  //
+  // `cell_commissioning` stays Full-only: the Configure tab's cell
+  // list reads (GET /api/cells + GET /api/cells/active) are already
+  // open on basic, and the Setup Wizard's cell-write endpoints
+  // (POST/PUT/DELETE on /api/cells/*) continue to refuse for basic.
+  // Basic operators see the Configure tab + the I/O profile section +
+  // the collision-guard section + a read-only cell list; the
+  // "+ Commission a New Cell" write path is still Full-gated at the
+  // backend.
+  configure:          EDITION_BASIC,
   cell_commissioning: EDITION_FULL,
   // 2026-09-08 banner removal: guard-state visibility (footer
   // "Guards OFF" text next to disk) is full-only. Basic shows

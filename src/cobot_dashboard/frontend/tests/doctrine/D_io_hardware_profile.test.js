@@ -162,6 +162,69 @@ test('TopBar imports shouldShowSynapseTab + gates the Synapse tab on it', () => 
       + 'the synapse tab — otherwise OEM operators see a dead tab.'))
 })
 
+test('Configure tab actually survives the TopBar filter at the DEFAULT edition', async () => {
+  // Earlier version of this pin only grep-checked that `configure`
+  // appears in the TABS literal. That is a FALSE ECHO: TopBar.jsx
+  // then filters every tab through `isFeatureEnabled(feature, edition)`
+  // against the live `edition` value, which defaults to 'basic'. If
+  // FEATURE_MAP.configure is EDITION_FULL (as it was on 2026-09-04),
+  // Configure is dropped on every basic device — the live app renders
+  // the nav ending at Event Log, exactly the operator-reported bug.
+  //
+  // This test SIMULATES the real TopBar filter: parses TABS from the
+  // source, imports FEATURE_MAP + TAB_TO_FEATURE + isFeatureEnabled
+  // from lib/edition.js, applies the exact same predicate TopBar
+  // applies, and asserts Configure survives. Catches: tab removed
+  // from TABS, tab re-gated to Full, feature mapping broken.
+  const { FEATURE_MAP, TAB_TO_FEATURE, isFeatureEnabled, EDITION_BASIC }
+    = await import('../../src/lib/edition.js')
+  // Parse the TABS array from TopBar source — same shape as the file.
+  const tabsSrc = topbarSrc.match(/const TABS = \[([\s\S]*?)\]/)[1]
+  const ids = Array.from(tabsSrc.matchAll(/id:\s*['"]([a-z_0-9]+)['"]/g))
+    .map((m) => m[1])
+  assert.ok(ids.includes('configure'),
+    v('TABS literal must declare id:"configure" — the Configure tab.'))
+  // Apply TopBar's exact filter at the default edition. The live app
+  // ships with edition='basic' (the useStore slice default, matched
+  // by the /api/edition response's `default:"basic"` field). Configure
+  // MUST pass the filter — otherwise the operator sees no Configure
+  // tab, as reported 2026-10-06.
+  const edition = EDITION_BASIC
+  const visible = ids.filter((id) => {
+    const feat = TAB_TO_FEATURE[id] || id
+    return isFeatureEnabled(feat, edition)
+  })
+  assert.ok(visible.includes('configure'),
+    v(`Configure tab must survive the TopBar filter at the default `
+      + `edition='${edition}'. Current FEATURE_MAP.configure = `
+      + `${JSON.stringify(FEATURE_MAP.configure)}. The 2026-10-06 `
+      + `Configure-tab doctrine ungates Configure for both editions `
+      + `— it is a core setting surface, not a Full-tier affordance.`))
+  // And Configure must be the LAST visible tab — doctrine from the
+  // same directive. If this fails, something else slipped to the end.
+  assert.equal(visible[visible.length - 1], 'configure',
+    v(`Configure must be the LAST visible tab at edition='${edition}'. `
+      + `Got order: ${JSON.stringify(visible)}.`))
+})
+
+test('Configure tab also survives the TopBar filter at edition=full', async () => {
+  const { FEATURE_MAP, TAB_TO_FEATURE, isFeatureEnabled }
+    = await import('../../src/lib/edition.js')
+  const tabsSrc = topbarSrc.match(/const TABS = \[([\s\S]*?)\]/)[1]
+  const ids = Array.from(tabsSrc.matchAll(/id:\s*['"]([a-z_0-9]+)['"]/g))
+    .map((m) => m[1])
+  const visible = ids.filter((id) => {
+    const feat = TAB_TO_FEATURE[id] || id
+    return isFeatureEnabled(feat, 'full')
+  })
+  assert.ok(visible.includes('configure'),
+    v(`Configure tab must be visible on edition='full' too. `
+      + `FEATURE_MAP.configure=${JSON.stringify(FEATURE_MAP.configure)}.`))
+  assert.equal(visible[visible.length - 1], 'configure',
+    v(`Configure must be the LAST visible tab on full too — ordering `
+      + `is set by TABS and is edition-independent.`))
+})
+
 test('TopBar reads ioHardwareProfile from the store', () => {
   assert.ok(/ioHardwareProfile/.test(topbarSrc),
     v('TopBar must read `ioHardwareProfile` from useStore so the '
