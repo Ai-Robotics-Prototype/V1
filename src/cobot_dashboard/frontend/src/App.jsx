@@ -288,6 +288,8 @@ export default function App() {
   const hydrateCells    = useStore((s) => s.hydrateCells)
   const hydratePrograms = useStore((s) => s.hydratePrograms)
   const hydrateEdition  = useStore((s) => s.hydrateEdition)
+  const hydrateIoHardwareProfile = useStore(
+    (s) => s.hydrateIoHardwareProfile)
   const edition         = useStore((s) => s.edition)
   const setTab          = useStore((s) => s.setTab)
   const setSynapseIOSectionOpen = useStore(
@@ -318,6 +320,11 @@ export default function App() {
     // default). Hydrating first keeps a Full-only tab from
     // flash-rendering on a Full PC during the initial paint.
     hydrateEdition()
+    // Hydrate the I/O hardware profile (Configure tab doctrine) so
+    // wizards, port formatters, and the TopBar Synapse-tab gate all
+    // see the operator-declared choice on the first paint — before
+    // the user navigates into any wizard.
+    hydrateIoHardwareProfile()
     // 2026-08-05 (refresh persistence, fork registry:
     // page_context_persistence): rehydrate the last-open program
     // for THIS device from the server. If a draft with a
@@ -396,12 +403,22 @@ export default function App() {
   // `editionHydrated` so the guard only fires after the server
   // has answered.
   const editionHydrated = useStore((s) => s.editionHydrated)
+  const ioHardwareProfile = useStore((s) => s.ioHardwareProfile)
   const _tabFeature = TAB_TO_FEATURE[activeTab] || activeTab
   const _tabAllowed = isFeatureEnabled(_tabFeature, edition)
   useEffect(() => {
     if (!editionHydrated) return
     if (!_tabAllowed && activeTab !== 'monitor') setTab('monitor')
   }, [editionHydrated, _tabAllowed, activeTab, setTab])
+
+  // Hardware-profile tab fallback (2026-10-06). If the operator flips
+  // to OEM while the Synapse tab is active, send them back to Monitor
+  // — the Synapse connection map models a panel that isn't present.
+  useEffect(() => {
+    if (ioHardwareProfile === 'oem' && activeTab === 'synapse') {
+      setTab('monitor')
+    }
+  }, [ioHardwareProfile, activeTab, setTab])
 
   // Keep the two 3D-heavy tabs persistently mounted, toggled by CSS
   // display, so switching between them doesn't tear down the Canvas +

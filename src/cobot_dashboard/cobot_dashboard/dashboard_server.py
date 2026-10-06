@@ -10515,6 +10515,15 @@ if FASTAPI_AVAILABLE:
         'COBOT_CELL', '/opt/cobot/cell.json')
     _CELL_LOCK = threading.RLock()
 
+    # I/O hardware profile — "synapse" (NeuRobots Synapse panel attached)
+    # or "oem" (customer wiring directly to CC10-A controller DO/DI).
+    # Operator-declared, never auto-detected. Persisted in cell.json meta.
+    # Default is "synapse" to preserve the behaviour of every already-
+    # deployed install; a fresh customer install flips this to "oem" from
+    # the Configure tab before provisioning tools/fixtures.
+    _IO_HARDWARE_PROFILES = ('synapse', 'oem')
+    _IO_HARDWARE_PROFILE_DEFAULT = 'synapse'
+
     def _empty_cell() -> dict:
         now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         return {
@@ -10522,6 +10531,7 @@ if FASTAPI_AVAILABLE:
             'meta': {
                 'created_at': now, 'updated_at': now,
                 'migrations': [],
+                'io_hardware_profile': _IO_HARDWARE_PROFILE_DEFAULT,
             },
         }
 
@@ -10531,13 +10541,71 @@ if FASTAPI_AVAILABLE:
                 d = json.load(fh)
             if isinstance(d, dict) and isinstance(d.get('eoats'), list) \
                     and isinstance(d.get('fixtures'), list):
-                d.setdefault('meta', {})
+                meta = d.setdefault('meta', {})
+                # Back-compat: pre-profile cell.json files have no
+                # io_hardware_profile key. Materialize the default on
+                # read so every downstream caller sees the field.
+                if meta.get('io_hardware_profile') \
+                        not in _IO_HARDWARE_PROFILES:
+                    meta['io_hardware_profile'] = \
+                        _IO_HARDWARE_PROFILE_DEFAULT
                 return d
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
             pass
         return _empty_cell()
+
+    def _cell_io_hardware_profile(cell: dict | None = None) -> str:
+        """Read the active I/O hardware profile from cell.json. Falls
+        back to the default on any shape surprise."""
+        try:
+            c = cell if isinstance(cell, dict) else _read_cell()
+            p = (c.get('meta') or {}).get('io_hardware_profile')
+            if p in _IO_HARDWARE_PROFILES:
+                return p
+        except Exception:
+            pass
+        return _IO_HARDWARE_PROFILE_DEFAULT
+
+    def _cell_profile_assignment_counts(cell: dict) -> dict:
+        """Count operator assignments that reference Synapse port ids
+        (V<n>/IN<n>/OUT<n>/SAFETY<n>). The Configure tab shows these
+        when the operator switches profiles so nothing gets silently
+        re-mapped — existing assignments are FLAGGED for review."""
+        import re as _re
+        syn_re = _re.compile(r'^(V|IN|OUT|SAFETY)\s*0*\d+$', _re.I)
+
+        def _is_syn(x):
+            return isinstance(x, str) and bool(syn_re.match(x.strip()))
+
+        eoat_hits = 0
+        for e in (cell.get('eoats') or []):
+            if _is_syn(e.get('valve')):
+                eoat_hits += 1
+                continue
+            if any(_is_syn(a.get('valve'))
+                   for a in (e.get('actuators') or []) if isinstance(a, dict)):
+                eoat_hits += 1
+                continue
+            if any(_is_syn(x) for x in (e.get('inputs') or [])):
+                eoat_hits += 1
+                continue
+            if any(_is_syn(x) for x in (e.get('outputs') or [])):
+                eoat_hits += 1
+        fixture_hits = 0
+        for f in (cell.get('fixtures') or []):
+            if _is_syn(f.get('valve')) or _is_syn(f.get('out')) \
+                    or _is_syn(f.get('in_done')):
+                fixture_hits += 1
+                continue
+            if any(_is_syn(x) for x in (f.get('inputs') or [])):
+                fixture_hits += 1
+                continue
+            if any(_is_syn(x) for x in (f.get('outputs') or [])):
+                fixture_hits += 1
+        return {'eoats_with_synapse_ports': eoat_hits,
+                'fixtures_with_synapse_ports': fixture_hits}
 
     def _write_cell(cell: dict) -> None:
         os.makedirs(os.path.dirname(_CELL_PATH), exist_ok=True)
@@ -10920,6 +10988,71 @@ if FASTAPI_AVAILABLE:
         with _SYNAPSE_PORTMAP_LOCK:
             pm = _read_synapse_portmap()
         return {'ok': True, 'portmap': pm}
+
+    # ─── I/O hardware profile (Configure tab) ─────────────────────────
+    # "synapse": operator-facing I/O routes through the Synapse portmap
+    #            (Valve 01-10 / IN 01-10 / OUT 01-10 / SAFETY).
+    # "oem":     operator-facing I/O renders CC10-A native channels
+    #            directly (DO0-15 / DI0-15 / safety-relay block). The
+    #            portmap is BYPASSED for display; codegen still emits
+    #            the same raw channel so wire output is unchanged.
+    #
+    # The operator declares which hardware is attached. Switching
+    # profiles never silently re-maps existing cell assignments —
+    # the response includes a count of currently-assigned Synapse
+    # ports so the UI can warn + flag them for review.
+
+    @app.get("/api/config/io_hardware_profile")
+    async def api_io_hardware_profile_get():
+        with _CELL_LOCK:
+            cell = _read_cell()
+        return {
+            'ok': True,
+            'profile': _cell_io_hardware_profile(cell),
+            'default': _IO_HARDWARE_PROFILE_DEFAULT,
+            'choices': list(_IO_HARDWARE_PROFILES),
+            'counts': _cell_profile_assignment_counts(cell),
+        }
+
+    @app.put("/api/config/io_hardware_profile")
+    async def api_io_hardware_profile_put(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        profile = str((body or {}).get('profile') or '').strip().lower()
+        if profile not in _IO_HARDWARE_PROFILES:
+            return JSONResponse({
+                'ok': False,
+                'error': 'invalid_profile',
+                'choices': list(_IO_HARDWARE_PROFILES),
+            }, status_code=400)
+        with _CELL_LOCK:
+            cell = _read_cell()
+            prev = _cell_io_hardware_profile(cell)
+            cell.setdefault('meta', {})['io_hardware_profile'] = profile
+            _write_cell(cell)
+            counts = _cell_profile_assignment_counts(cell)
+        try:
+            _event_log.emit(
+                severity='info',
+                source='configure',
+                code='io_hardware_profile_set',
+                operator_message=(
+                    f'I/O interface set to {profile.upper()}'
+                    + (f' (was {prev.upper()})' if prev != profile else '')),
+                technical_detail=f'cell.meta.io_hardware_profile={profile}',
+                context={'previous': prev, 'next': profile,
+                         'counts': counts},
+            )
+        except Exception:
+            pass
+        return {
+            'ok': True,
+            'profile': profile,
+            'previous': prev,
+            'counts': counts,
+        }
 
     @app.post("/api/event_log/append")
     async def api_event_log_append(request: Request):

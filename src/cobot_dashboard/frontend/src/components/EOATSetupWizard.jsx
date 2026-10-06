@@ -16,6 +16,11 @@ import {
 import { useKeyboardInset } from '../lib/keyboardInset'
 import { useStore } from '../store/useStore'
 import { portDisplayName, portListDisplay } from '../lib/cellEntryDisplay'
+import {
+  useIoHardwareProfile, isOemProfile, shouldShowSynapseMap,
+  formatPortName, wiringTargetCopy, profileInterfaceNoun,
+} from '../lib/ioHardwareProfile'
+import { useSynapsePortmap } from '../lib/synapsePortmap'
 import WhyExpander from './WhyExpander'
 import {
   CAPABILITY_CATALOG as _CAPABILITY_CATALOG,
@@ -640,8 +645,11 @@ export function GuidanceBlock({ port }) {
     inputs:  port.required_inputs  || [],
     outputs: port.required_outputs || [],
   }
+  const profile = useIoHardwareProfile()
+  const portmap = useSynapsePortmap()
   return (
     <div data-testid="hardware-setup-guidance"
+         data-io-profile={profile}
          style={{ marginBottom: 16 }}>
       {port.notes && (
         <div style={{
@@ -653,14 +661,126 @@ export function GuidanceBlock({ port }) {
           {port.notes}
         </div>
       )}
-      <SynapseConnectionMap
-        mode="guidance"
-        highlight={highlight}
-        labelOverrides={port.label_overrides || {}}
-        typeOverrides={port.type_overrides || {}}
-      />
+      {shouldShowSynapseMap(profile) ? (
+        <SynapseConnectionMap
+          mode="guidance"
+          highlight={highlight}
+          labelOverrides={port.label_overrides || {}}
+          typeOverrides={port.type_overrides || {}}
+        />
+      ) : (
+        <OemWiringGuidance
+          highlight={highlight}
+          labelOverrides={port.label_overrides || {}}
+          portmap={portmap}
+        />
+      )}
     </div>
   )
+}
+
+// OEM wiring guidance — replaces the Synapse connection-map diagram
+// when the operator has declared the OEM profile. Lists each port the
+// tool requires, resolved to its CC10-A native channel (DO<n>/DI<n>),
+// with the operator-friendly label from the Synapse-side callouts
+// repurposed as the per-row description. Instructions read "Wire the
+// gripper's valve to output DO3 on the controller" rather than
+// "Connect to Valve 03" + a glowing panel diagram.
+function OemWiringGuidance({ highlight, labelOverrides, portmap }) {
+  const rows = []
+  for (const v of (highlight.valves || [])) {
+    rows.push({
+      kind: 'valve', synapseId: v,
+      role: labelOverrides[v] || 'Valve',
+    })
+  }
+  for (const i of (highlight.inputs || [])) {
+    rows.push({
+      kind: 'input', synapseId: i,
+      role: labelOverrides[i] || 'Sensor input',
+    })
+  }
+  for (const o of (highlight.outputs || [])) {
+    rows.push({
+      kind: 'output', synapseId: o,
+      role: labelOverrides[o] || 'Output',
+    })
+  }
+  return (
+    <div
+      data-testid="oem-wiring-guidance"
+      style={{
+        padding: 12,
+        background: '#F9FAFB', border: '1px solid #E5E7EB',
+        borderRadius: 8, color: '#111827',
+      }}>
+      <div style={{
+        fontSize: 12, fontWeight: 700, textTransform: 'uppercase',
+        letterSpacing: 0.6, color: '#374151', marginBottom: 8,
+      }}>
+        Wire these channels on the controller
+      </div>
+      <div style={{ fontSize: 12, color: '#4B5563', marginBottom: 10,
+                    lineHeight: 1.5 }}>
+        Open the CC10-A cabinet and land each wire on the native
+        inputs-and-outputs block, using the channel label shown on
+        each row below. Safety wiring continues to use the safety
+        relay block, same as the Synapse configuration.
+      </div>
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 12, color: '#6B7280' }}>
+          This tool needs no I/O wiring.
+        </div>
+      ) : (
+        <ul data-testid="oem-wiring-list"
+            style={{ listStyle: 'none', padding: 0, margin: 0,
+                     display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {rows.map((r, i) => {
+            const target = formatPortName(r.synapseId, portmap, 'oem')
+            return (
+              <li
+                key={i}
+                data-testid="oem-wiring-row"
+                data-kind={r.kind}
+                data-channel={target}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '8px 10px', background: '#fff',
+                  border: '1px solid #E5E7EB', borderRadius: 6,
+                }}>
+                <span style={{
+                  fontFamily: 'ui-monospace, monospace',
+                  fontSize: 12, fontWeight: 700,
+                  padding: '2px 8px', borderRadius: 4,
+                  background: r.kind === 'input' ? '#E0F2FE' : '#FEF3C7',
+                  color:      r.kind === 'input' ? '#075985' : '#92400E',
+                  minWidth: 56, textAlign: 'center',
+                }}>
+                  {target}
+                </span>
+                <span style={{ fontSize: 12, color: '#1F2937' }}>
+                  {r.role}
+                </span>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+// Short wiring-sentence helper for custom-EOAT + external-fixture
+// steps where a single-line prompt reads better than a list. Shared
+// so wizard surfaces don't fork their copy.
+// eslint-disable-next-line no-unused-vars
+export function wiringPromptCopy({ synapseId, role, portmap, profile }) {
+  const target = wiringTargetCopy(synapseId, portmap, profile)
+  if (!target) return role || ''
+  if (isOemProfile(profile)) {
+    return `Wire the ${role || 'device'} to ${target} on ${profileInterfaceNoun(profile)}.`
+  }
+  return `Connect the ${role || 'device'} to ${target} on ${profileInterfaceNoun(profile)}.`
 }
 
 // Standard-path sensor-count chooser (2026-10-01 directive). The

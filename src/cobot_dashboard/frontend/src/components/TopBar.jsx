@@ -1,35 +1,44 @@
 import { useStore } from '../store/useStore'
 import Brand from './Brand'
 import { isFeatureEnabled, TAB_TO_FEATURE } from '../lib/edition'
+import { shouldShowSynapseTab } from '../lib/ioHardwareProfile'
 import UserChip from './UserChip'
 
-// 2026-09-21 operator directive: I/O tab RETIRED. Its content
-// (IOPortMap — manual overrides, DO2 confirm, refusal copy, live
-// 1 Hz poll) moved to the "Main Internal Robot Controller I/O"
-// expandable section at the bottom of the Synapse page. Old
-// bookmarks / stale persisted activeTab='io' are redirected in
-// App.jsx to synapse with the section auto-expanded.
+// Tab order (2026-10-06 Configure-tab doctrine):
+//   NeuRobots · Monitor · Program Library · Program · 3D View
+//     · [Cameras & LiDAR] · [Part Recognition] · [Safety]
+//     · Synapse · Event Log · Configure
 //
-// Tab order: Synapse sits immediately LEFT of Event Log; Event
-// Log is the LAST tab. On both editions.
+// Bracketed tabs are Full-edition-only (filtered below). Configure
+// moves to the TRAILING edge per the hardware-profile directive: it
+// is the installation-setup home, and belongs after Event Log so a
+// basic-edition tablet still reads Monitor → Program Library → Program
+// → 3D View → Synapse → Event Log → Configure.
+//
+// The Synapse tab is HIDDEN entirely when the operator has declared
+// the OEM profile (no Synapse panel attached) — the Synapse connection
+// map models a panel that doesn't exist in OEM installs, and the
+// Main Internal Robot Controller I/O panel is reachable via Configure.
+//
+// Historic note: the standalone I/O tab was retired 2026-09-21 (its
+// content moved into the Synapse page's expandable section). Stale
+// persisted activeTab='io' is redirected in App.jsx.
 const TABS = [
   { id: 'monitor',          label: 'Monitor' },
   { id: 'programs',         label: 'Program Library' },
   { id: 'program',          label: 'Program' },
   { id: '3dview',           label: '3D View' },
-  // Full-only surfaces sit between the shared basic-friendly tabs
-  // and the Synapse / Event Log pair. Basic edition hides all four
-  // of these via the edition filter below — resulting visible order
-  // on basic: Monitor · Program Library · Program · 3D View ·
-  // Synapse · Event Log.
+  // Full-only surfaces — hidden on basic via the edition filter.
   { id: 'sensors',          label: 'Cameras & LiDAR' },
   { id: 'adaptive_picking', label: 'Part Recognition' },
   { id: 'safety',           label: 'Safety' },
-  { id: 'configure',        label: 'Configure' },
-  // Synapse — hosts the connection map + IO section (post-2026-09-21).
+  // Synapse — hidden entirely in OEM mode via shouldShowSynapseTab.
   { id: 'synapse',          label: 'Synapse' },
-  // Event Log — LAST tab, both editions.
+  // Event Log.
   { id: 'event_log',        label: 'Event Log' },
+  // Configure — the trailing installation-setup tab. Hosts the I/O
+  // Interface control that owns the Synapse-vs-OEM profile pick.
+  { id: 'configure',        label: 'Configure' },
 ]
 
 const WS_DOT = {
@@ -46,6 +55,7 @@ export default function TopBar() {
   const triggerEstop = useStore((s) => s.triggerEstop)
   const releaseEstop = useStore((s) => s.releaseEstop)
   const edition      = useStore((s) => s.edition)
+  const ioProfile    = useStore((s) => s.ioHardwareProfile)
   // Fleet-home affordances (2026-09-21 operator directive).
   //   * `fleetTotal > 1` → render the "Fleet" chip so the operator
   //     can return to the grid from any tab.
@@ -60,9 +70,16 @@ export default function TopBar() {
   // map render NOTHING (not disabled-greyed — absent). Safety is
   // edition-INDEPENDENT and left unmapped in TAB_TO_FEATURE, so
   // isFeatureEnabled returns true for every edition on that key.
+  //
+  // Hardware-profile filter (2026-10-06): the Synapse tab vanishes
+  // in OEM mode — the connection-map page models a panel that
+  // isn't attached. Configure stays visible in both profiles so the
+  // operator can flip back.
   const visibleTabs = TABS.filter((tab) => {
     const feature = TAB_TO_FEATURE[tab.id] || tab.id
-    return isFeatureEnabled(feature, edition)
+    if (!isFeatureEnabled(feature, edition)) return false
+    if (tab.id === 'synapse' && !shouldShowSynapseTab(ioProfile)) return false
+    return true
   })
 
   // Safety: trigger fires on the first tap with no confirmation — an

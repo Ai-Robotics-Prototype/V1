@@ -381,6 +381,52 @@ const storeDefinition = (set, get) => ({
   // this edition render NOTHING (absent, not disabled-greyed).
   edition: 'basic',
   editionHydrated: false,
+  // I/O hardware profile — "synapse" (NeuRobots Synapse panel wired to
+  // CC10-A via the single portmap) or "oem" (customer wiring directly
+  // to CC10-A DO/DI). Operator-declared from the Configure tab, never
+  // auto-detected. Default "synapse" preserves today's deployed
+  // behaviour on upgrade. Reshapes the Synapse-tab visibility,
+  // wizard copy, and port-name formatting everywhere via
+  // lib/ioHardwareProfile.js.
+  ioHardwareProfile: 'synapse',
+  ioHardwareProfileHydrated: false,
+  async hydrateIoHardwareProfile() {
+    try {
+      const res = await fetch('/api/config/io_hardware_profile')
+      if (!res.ok) {
+        set({ ioHardwareProfileHydrated: true })
+        return
+      }
+      const data = await res.json()
+      const prof = (data && data.profile) || 'synapse'
+      if (prof === 'synapse' || prof === 'oem') {
+        set({ ioHardwareProfile: prof, ioHardwareProfileHydrated: true })
+      } else {
+        set({ ioHardwareProfileHydrated: true })
+      }
+    } catch { set({ ioHardwareProfileHydrated: true }) }
+  },
+  async setIoHardwareProfile(profile) {
+    const prof = (profile === 'oem' || profile === 'synapse')
+      ? profile : null
+    if (!prof) return { ok: false, error: 'invalid_profile' }
+    try {
+      const res = await fetch('/api/config/io_hardware_profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile: prof }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data && data.profile) {
+        set({ ioHardwareProfile: data.profile })
+        return { ok: true, previous: data.previous,
+                 counts: data.counts || {} }
+      }
+      return { ok: false, error: data.error || `HTTP ${res.status}` }
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) }
+    }
+  },
   // Fleet-home state (2026-09-21 operator directive). Populated once
   // at boot from /api/fleet/peers. `fleetTotal` gates the back-to-
   // fleet chip in TopBar; `robotIdentity` names THIS robot in the

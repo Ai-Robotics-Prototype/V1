@@ -9,6 +9,8 @@ import {
 } from '../lib/cellActions'
 import { shouldReviewHold } from '../lib/cellReview'
 import { entrySubtitle } from '../lib/cellEntryDisplay'
+import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
+import { useSynapsePortmap } from '../lib/synapsePortmap'
 import { useStore } from '../store/useStore'
 
 // My Cell — read-only summary of the cell registry, with per-entry
@@ -253,7 +255,13 @@ function _EntryRow({
   programsReferencing,
   ...rest
 }) {
-  const subtitle = entrySubtitle(entry)
+  // Profile-aware subtitle. In Synapse mode (default), reads "Vacuum
+  // tool · Valve 03 · IN 04". In OEM mode, the same record renders as
+  // "Vacuum tool · DO3 · DI4" so the operator sees the controller-
+  // native channels they wired.
+  const profile = useIoHardwareProfile()
+  const portmap = useSynapsePortmap()
+  const subtitle = entrySubtitle(entry, { profile, portmap })
   return (
     <div data-testid="my-cell-entry"
          data-cell-id={entry.id}

@@ -296,25 +296,38 @@ test('TopBar TABS does NOT contain the retired `io` tab', () => {
       + 'page\'s expandable section.'))
 })
 
-test('TopBar nav order: Synapse immediately LEFT of Event Log, Event Log LAST', () => {
-  // Grep the TABS array only (not the whole file — Event Log
-  // appears in comments too).
+test('TopBar nav order: Synapse before Event Log, Event Log before Configure, Configure LAST', () => {
+  // 2026-10-06 Configure-tab doctrine update: Configure moves to the
+  // trailing edge of TABS (the installation-setup home). The 2026-
+  // 09-21 "Event Log is LAST" rule is superseded — Event Log is now
+  // the SECOND-to-last tab, with Configure after it.
+  //
+  // Grep the TABS array only (not the whole file — tab ids appear in
+  // comments too).
   const arrMatch = topbarSrc.match(/const TABS = \[([\s\S]*?)\]/)
   assert.ok(arrMatch, v('TopBar must declare const TABS = [...]'))
   const arr = arrMatch[1]
   const synIdx = arr.indexOf("id: 'synapse'")
   const evIdx  = arr.indexOf("id: 'event_log'")
+  const cfgIdx = arr.indexOf("id: 'configure'")
   assert.ok(synIdx > 0, v('synapse tab id must be present in TABS'))
   assert.ok(evIdx  > 0, v('event_log tab id must be present in TABS'))
+  assert.ok(cfgIdx > 0, v('configure tab id must be present in TABS'))
   assert.ok(synIdx < evIdx,
     v(`Synapse must be declared BEFORE Event Log in TABS. `
       + `Found synapse@${synIdx}, event_log@${evIdx}.`))
-  // Event Log must be LAST: no other id: '...' entry appears
-  // AFTER it in the array body.
-  const afterEv = arr.slice(evIdx)
-  assert.equal(/id:\s*['"][^'"]+['"]/.test(afterEv.replace(/id:\s*['"]event_log['"]/, '')),
+  assert.ok(evIdx < cfgIdx,
+    v(`Event Log must be declared BEFORE Configure in TABS — the `
+      + `Configure-tab doctrine makes Configure the trailing tab. `
+      + `Found event_log@${evIdx}, configure@${cfgIdx}.`))
+  // Configure must be LAST: no other id: '...' entry appears AFTER
+  // it in the array body.
+  const afterCfg = arr.slice(cfgIdx)
+  assert.equal(
+    /id:\s*['"][^'"]+['"]/.test(
+      afterCfg.replace(/id:\s*['"]configure['"]/, '')),
     false,
-    v('Event Log must be the LAST tab in TABS — no tab declaration '
+    v('Configure must be the LAST tab in TABS — no tab declaration '
       + 'may appear after it.'))
 })
 

@@ -3,6 +3,9 @@ import { useStore } from '../store/useStore'
 import SetupWizard from '../components/SetupWizard'
 import CellDetailPanel from '../components/CellDetailPanel'
 import { useCellWizardStore } from '../store/cellWizardStore'
+import {
+  PROFILE_SYNAPSE, PROFILE_OEM, profileLabel,
+} from '../lib/ioHardwareProfile'
 // 2026-09-04 Configure additions: Cam0CalibrationCard, RecentRunsCard,
 // and getServedBundleHash imports retired along with the Camera
 // calibration disclosure, Motion recordings, and Provenance card.
@@ -740,6 +743,327 @@ function _SystemCheckSection_UNUSED_20260904() {
 // /api/deploy_status for anyone who needs it.
 
 
+// ---------------------------------------------------------------------------
+// I/O Hardware Profile — the Configure tab's primary setting
+// (2026-10-06 operator directive).
+//
+// Operator declares which interface the controller is wired to:
+//   • "Synapse Panel" — NeuRobots Synapse breakout (Valve/IN/OUT/SAFETY
+//     bulkheads). Operator-facing wizards use Synapse port names and
+//     the pulse-glow connection-map diagram.
+//   • "OEM Controller I/O" — direct wiring to the CC10-A controller's
+//     native DO/DI block. Wizards address channels by their silkscreen
+//     ids (DO0–15 / DI0–15, see HARDWARE.md > I/O vocabulary). The
+//     Synapse connection-map tab and diagram are hidden.
+//
+// Switching profiles never silently re-maps existing assignments —
+// the switch confirm shows how many tools/fixtures are currently
+// bound to Synapse port names so the operator knows to re-check
+// their wiring. Codegen is unchanged in both profiles: the same
+// physical DO/DI channel fires regardless.
+//
+// SAFETY (e-stop + protective stop) is identical in both profiles —
+// it lives in the safety-relay block + firmware, outside this control.
+// ---------------------------------------------------------------------------
+
+function HardwareProfileSection() {
+  const current  = useStore((s) => s.ioHardwareProfile)
+  const hydrated = useStore((s) => s.ioHardwareProfileHydrated)
+  const setProf  = useStore((s) => s.setIoHardwareProfile)
+  const refreshCells = useStore((s) => s.refreshCells)
+  const [busy, setBusy]       = useState(false)
+  const [confirm, setConfirm] = useState(null)   // target profile or null
+  const [counts, setCounts]   = useState(null)
+  const [error, setError]     = useState(null)
+  const [lastOk, setLastOk]   = useState(null)   // {prev,next,counts}
+
+  // Pull the live assignment-count snapshot whenever the operator
+  // starts a switch confirm. We do this on confirm-open rather than
+  // on mount so the counts reflect the current cell state (operators
+  // can add tools between viewing Configure and switching profiles).
+  useEffect(() => {
+    if (!confirm) { setCounts(null); return }
+    let alive = true
+    fetch('/api/config/io_hardware_profile')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (alive && d) setCounts(d.counts || {}) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [confirm])
+
+  async function applySwitch(target) {
+    setBusy(true); setError(null)
+    try {
+      const r = await setProf(target)
+      if (!r.ok) {
+        setError(r.error || 'switch failed')
+        return
+      }
+      setLastOk({ previous: r.previous, next: target, counts: r.counts || {} })
+      setConfirm(null)
+      // Cells list carries nothing new today, but refresh so any
+      // follow-up Configure panels (CellDetailPanel) re-render against
+      // the new profile without a tab reload.
+      try { refreshCells() } catch { /* nop */ }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const isSynapse = current === PROFILE_SYNAPSE
+  const isOem     = current === PROFILE_OEM
+
+  const choice = (id, title, description, diagram) => {
+    const active = (id === current)
+    return (
+      <button
+        type="button"
+        data-testid="io-profile-choice"
+        data-profile={id}
+        data-active={String(active)}
+        onClick={() => {
+          if (busy) return
+          if (active) return
+          setConfirm(id)
+        }}
+        style={{
+          flex: 1, minWidth: 0,
+          textAlign: 'left',
+          padding: '14px 16px',
+          background: active ? 'rgba(37,99,235,0.08)' : 'var(--bg-panel)',
+          border: `2px solid ${active ? '#2563EB' : 'var(--border)'}`,
+          borderRadius: 'var(--radius-sm)',
+          cursor: active ? 'default' : 'pointer',
+          color: 'var(--text-primary)',
+          display: 'flex', flexDirection: 'column', gap: 8,
+        }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{
+            display: 'inline-block',
+            width: 14, height: 14, borderRadius: '50%',
+            background: active ? '#2563EB' : 'transparent',
+            border: `2px solid ${active ? '#2563EB' : '#9CA3AF'}`,
+            flexShrink: 0,
+          }} />
+          <span style={{ fontSize: 14, fontWeight: 700 }}>{title}</span>
+          {active && (
+            <span style={{
+              fontSize: 10, fontWeight: 700,
+              padding: '2px 8px', borderRadius: 999,
+              background: '#DCFCE7', color: '#166534',
+              letterSpacing: 0.4,
+            }}>ACTIVE</span>
+          )}
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--text-secondary)',
+                      lineHeight: 1.5 }}>
+          {description}
+        </div>
+        <div
+          aria-hidden="true"
+          style={{
+            marginTop: 4,
+            padding: 10,
+            background: 'var(--bg-app)',
+            border: '1px dashed var(--border)',
+            borderRadius: 6,
+            fontFamily: 'ui-monospace, monospace',
+            fontSize: 11, color: 'var(--text-muted)',
+            whiteSpace: 'pre',
+            lineHeight: 1.35,
+          }}>{diagram}</div>
+      </button>
+    )
+  }
+
+  return (
+    <div
+      data-testid="io-hardware-profile-section"
+      data-profile={current}
+      style={{
+        background: 'var(--bg-surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius-lg)',
+        padding: '16px 20px',
+        display: 'flex', flexDirection: 'column', gap: 12,
+      }}>
+      <div style={{
+        fontSize: 11, fontWeight: 600, color: 'var(--text-primary)',
+        textTransform: 'uppercase', letterSpacing: '0.08em',
+        paddingBottom: 8, borderBottom: '1px solid var(--border)',
+      }}>
+        I/O Interface
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--text-secondary)',
+                    lineHeight: 1.5 }}>
+        Which I/O interface is wired to the robot controller? This
+        reshapes the port names shown in every wizard, hides or shows
+        the Synapse connection map, and tailors hookup instructions.
+        E-stop and protective-stop behaviour are unchanged.
+      </div>
+      {!hydrated && (
+        <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+          Loading current interface…
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        {choice(
+          PROFILE_SYNAPSE,
+          'Synapse Panel',
+          'The NeuRobots Synapse breakout is wired to the controller. '
+          + 'Operators address I/O by Synapse port name (Valve 01–10, '
+          + 'IN 01–10, OUT 01–10, SAFETY). Default on all shipped cells.',
+          '┌─────────────────────┐\n'
+          + '│  SYNAPSE PANEL     │\n'
+          + '│  Valve  IN   OUT   │\n'
+          + '│  SAFETY            │\n'
+          + '└──┬──────────────┬──┘\n'
+          + '   │  portmap     │\n'
+          + '   ▼              ▼\n'
+          + '   CC10-A DO/DI block',
+        )}
+        {choice(
+          PROFILE_OEM,
+          'OEM Controller I/O',
+          'The customer has wired directly to the CC10-A controller\'s '
+          + 'built-in I/O block. Operators address channels by DO/DI id '
+          + '(DO0–15, DI0–15, safety-relay ch1–4). The Synapse map is '
+          + 'hidden.',
+          '┌─────────────────────┐\n'
+          + '│  CC10-A controller │\n'
+          + '│  DO0..DO15         │\n'
+          + '│  DI0..DI15         │\n'
+          + '│  Safety ch1-4      │\n'
+          + '└─────────┬──────────┘\n'
+          + '          │ direct wiring\n'
+          + '          ▼\n'
+          + '          customer field devices',
+        )}
+      </div>
+      {isSynapse && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)',
+                      lineHeight: 1.5 }}>
+          Synapse tab is visible. Wizards show the connection-map
+          diagram and address I/O by Synapse port name.
+        </div>
+      )}
+      {isOem && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)',
+                      lineHeight: 1.5 }}>
+          Synapse tab is hidden. Wizards instruct the operator to wire
+          directly to the controller&rsquo;s DO/DI channels. The
+          internal controller-I/O panel is reachable from here (below).
+        </div>
+      )}
+      {error && (
+        <div style={{
+          fontSize: 12, color: '#B91C1C',
+          background: '#FEF2F2', border: '1px solid #FECACA',
+          padding: '8px 10px', borderRadius: 6,
+        }}>
+          Could not save: {String(error)}
+        </div>
+      )}
+      {lastOk && !confirm && !busy && (
+        <div
+          data-testid="io-profile-switch-receipt"
+          data-prev={lastOk.previous}
+          data-next={lastOk.next}
+          style={{
+            fontSize: 12, color: '#065F46',
+            background: '#ECFDF5', border: '1px solid #A7F3D0',
+            padding: '8px 10px', borderRadius: 6,
+          }}>
+          I/O interface changed to <b>{profileLabel(lastOk.next)}</b>
+          {lastOk.previous && lastOk.previous !== lastOk.next
+            ? <> (was <b>{profileLabel(lastOk.previous)}</b>)</>
+            : null}
+          .
+          {(lastOk.counts.eoats_with_synapse_ports > 0
+            || lastOk.counts.fixtures_with_synapse_ports > 0) && (
+            <> {' '}
+              {lastOk.counts.eoats_with_synapse_ports} tool(s) and
+              {' '}{lastOk.counts.fixtures_with_synapse_ports} fixture(s)
+              are flagged for wiring review — their port assignments
+              still reference Synapse names.
+            </>
+          )}
+        </div>
+      )}
+      {confirm && (
+        <div
+          data-testid="io-profile-switch-confirm"
+          data-target={confirm}
+          style={{
+            marginTop: 4, padding: 12,
+            background: '#111827', border: '1px solid #374151',
+            borderRadius: 6, color: '#E5E7EB',
+            display: 'flex', flexDirection: 'column', gap: 8,
+          }}>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>
+            Switch I/O Interface to {profileLabel(confirm)}?
+          </div>
+          <div style={{ fontSize: 12, lineHeight: 1.5 }}>
+            {confirm === PROFILE_OEM
+              ? ('Your tools and fixtures are currently set up with '
+                 + 'Synapse port names. Switching to OEM I/O means '
+                 + 're-checking each one\'s wiring on the controller\'s '
+                 + 'DO/DI block — existing assignments are flagged for '
+                 + 'review, never silently re-mapped.')
+              : ('Switching back to Synapse. Any assignments made under '
+                 + 'OEM mode will keep their raw DO/DI ids and will be '
+                 + 'flagged for review in the Synapse port scheme.')}
+          </div>
+          {counts && (counts.eoats_with_synapse_ports > 0
+                      || counts.fixtures_with_synapse_ports > 0) && (
+            <div
+              data-testid="io-profile-switch-flagged"
+              data-eoats={counts.eoats_with_synapse_ports}
+              data-fixtures={counts.fixtures_with_synapse_ports}
+              style={{
+                fontSize: 12, color: '#FCD34D',
+                background: '#422006', border: '1px solid #713F12',
+                padding: '8px 10px', borderRadius: 6,
+                fontFamily: 'ui-monospace, monospace',
+              }}>
+              Flagged for review on switch:
+              {' '}{counts.eoats_with_synapse_ports} tool(s),
+              {' '}{counts.fixtures_with_synapse_ports} fixture(s).
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              type="button"
+              data-testid="io-profile-switch-apply"
+              disabled={busy}
+              onClick={() => applySwitch(confirm)}
+              style={{
+                padding: '6px 14px', fontSize: 12, fontWeight: 700,
+                background: '#2563EB', color: '#fff', border: 'none',
+                borderRadius: 4, cursor: busy ? 'default' : 'pointer',
+              }}>
+              {busy ? 'Switching…' : `Switch to ${profileLabel(confirm)}`}
+            </button>
+            <button
+              type="button"
+              data-testid="io-profile-switch-cancel"
+              disabled={busy}
+              onClick={() => setConfirm(null)}
+              style={{
+                padding: '6px 14px', fontSize: 12,
+                background: 'transparent', color: '#E5E7EB',
+                border: '1px solid #374151',
+                borderRadius: 4, cursor: 'pointer',
+              }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function ConfigureLayout() {
   return (
     <div style={{
@@ -754,6 +1078,13 @@ export default function ConfigureLayout() {
       <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
         Configure
       </div>
+
+      {/* 2026-10-06 operator directive — Configure's primary setting
+          is the I/O hardware profile. This section renders FIRST so
+          every operator who lands here sees it and can declare which
+          interface is wired before provisioning tools/fixtures. */}
+      <HardwareProfileSection />
+
 
       {/* 2026-09-04 operator directive (Configure additions):
             * Configure tab flipped to full-only — hidden entirely

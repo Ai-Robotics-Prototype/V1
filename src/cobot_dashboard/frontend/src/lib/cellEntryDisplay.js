@@ -28,8 +28,33 @@
 
 import {
   displayNameForSynapse, isSynapseId, canonSynapse,
+  canonRaw, isRawId, displayNameForRaw, rawForSynapse,
 } from './synapsePortmap.js'
 import { FIXTURE_TYPES } from './fixturesData.js'
+
+// Local profile-aware formatter — kept inline so cellEntryDisplay can
+// be imported by both the frontend (via Vite) and the node test
+// runner without pulling the Zustand store into the dep graph. The
+// shared library at lib/ioHardwareProfile.js re-exports the same
+// logic in formatPortName() for callers that want it directly.
+const _SYN = 'synapse'
+const _OEM = 'oem'
+function _formatForProfile(id, portmap, profile) {
+  if (!id) return ''
+  const prof = profile === _OEM ? _OEM : _SYN
+  if (prof === _OEM) {
+    if (isSynapseId(id)) {
+      const raw = rawForSynapse(portmap, id)
+      if (raw) return raw
+      return `Unmapped Synapse port ${canonSynapse(id) || String(id)}`
+    }
+    const r = canonRaw(id)
+    return r || String(id)
+  }
+  if (isSynapseId(id)) return displayNameForSynapse(id)
+  if (isRawId(id))     return displayNameForRaw(portmap, id)
+  return String(id)
+}
 
 // EOAT kind → operator-plain label. Mirrors effectorOf() canonical
 // tokens from lib/effectorVocab.js, but the display mapping is a UI
@@ -85,26 +110,40 @@ function _collectPortIds(entry) {
   return ids
 }
 
-// Render a single id through the portmap. Non-Synapse ids pass
-// through verbatim (there shouldn't be any at this layer, but the
-// honest fallback matches the portmap library's own behavior).
-export function portDisplayName(id) {
+// Render a single id through the portmap, profile-aware.
+//
+//   portDisplayName('V03')
+//     → "Valve 03" (SYNAPSE, default — unchanged behaviour)
+//     → "DO3"      (OEM)
+//
+// `opts` is optional: { profile, portmap }. Omit to get Synapse
+// behaviour (back-compat with every caller that predates the
+// profile system — doctrine tests pin this exact default).
+export function portDisplayName(id, opts) {
   if (!id) return ''
-  if (isSynapseId(id)) return displayNameForSynapse(id)
-  return String(id)
+  const prof = (opts && opts.profile) || _SYN
+  const pm   = opts && opts.portmap   // may be null — OK for Synapse ids
+  if (prof === _SYN) {
+    if (isSynapseId(id)) return displayNameForSynapse(id)
+    return String(id)
+  }
+  return _formatForProfile(id, pm, prof)
 }
 
-// Subtitle port tail — "Valve 03 · IN 04 · IN 06".
-export function portsLine(entry) {
+// Subtitle port tail — "Valve 03 · IN 04 · IN 06". Profile-aware;
+// defaults to Synapse display when no opts passed.
+export function portsLine(entry, opts) {
   const ids = _collectPortIds(entry)
-  return ids.map(portDisplayName).filter(Boolean).join(' · ')
+  return ids
+    .map((id) => portDisplayName(id, opts))
+    .filter(Boolean).join(' · ')
 }
 
 // Full subtitle — "Vacuum tool · Valve 03 · IN 04". The one function
-// every cell-rendering surface calls.
-export function entrySubtitle(entry) {
+// every cell-rendering surface calls. Profile-aware.
+export function entrySubtitle(entry, opts) {
   const t = typeLabel(entry)
-  const p = portsLine(entry)
+  const p = portsLine(entry, opts)
   if (t && p) return `${t} · ${p}`
   return t || p
 }
@@ -112,10 +151,17 @@ export function entrySubtitle(entry) {
 // Render a list of raw port ids (strings) as display names joined
 // by a separator. Used by SavedScreen "Ports claimed" + wizard
 // summary bullets where the source is an array, not an entry.
-export function portListDisplay(ids, sep = ', ') {
+export function portListDisplay(ids, sep = ', ', opts) {
   if (!Array.isArray(ids)) return ''
+  const prof = (opts && opts.profile) || _SYN
+  const pm   = opts && opts.portmap
   return ids
     .filter(Boolean)
-    .map((id) => canonSynapse(id) ? displayNameForSynapse(id) : String(id))
+    .map((id) => {
+      if (prof === _SYN) {
+        return canonSynapse(id) ? displayNameForSynapse(id) : String(id)
+      }
+      return _formatForProfile(id, pm, prof)
+    })
     .join(sep)
 }
