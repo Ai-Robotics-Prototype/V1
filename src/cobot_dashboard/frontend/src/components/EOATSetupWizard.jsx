@@ -862,6 +862,12 @@ function CustomEOATFlow({
   customs, cell, onCellChanged,
   onBack, onClose, onViewInMyCell, onSetupAnother,
 }) {
+  // Profile-aware "wire to ..." lines in the custom summary + sensor
+  // assignment hint. In OEM mode the operator sees "wire to DO3"
+  // instead of "wire to Valve 03".
+  const profile = useIoHardwareProfile()
+  const synPortmap = useSynapsePortmap()
+  const _portOpts = { profile, portmap: synPortmap }
   const [step, setStep]  = useState(0)
   const [name, setName]  = useState('')
   // Set of selected capability keys. Order follows _CAPABILITY_CATALOG
@@ -1197,7 +1203,7 @@ function CustomEOATFlow({
                    color: '#166534', fontSize: 13, lineHeight: 1.5,
                  }}>
               Wire your sensors to: <b>
-                {portListDisplay(resolved.required_inputs)}
+                {portListDisplay(resolved.required_inputs, ', ', _portOpts)}
               </b>.
               These are the next free input ports on your controller.
             </div>
@@ -1220,7 +1226,7 @@ function CustomEOATFlow({
             {(resolved.actuators || []).map((a, i) => (
               <div key={i} data-testid="custom-eoat-summary-actuator"
                    style={{ marginLeft: 12 }}>
-                • {a.label}{a.valve ? ` → wire to ${portDisplayName(a.valve)}` : ''}
+                • {a.label}{a.valve ? ` → wire to ${portDisplayName(a.valve, _portOpts)}` : ''}
                 {a.type === 'double_acting'
                   && (a.hold_on_loss
                        ? ' (keeps holding on power loss)'
@@ -1233,7 +1239,7 @@ function CustomEOATFlow({
             ))}
             <div><b>Sensors:</b> {sensorCount}
               {resolved.required_inputs.length > 0
-                && ` → wire to ${portListDisplay(resolved.required_inputs)}`}
+                && ` → wire to ${portListDisplay(resolved.required_inputs, ', ', _portOpts)}`}
             </div>
           </div>
           <GuidanceBlock port={resolved} />
@@ -1528,6 +1534,12 @@ function StandardNameInput({
 // the save happened + has three next-step affordances. Never a
 // silent-end wizard.
 function SavedScreen({ entry, onViewInMyCell, onSetupAnother, onDone }) {
+  // Profile-aware "Ports claimed" + copy that doesn't invoke the
+  // Synapse tab name in OEM installs (the Synapse tab is hidden there).
+  const profile = useIoHardwareProfile()
+  const portmap = useSynapsePortmap()
+  const _portOpts = { profile, portmap }
+  const isOem = profile === 'oem'
   const name = entry?.name || 'Tool'
   const valves = []
   if (entry?.valve) valves.push(entry.valve)
@@ -1573,14 +1585,17 @@ function SavedScreen({ entry, onViewInMyCell, onSetupAnother, onDone }) {
       </div>
       <div style={{ color: '#065F46', marginBottom: 14 }}>
         It will appear as a card in the Program Wizard's tool step
-        and in <b>My Cell</b> on the Synapse tab.
+        {isOem
+          ? <> and in <b>My Cell</b>.</>
+          : <> and in <b>My Cell</b> on the Synapse tab.</>}
         {(valves.length > 0 || inputs.length > 0) && (
           <div style={{ marginTop: 6, fontSize: 13, color: '#047857' }}
-               data-testid="hardware-setup-saved-ports">
+               data-testid="hardware-setup-saved-ports"
+               data-io-profile={profile}>
             Ports claimed:{' '}
-            {valves.length > 0 && <b>{portListDisplay(valves)}</b>}
+            {valves.length > 0 && <b>{portListDisplay(valves, ', ', _portOpts)}</b>}
             {valves.length > 0 && inputs.length > 0 && ' · '}
-            {inputs.length > 0 && <b>{portListDisplay(inputs)}</b>}
+            {inputs.length > 0 && <b>{portListDisplay(inputs, ', ', _portOpts)}</b>}
           </div>
         )}
       </div>

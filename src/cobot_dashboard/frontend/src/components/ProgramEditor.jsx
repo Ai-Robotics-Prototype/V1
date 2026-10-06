@@ -17,6 +17,9 @@ import { useIOPortmap, portmapLabels, portmapToOptions }
   from '../lib/ioPortmap'
 import { useSynapsePortmap, displayNameForRaw }
   from '../lib/synapsePortmap'
+import {
+  useIoHardwareProfile, formatPortName,
+} from '../lib/ioHardwareProfile'
 import { displayIoForStep, rebindProgramToCell, stepsNeedingRebind }
   from '../lib/programCellRebind'
 import { getCell } from '../lib/cellStore'
@@ -384,7 +387,7 @@ function actionFor(step) {
 // Raw position data (taught_joints, taught_tcp, joints, position) is
 // intentionally NOT included here — that lives in the collapsible
 // "position data" block triggered by the "View position data" link.
-function detailLine(step, ioLabels, synapsePortmap, program, cell) {
+function detailLine(step, ioLabels, synapsePortmap, program, cell, profile) {
   // 2026-10-01 Synapse Addressing Doctrine: operator-facing step
   // detail renders Synapse names ("Valve 03", "IN 06"), with the
   // operator-assigned nickname appended when present. Raw channel
@@ -395,17 +398,22 @@ function detailLine(step, ioLabels, synapsePortmap, program, cell) {
   // 2026-10-05 cell-rebind: when the program is cell-bound AND the
   // step plays a cell-eoat role (vacuum / magnet / blow_off), the
   // row prefers the CELL's current valve over the stored raw io_id.
-  // This is the "displayed-port == cell-assigned-port" invariant —
-  // legacy programs whose stored io_id predates the cell binding
-  // (e.g. DO2 baked in at author time) render the cell's current
-  // assignment (e.g. "Valve 03") instead of the honest-but-stale
-  // reverse-lookup. The io_id itself is rewritten to agree with the
-  // display at program-load time by rebindProgramToCell, so wire
-  // follows display on the next save.
+  //
+  // 2026-10-06 I/O hardware profile: when the operator has declared
+  // OEM mode (no Synapse panel), the Synapse translation is BYPASSED
+  // and raw controller channels (DO3 / DI4) are shown directly.
+  // `profile` defaults to Synapse mode so every pre-profile caller
+  // (and the 2026-10-01 doctrine) keeps the exact prior behaviour.
+  const isOem = profile === 'oem'
   const ioName = (id, _step) => {
     if (!id) return id
-    // Prefer the cell-rebound display when the step carries a role
-    // the rebinder knows about + the program is cell-bound.
+    if (isOem) {
+      // OEM: skip the cell-rebind reverse-lookup chain entirely and
+      // emit the raw controller channel (plus operator nickname).
+      const raw = formatPortName(id, synapsePortmap, 'oem')
+      const lab = ioLabels && ioLabels[id]
+      return lab ? `${raw} — ${lab}` : raw
+    }
     const resolved = _step
       ? displayIoForStep(_step, program, cell, synapsePortmap)
       : null
@@ -501,13 +509,25 @@ function useIOLabels() {
 function IOPortSelector({ label, value, onChange, direction, analog }) {
   const portmap = useIOPortmap()
   const synapsePortmap = useSynapsePortmap()
+  const profile = useIoHardwareProfile()
   const options = portmapToOptions(portmap, direction, { analog: Boolean(analog) })
-  // 2026-10-01 Synapse Addressing Doctrine: dropdown rows render the
-  // Synapse name first ("Valve 03 (DO3) — Vacuum On"), with the raw
-  // channel in parentheses for traceability. Raw channels that
-  // aren't in the portmap render as "Unmapped channel DOx" via the
-  // same helper so no silent invention of a Synapse name.
+  // 2026-10-01 Synapse Addressing Doctrine: in Synapse mode, dropdown
+  // rows render "Valve 03 (DO3) — Vacuum On" so operators pick by
+  // panel label with the raw channel as traceability breadcrumb.
+  // 2026-10-06 I/O hardware profile: in OEM mode there is no Synapse
+  // panel, so the Synapse-name breadcrumb is dropped — rows render
+  // "DO3 — Vacuum On" directly. The displayNameForRaw call is kept
+  // on the Synapse branch so the single-source translator still owns
+  // the panel-name derivation (doctrine pin).
+  const isOem = profile === 'oem'
   const displayFor = (opt) => {
+    if (isOem) {
+      const base = opt.id
+      const suffix = opt.label
+        ? ` — ${opt.label}${opt.flange ? ' (flange)' : ''}`
+        : (opt.flange ? ' (flange)' : '')
+      return `${base}${suffix}`
+    }
     if (!synapsePortmap) return opt.display
     const syn = displayNameForRaw(synapsePortmap, opt.id)
     const base = `${syn} (${opt.id})`
@@ -627,15 +647,17 @@ function PalletSubStepInlineField({
 // the sub-steps stay COMPOSER-GENERATED so one edit updates every
 // cycle deterministically. Regeneration goes through the shared
 // `regenerateMoveToPalletSteps` so all cycles reflect the change.
-function PalletExpansionPreview({ step, palletCfg, onPatchPallet, synapsePortmap }) {
+function PalletExpansionPreview({ step, palletCfg, onPatchPallet, synapsePortmap, profile }) {
   // Route the sub-step detail IO strings through the single-source
   // Synapse portmap so the operator sees "Valve 03 = ON" instead of
-  // raw "DO3 = 1" (2026-10-05 subtitle leak sweep). Fallback keeps
-  // the raw form when the portmap hasn't resolved yet so cold-boot
-  // renders stay legible.
-  const _ioName = (raw) => synapsePortmap
-    ? displayNameForRaw(synapsePortmap, raw)
-    : raw
+  // raw "DO3 = 1" (2026-10-05 subtitle leak sweep). In OEM mode the
+  // Synapse translation is bypassed and the raw channel renders
+  // verbatim ("DO3 = ON"). Fallback keeps the raw form when the
+  // portmap hasn't resolved yet so cold-boot renders stay legible.
+  const _ioName = (raw) => {
+    if (profile === 'oem') return raw
+    return synapsePortmap ? displayNameForRaw(synapsePortmap, raw) : raw
+  }
   const grip = String(step?.gripper_type || 'vacuum').toLowerCase()
   const vacPort = Number(step?.vacuum_port_do ?? palletCfg?.vacuum_port_do ?? 2)
   const blowPortRaw = (step?.blow_off_port_do ?? palletCfg?.blow_off_port_do)
@@ -4107,6 +4129,10 @@ export default function ProgramEditor() {
   // Synapse portmap for operator-facing name translation
   // (2026-10-01 Synapse Addressing Doctrine).
   const synapsePortmap     = useSynapsePortmap()
+  // I/O hardware profile (2026-10-06). When set to "oem" by the
+  // operator in Configure, step rows + IOPortSelector dropdowns +
+  // pallet substep previews render raw controller channels directly.
+  const ioHardwareProfile  = useIoHardwareProfile()
   // Cell registry — used by detailLine to re-resolve a cell-bound
   // step's io_id against the cell's CURRENT valve (2026-10-05 fix
   // for legacy programs whose stored io_id predates the cell
@@ -6558,7 +6584,8 @@ export default function ProgramEditor() {
                     wordBreak: 'break-word', whiteSpace: 'normal',
                   }}>
                     {detailLine(step, ioLabels, synapsePortmap,
-                                currentProgram, cellRegistry)}
+                                currentProgram, cellRegistry,
+                                ioHardwareProfile)}
                   </span>
                   {isTeachable(step, currentProgram) && hasPositionData(step) && (() => {
                     const open = openPosData.has(step.id)
@@ -6785,6 +6812,7 @@ export default function ProgramEditor() {
                   palletCfg={currentProgram?.config?.pallet || {}}
                   onPatchPallet={commitPalletPatch}
                   synapsePortmap={synapsePortmap}
+                  profile={ioHardwareProfile}
                 />
               )}
 

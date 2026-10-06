@@ -15,6 +15,8 @@ import {
 import {
   portDisplayName, portListDisplay, entrySubtitle, typeLabel,
 } from '../lib/cellEntryDisplay'
+import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
+import { useSynapsePortmap } from '../lib/synapsePortmap'
 import { useKeyboardInset, scrollFocusedIntoView } from '../lib/keyboardInset'
 
 // External Fixture Wizard (2026-09-22 operator directive).
@@ -366,6 +368,10 @@ function _recordToAnswers(rec) {
 // ── Steps ───────────────────────────────────────────────────────────
 
 function FixturePicker({ fixtures, onNew, onEdit, onDelete }) {
+  // Profile-aware subtitles: in OEM mode the picker row renders raw
+  // controller channels (DO3 / DI4) instead of Synapse port names.
+  const profile = useIoHardwareProfile()
+  const portmap = useSynapsePortmap()
   return (
     <div data-testid="external-fixture-picker">
       <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 12 }}>
@@ -405,8 +411,9 @@ function FixturePicker({ fixtures, onNew, onEdit, onDelete }) {
                   {f.name}
                 </div>
                 <div style={{ fontSize: 12, color: '#6B7280' }}
-                     data-testid="external-fixture-picker-row-subtitle">
-                  {entrySubtitle(f)}
+                     data-testid="external-fixture-picker-row-subtitle"
+                     data-io-profile={profile}>
+                  {entrySubtitle(f, { profile, portmap })}
                 </div>
               </div>
               <button
@@ -711,8 +718,15 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
 
 function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }) {
   const port = fixturePortMap(record)
+  // Profile-aware receipt: in OEM mode the "Wire ... to" rows show
+  // controller channels (DO3, DI4) instead of Synapse port names,
+  // matching what the operator actually lands on the cabinet block.
+  const profile = useIoHardwareProfile()
+  const portmap = useSynapsePortmap()
+  const _port = (id) => portDisplayName(id, { profile, portmap })
   return (
     <div data-testid="fixture-step-summary"
+         data-io-profile={profile}
          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div>
         <div style={{ fontSize: 12, color: '#6B7280', fontWeight: 600,
@@ -748,13 +762,13 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
           </div>
         )}
         {record.valve && (
-          <div><b>Wire air line to:</b> {portDisplayName(record.valve)}</div>
+          <div><b>Wire air line to:</b> {_port(record.valve)}</div>
         )}
         {record.out && (
-          <div><b>Wire start signal to:</b> {portDisplayName(record.out)}</div>
+          <div><b>Wire start signal to:</b> {_port(record.out)}</div>
         )}
         {record.in_done && (
-          <div><b>Wire done sensor to:</b> {portDisplayName(record.in_done)}</div>
+          <div><b>Wire done sensor to:</b> {_port(record.in_done)}</div>
         )}
         <div>
           <b>Robot waits by:</b>{' '}

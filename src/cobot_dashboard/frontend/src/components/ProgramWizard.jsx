@@ -8,6 +8,7 @@ import ToolFromCellStep from './ToolFromCellStep'
 import { QuestionCard } from './WizardStepCard'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { useSynapsePortmap, displayNameForRaw } from '../lib/synapsePortmap'
+import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
 import { getCell, findCellEoat } from '../lib/cellStore'
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
@@ -1546,12 +1547,23 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
 function MachineIOBody({ answers, setAnswer, goNext }) {
   const portmap = useIOPortmap()
   const synapsePortmap = useSynapsePortmap()
+  const profile = useIoHardwareProfile()
   const doOptions = portmapToOptions(portmap, 'output')
   const diOptions = portmapToOptions(portmap, 'input')
-  // 2026-10-01 Synapse Addressing Doctrine: dropdown rows render the
-  // Synapse name primarily ("Valve 03 (DO3) — Vacuum On") so operators
-  // pick slots by their panel labels, not by raw controller channels.
+  // 2026-10-01 Synapse Addressing Doctrine (default): dropdown rows
+  // render the Synapse name primarily — "Valve 03 (DO3) — Vacuum On".
+  // 2026-10-06 I/O hardware profile: in OEM mode the operator wires
+  // directly to the controller, so the Synapse breadcrumb is dropped
+  // — "DO3 — Vacuum On". The displayNameForRaw call stays live on
+  // the Synapse branch (doctrine pin).
+  const isOem = profile === 'oem'
   const synDisplay = (o) => {
+    if (isOem) {
+      const suffix = o.label
+        ? ` — ${o.label}${o.flange ? ' (flange)' : ''}`
+        : (o.flange ? ' (flange)' : '')
+      return `${o.id}${suffix}`
+    }
     if (!synapsePortmap) return o.display
     const syn = displayNameForRaw(synapsePortmap, o.id)
     const base = `${syn} (${o.id})`

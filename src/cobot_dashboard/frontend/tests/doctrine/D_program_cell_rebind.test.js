@@ -99,25 +99,31 @@ test('ProgramEditor imports from programCellRebind + cellStore', () => {
 // ── (3) detailLine accepts program + cell for cell-rebind ──────────
 
 test('detailLine threads step + program + cell into ioName', () => {
-  // Signature: (step, ioLabels, synapsePortmap, program, cell).
+  // Signature: (step, ioLabels, synapsePortmap, program, cell, ...).
+  // 2026-10-06 extension: a trailing `profile` arg carries the I/O
+  // hardware profile so OEM installs render raw DO/DI channels. The
+  // 5-arg prefix is still required — cell-rebind context is
+  // positional and the Configure-tab doctrine is additive.
   assert.ok(
-    /function\s+detailLine\(step,\s*ioLabels,\s*synapsePortmap,\s*program,\s*cell\)/
+    /function\s+detailLine\(step,\s*ioLabels,\s*synapsePortmap,\s*program,\s*cell(?:,\s*profile)?\)/
       .test(progEdSrc),
     v('detailLine must accept (step, ioLabels, synapsePortmap, '
-      + 'program, cell) — the two trailing args carry the cell-'
-      + 'rebind context.'))
+      + 'program, cell) — the two trailing cell-rebind args are '
+      + 'required (profile is an optional sixth arg per the '
+      + 'Configure-tab directive).'))
   // ioName must call displayIoForStep when a step is passed through.
   assert.ok(/displayIoForStep\(_step,\s*program,\s*cell,\s*synapsePortmap\)/
               .test(progEdSrc),
     v('detailLine.ioName must call displayIoForStep(step, program, '
       + 'cell, portmap) so cell-role steps prefer the cell\'s '
       + 'current valve over the stored raw io_id reverse.'))
-  // The call site passes currentProgram + cellRegistry.
+  // The call site passes currentProgram + cellRegistry (+ profile).
   assert.ok(
-    /detailLine\(step,\s*ioLabels,\s*synapsePortmap,\s*\n?\s*currentProgram,\s*cellRegistry\)/
+    /detailLine\(step,\s*ioLabels,\s*synapsePortmap,\s*\n?\s*currentProgram,\s*cellRegistry(?:,\s*\n?\s*ioHardwareProfile)?\)/
       .test(progEdSrc),
     v('ProgramEditor must call detailLine(step, ioLabels, portmap, '
-      + 'currentProgram, cellRegistry) at the step-row render.'))
+      + 'currentProgram, cellRegistry[, ioHardwareProfile]) at the '
+      + 'step-row render.'))
 })
 
 

@@ -46,6 +46,9 @@ const appSrc        = readSrc('App.jsx')
 const storeSrc      = readSrc('store/useStore.js')
 const eoatWizSrc    = readSrc('components/EOATSetupWizard.jsx')
 const myCellSrc     = readSrc('components/MyCellSection.jsx')
+const extFixSrc     = readSrc('components/ExternalFixtureWizard.jsx')
+const progEdSrc     = readSrc('components/ProgramEditor.jsx')
+const progWizSrc    = readSrc('components/ProgramWizard.jsx')
 const backendSrc    = readRepo(
   'src/cobot_dashboard/cobot_dashboard/dashboard_server.py')
 
@@ -253,6 +256,177 @@ test('MyCellSection renders subtitles through the profile-aware helper', () => {
               .test(myCellSrc),
     v('MyCellSection must call entrySubtitle with {profile, portmap} '
       + '— the single-source profile-aware subtitle path.'))
+})
+
+
+// ── (6b) Every remaining operator-facing surface threads the profile ─
+//
+// Grep-pin surfaces named in the Configure-tab directive. Each must:
+//   (a) Pull the profile via useIoHardwareProfile() (or receive it
+//       as a prop from a parent that did).
+//   (b) Pass `{ profile, portmap }` into cellEntryDisplay helpers,
+//       or (for dropdowns rendering their own id-first display)
+//       branch on profile explicitly.
+//
+// Together these pins catch regressions where someone adds a new
+// subtitle / summary / step-row surface without wiring the profile
+// — the operator would see leftover "Valve 03" copy in OEM mode.
+
+test('ExternalFixtureWizard threads {profile, portmap} through its displays', () => {
+  assert.ok(/useIoHardwareProfile/.test(extFixSrc),
+    v('ExternalFixtureWizard must import + call useIoHardwareProfile '
+      + 'in the picker + summary surfaces.'))
+  assert.ok(/useSynapsePortmap/.test(extFixSrc),
+    v('ExternalFixtureWizard must call useSynapsePortmap for '
+      + 'translation inputs.'))
+  assert.ok(
+    /entrySubtitle\(f,\s*\{\s*profile,\s*portmap\s*\}\)/.test(extFixSrc),
+    v('FixturePicker row subtitle must call entrySubtitle(f, '
+      + '{profile, portmap}) — the profile-aware path.'))
+  assert.ok(
+    /portDisplayName\(id,\s*\{\s*profile,\s*portmap\s*\}\)/.test(extFixSrc),
+    v('SummaryStep "wire ... to" rows must route through '
+      + 'portDisplayName(id, {profile, portmap}).'))
+})
+
+test('EOATSetupWizard custom summary + SavedScreen are profile-aware', () => {
+  // CustomEOATFlow builds a _portOpts bag + feeds it to every port
+  // renderer; grep the shape so a regression that drops the bag at
+  // one site is caught.
+  assert.ok(/const _portOpts = \{ profile, portmap: synPortmap \}/
+              .test(eoatWizSrc),
+    v('CustomEOATFlow must declare _portOpts = { profile, portmap } '
+      + 'and feed it into every port renderer below.'))
+  for (const call of [
+    'portListDisplay(resolved.required_inputs, \', \', _portOpts)',
+    'portDisplayName(a.valve, _portOpts)',
+  ]) {
+    assert.ok(eoatWizSrc.includes(call),
+      v(`EOATSetupWizard CustomEOATFlow must call "${call}" — the `
+        + 'profile-aware path for the custom summary.'))
+  }
+  // SavedScreen flips the "on the Synapse tab" copy off in OEM mode
+  // and routes "Ports claimed" through the profile-aware helper.
+  assert.ok(/const _portOpts = \{ profile, portmap \}/.test(eoatWizSrc),
+    v('SavedScreen must declare its own _portOpts bag.'))
+  assert.ok(/portListDisplay\(valves, ', ', _portOpts\)/.test(eoatWizSrc),
+    v('SavedScreen Ports-claimed line must use the profile-aware '
+      + 'portListDisplay call.'))
+  assert.ok(/isOem/.test(eoatWizSrc),
+    v('SavedScreen must branch on isOem so the "Synapse tab" copy '
+      + 'is suppressed in OEM mode (the tab is hidden there).'))
+})
+
+test('ProgramEditor detailLine + IOPortSelector + Pallet preview accept profile', () => {
+  assert.ok(/function detailLine\(step, ioLabels, synapsePortmap, program, cell, profile\)/
+              .test(progEdSrc),
+    v('detailLine signature must take `profile` as its 6th arg so '
+      + 'step rows render raw channels in OEM mode.'))
+  assert.ok(
+    /detailLine\(step, ioLabels, synapsePortmap,\s*\n?\s*currentProgram, cellRegistry,\s*\n?\s*ioHardwareProfile\)/
+      .test(progEdSrc),
+    v('ProgramEditor step row must pass ioHardwareProfile into '
+      + 'detailLine when rendering the detail line.'))
+  assert.ok(/formatPortName\(id, synapsePortmap, 'oem'\)/.test(progEdSrc),
+    v('detailLine OEM branch must call formatPortName with the '
+      + '"oem" profile so no Synapse breadcrumb leaks into step rows.'))
+  assert.ok(
+    /function IOPortSelector[\s\S]{0,500}useIoHardwareProfile\(\)/
+      .test(progEdSrc),
+    v('IOPortSelector must call useIoHardwareProfile() to branch its '
+      + 'dropdown display per profile.'))
+  assert.ok(
+    /function PalletExpansionPreview\(\{[^)]*profile[^)]*\}\)/.test(progEdSrc),
+    v('PalletExpansionPreview must accept `profile` as a prop so '
+      + 'pallet substep IO details render raw channels in OEM mode.'))
+  assert.ok(
+    /PalletExpansionPreview[\s\S]{0,1200}profile === ['"]oem['"]/.test(progEdSrc),
+    v('PalletExpansionPreview _ioName must short-circuit to the raw '
+      + 'channel when profile === "oem".'))
+  assert.ok(/profile={ioHardwareProfile}/.test(progEdSrc),
+    v('<PalletExpansionPreview /> call site must pass profile prop.'))
+})
+
+test('ProgramWizard MachineIOBody dropdown branches on profile', () => {
+  assert.ok(/useIoHardwareProfile/.test(progWizSrc),
+    v('ProgramWizard must import useIoHardwareProfile and call it '
+      + 'inside MachineIOBody.'))
+  assert.ok(/isOem/.test(progWizSrc),
+    v('MachineIOBody synDisplay must branch on isOem — the Synapse-'
+      + 'name breadcrumb has no meaning on an OEM install.'))
+})
+
+
+// ── (6c) Unit: profile-aware entrySubtitle on every entry shape ────
+//
+// Direct exercise of entrySubtitle under both profiles on the exact
+// records the field surfaces render (vacuum EOAT, finger EOAT, vice
+// fixture). Catches a regression where a helper drops the profile
+// branch for one entry type.
+
+test('entrySubtitle in OEM mode: vacuum / finger / vice all render raw channels', async () => {
+  const { entrySubtitle } = await import(
+    '../../src/lib/cellEntryDisplay.js')
+  const pm = { version: 1, rows: Array.from({ length: 10 }, (_, i) => [
+    { synapse: `V${String(i + 1).padStart(2, '0')}`, kind: 'valve',
+      raw: `DO${i + 1}`, verified: false },
+    { synapse: `IN${String(i + 1).padStart(2, '0')}`, kind: 'input',
+      raw: `DI${i + 1}`, verified: false },
+    { synapse: `OUT${String(i + 1).padStart(2, '0')}`, kind: 'output',
+      raw: `DO${i + 1}`, verified: false },
+  ]).flat() }
+  const opts = { profile: 'oem', portmap: pm }
+  const vac = { id: 'standard:vacuum', name: 'Vacuum A',
+                type: 'vacuum', valve: 'V03', inputs: ['IN04'] }
+  assert.equal(entrySubtitle(vac, opts), 'Vacuum tool · DO3 · DI4',
+    v('OEM vacuum subtitle must render DO3 + DI4 — no Valve/IN leaks.'))
+  const fin = { id: 'standard:finger', name: 'Finger A',
+                type: 'finger', valve: 'V01', inputs: ['IN01', 'IN02'] }
+  assert.equal(entrySubtitle(fin, opts),
+    'Finger gripper · DO1 · DI1 · DI2',
+    v('OEM finger subtitle must render DO/DI channels, no Valve copy.'))
+  const vice = { id: 'vice:1', name: 'Vice 1',
+                 type: 'vice', valve: 'V05', out: 'OUT02', in_done: 'IN07' }
+  // OUT05 collides with V05 on DO5 but the vice's valve beats its OUT
+  // field — the OEM renderer resolves both to raw channel ids.
+  assert.equal(entrySubtitle(vice, opts),
+    'Vice / Clamp · DO5 · DO2 · DI7',
+    v('OEM vice subtitle must render raw DO/DI channels for '
+      + 'valve + out + in_done fields.'))
+})
+
+test('OEM-mode port grep sweep: zero Valve/IN/OUT prose in surfaces that opted in', () => {
+  // Smoke pin on the TOUCHED surfaces: once a surface has threaded
+  // the profile, no new hard-coded "Valve 0x" / "IN 0x" / "OUT 0x"
+  // JSX text may appear. The sweep ignores WhyExpanders + comments
+  // + attribute strings.
+  const sweep = (src) => {
+    const noComments = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+    // Find text that would render in JSX between `>` and `<`.
+    const jsxText = []
+    const re = />([^<]+)</g
+    let m
+    while ((m = re.exec(noComments))) jsxText.push(m[1])
+    // Hits only count if they are literal prose — not inside
+    // template placeholders. Strip ${...} first.
+    return jsxText
+      .map((t) => t.replace(/\$\{[^}]+\}/g, ''))
+      .filter((t) => /\b(Valve|IN|OUT)\s*0\d\b/.test(t))
+  }
+  for (const [name, src] of [
+    ['MyCellSection.jsx', myCellSrc],
+    ['ExternalFixtureWizard.jsx', extFixSrc],
+    ['EOATSetupWizard.jsx', eoatWizSrc],
+  ]) {
+    const hits = sweep(src)
+    assert.deepEqual(hits, [],
+      v(`${name} must not contain hard-coded "Valve 0x"/"IN 0x"/"OUT 0x" `
+        + `prose — route through portDisplayName/entrySubtitle/`
+        + `portListDisplay with {profile, portmap}. Found: `
+        + JSON.stringify(hits)))
+  }
 })
 
 
