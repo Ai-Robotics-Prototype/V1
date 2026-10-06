@@ -26,8 +26,14 @@ export function normalizeProfile(p) {
 export function isSynapseProfile(p) { return normalizeProfile(p) === PROFILE_SYNAPSE }
 export function isOemProfile(p)     { return normalizeProfile(p) === PROFILE_OEM     }
 
+// Operator-facing label for a profile. The internal profile value
+// stays "oem" for storage + API + code paths; only this LABEL
+// surface flips. The 2026-10-06 operator order renamed the OEM
+// profile's user-visible label to "Basic Robot Controller I/O"
+// (plain language — matches the operator mental model of "no
+// Synapse panel, just the robot's built-in I/O").
 export function profileLabel(p) {
-  return isOemProfile(p) ? 'OEM Controller I/O' : 'Synapse Panel'
+  return isOemProfile(p) ? 'Basic Robot Controller I/O' : 'Synapse Panel'
 }
 
 export function profileInterfaceNoun(p) {

@@ -265,6 +265,142 @@ test('ConfigureLayout profile-switch confirm names the flagged counts', () => {
 })
 
 
+// ── (4b) 2026-10-06 Configure-tab polish ──────────────────────────
+//
+// Polish directive pins:
+//   * OEM profile renamed to "Basic Robot Controller I/O" at every
+//     operator-facing surface. Internal profile value "oem" unchanged.
+//   * Switch confirm is a STANDARD MODAL (ArmEnableControl / Orient
+//     family): fixed backdrop at zIndex 1000, role="dialog", Escape
+//     handler, no backdrop click-through, Confirm + Cancel buttons.
+//   * Configure tab renders ONLY the I/O Interface section. Cells
+//     wizard + self-collision guard are intentionally NOT mounted
+//     here this session.
+
+test('OEM profile label renamed to "Basic Robot Controller I/O"', async () => {
+  const { profileLabel, PROFILE_OEM, PROFILE_SYNAPSE }
+    = await import('../../src/lib/ioHardwareProfileCore.js')
+  assert.equal(profileLabel(PROFILE_OEM), 'Basic Robot Controller I/O',
+    v('profileLabel("oem") must return the operator-facing label '
+      + '"Basic Robot Controller I/O" per the 2026-10-06 rename. '
+      + 'Internal storage key stays "oem".'))
+  assert.equal(profileLabel(PROFILE_SYNAPSE), 'Synapse Panel',
+    v('Synapse profile label unchanged.'))
+})
+
+test('no operator-facing "OEM Controller I/O" string remains anywhere', () => {
+  // Grep every operator-visible surface. The rename directive says
+  // the internal "oem" slug can stay but the LABEL must flip. If a
+  // caller hard-coded the old label as a string literal (bypassing
+  // profileLabel), this pin catches it.
+  const checks = [
+    ['layouts/ConfigureLayout.jsx',  configureSrc],
+    ['lib/ioHardwareProfile.js',     profileSrc],
+    ['lib/ioHardwareProfileCore.js', profileCoreSrc],
+    ['components/TopBar.jsx',        topbarSrc],
+    ['App.jsx',                      appSrc],
+    ['components/MyCellSection.jsx', myCellSrc],
+    ['components/EOATSetupWizard.jsx', eoatWizSrc],
+    ['components/ExternalFixtureWizard.jsx', extFixSrc],
+    ['components/ProgramEditor.jsx',  progEdSrc],
+    ['components/ProgramWizard.jsx',  progWizSrc],
+  ]
+  for (const [path, src] of checks) {
+    // Pure prose grep — no code comments either (operators don't
+    // see them, but it's a drift signal). Case-insensitive.
+    const re = /OEM\s+Controller\s+I\/O/i
+    const hit = src.match(re)
+    assert.equal(hit, null,
+      v(`${path} must not contain the retired label `
+        + `"OEM Controller I/O" (case-insensitive). The 2026-10-06 `
+        + `operator order renamed it to "Basic Robot Controller I/O". `
+        + `Found: ${hit && hit[0]}.`))
+  }
+})
+
+test('switch confirm is a standard app-theme MODAL, not an inline card', () => {
+  // The dark inline card is retired. The confirm is now a modal that
+  // matches the Orient/Enable family — centered on a fixed-backdrop
+  // overlay, role="dialog", aria-modal, Escape handler, Confirm +
+  // Cancel buttons. Grep each required attribute.
+  for (const need of [
+    { re: /_IoProfileSwitchModal/,
+      msg: 'ConfigureLayout must declare a _IoProfileSwitchModal '
+         + 'component — the standard confirm modal.' },
+    { re: /role="dialog"/,
+      msg: 'Switch confirm must declare role="dialog" (ARIA pattern '
+         + 'shared with ArmEnableControl + OrientFlangeDownControl).' },
+    { re: /aria-modal="true"/,
+      msg: 'Switch confirm must declare aria-modal="true".' },
+    { re: /aria-labelledby="io-profile-switch-title"/,
+      msg: 'Switch confirm must label itself via aria-labelledby '
+         + 'pointing at the dialog title id.' },
+    { re: /position: 'fixed',\s*inset: 0,\s*zIndex: 1000/,
+      msg: 'Switch confirm must render a full-viewport backdrop at '
+         + 'zIndex 1000 (matches ArmEnableControl pattern).' },
+    { re: /e\.key === 'Escape'/,
+      msg: 'Switch confirm must handle Escape to cancel.' },
+    { re: /confirmRef\.current\?\.focus\(\)/,
+      msg: 'Switch confirm must auto-focus the Confirm button on '
+         + 'mount (consistency with the Orient/Enable modals).' },
+  ]) {
+    assert.ok(need.re.test(configureSrc),
+      v(need.msg + ` [pattern: ${need.re}]`))
+  }
+  // And the retired inline-card shape MUST be gone — a background:
+  // '#111827' panel inside the Configure body is the exact style
+  // the operator asked us to drop. Grep that no HardwareProfileSection
+  // sibling div uses that dark background inline (the modal uses
+  // white).
+  assert.equal(/data-testid="io-profile-switch-confirm"[^}]*background:\s*'#111827'/
+                 .test(configureSrc), false,
+    v('The retired inline-dark switch-confirm card must be gone — '
+      + 'the confirm is now an app-theme modal.'))
+})
+
+test('Configure tab renders ONLY the I/O Interface section', () => {
+  // Walk the default export's return JSX. It must mount
+  // <HardwareProfileSection /> and nothing else from the removed
+  // sections. The two retired components stay defined in the file
+  // (behind eslint-disable-no-unused-vars) so a follow-up directive
+  // can re-mount either without re-writing them.
+  const defaultExport = configureSrc.match(
+    /export default function ConfigureLayout\(\)[\s\S]*?^}/m)
+  assert.ok(defaultExport,
+    v('ConfigureLayout must declare an export default function.'))
+  const body = defaultExport[0]
+  assert.ok(/<HardwareProfileSection\s*\/>/.test(body),
+    v('ConfigureLayout default export must mount '
+      + '<HardwareProfileSection />.'))
+  assert.equal(/<CellSetupSection\s*\/>/.test(body), false,
+    v('ConfigureLayout default export must NOT mount '
+      + '<CellSetupSection /> — the 2026-10-06 polish directive '
+      + 'removes the Setup Wizard — Cells section from the Configure '
+      + 'tab. Function definition stays in-file for a future re-mount.'))
+  assert.equal(/<SelfCollisionGuardSection\s*\/>/.test(body), false,
+    v('ConfigureLayout default export must NOT mount '
+      + '<SelfCollisionGuardSection /> — the self-collision guard '
+      + 'is removed from the Configure tab this session (natural '
+      + 'home is SafetyPage per the directive).'))
+})
+
+test('profile-choice diagrams are SVG, not ASCII monospace', () => {
+  // The ASCII-art diagrams were visually rough — the polish directive
+  // asks for app-style (SVG or styled boxes).
+  assert.ok(/function _ProfileDiagram/.test(configureSrc),
+    v('ConfigureLayout must declare a _ProfileDiagram SVG component '
+      + '— replaces the retired ASCII blocks.'))
+  assert.ok(/<svg [^>]*viewBox="0 0 220 120"/.test(configureSrc),
+    v('_ProfileDiagram must render an SVG with a stable viewBox so '
+      + 'the two profile cards align.'))
+  // Grep that no monospace box-drawing character leaks into the
+  // Configure JSX — the retired ASCII art used ┌─┐│└┘▼.
+  assert.equal(/[┌┐│└┘─▼▲]/.test(configureSrc), false,
+    v('Configure tab must not contain ASCII box-drawing characters '
+      + '— the diagrams are now SVG per the polish directive.'))
+})
+
+
 // ── (5) Store slice + App.jsx hydrate ─────────────────────────────
 
 test('useStore declares ioHardwareProfile slice + hydrate action', () => {
