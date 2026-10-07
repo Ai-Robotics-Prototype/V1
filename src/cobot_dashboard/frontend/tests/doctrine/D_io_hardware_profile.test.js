@@ -6,7 +6,9 @@
 //             native DO/DI block. No Synapse panel.
 //
 // The choice reshapes:
-//   * TopBar: Synapse tab is hidden in OEM mode.
+//   * TopBar: Synapse tab is RENDERED DISABLED (greyed, non-navigable,
+//     tooltip + click-hint modal) in Basic Robot Controller I/O mode —
+//     NOT filtered out. Discoverable disappearance (2026-10-07 directive).
 //   * Wizards: hookup copy switches between "Connect ... Valve 03"
 //     and "Wire ... DO3 on the controller"; the pulse-glow Synapse
 //     connection-map diagram is hidden in OEM mode.
@@ -150,16 +152,105 @@ test('cellEntryDisplay.entrySubtitle: OEM profile flips to raw channels', async 
 })
 
 
-// ── (3) TopBar: Synapse tab hidden in OEM mode, Configure trailing ─
+// ── (3) TopBar: Synapse tab disabled (not hidden) in Basic mode ────
 
-test('TopBar imports shouldShowSynapseTab + gates the Synapse tab on it', () => {
+test('TopBar imports shouldShowSynapseTab + computes a synapseAllowed gate', () => {
   assert.ok(/shouldShowSynapseTab/.test(topbarSrc),
     v('TopBar must import shouldShowSynapseTab from '
-      + "'../lib/ioHardwareProfile' and gate the synapse tab on it."))
+      + "'../lib/ioHardwareProfile' so it can derive the disabled "
+      + 'state on the Synapse tab in Basic Robot Controller I/O mode.'))
+  // 2026-10-07 directive: the Synapse tab stays in the nav; the gate
+  // now drives a disabled-tab affordance, not a filter removal. Pin
+  // the `synapseAllowed = shouldShowSynapseTab(...)` shape.
   assert.ok(
-    /tab\.id === ['"]synapse['"].*shouldShowSynapseTab/.test(topbarSrc),
-    v('TopBar visibleTabs filter must call shouldShowSynapseTab for '
-      + 'the synapse tab — otherwise OEM operators see a dead tab.'))
+    /synapseAllowed\s*=\s*shouldShowSynapseTab\(/.test(topbarSrc),
+    v('TopBar must compute `const synapseAllowed = shouldShowSynapseTab(ioProfile)` '
+      + '— the disabled-tab affordance derives from it. The old '
+      + '`tab.id === "synapse" && !shouldShowSynapseTab(...)` filter '
+      + 'is retired: hiding the tab was the silent-disappearance bug.'))
+})
+
+test('TopBar does NOT filter the Synapse tab out of visibleTabs in Basic mode', () => {
+  // Negative pin: catch any regression that re-introduces a filter-
+  // return-false path on the synapse tab. The whole point of the
+  // 2026-10-07 directive is that the tab's slot is never empty — it
+  // renders greyed with a tooltip. If a future edit re-adds the
+  // filter, the tab disappears silently again.
+  const filter = topbarSrc.match(/const visibleTabs = TABS\.filter\(\([^]*?\n\s*\}\)/)
+  assert.ok(filter, v('TopBar must declare const visibleTabs = TABS.filter(...)'))
+  assert.equal(
+    /tab\.id\s*===\s*['"]synapse['"][\s\S]{0,120}return\s+false/.test(filter[0]),
+    false,
+    v('visibleTabs filter must NOT short-circuit `return false` for '
+      + 'the synapse tab — the Synapse tab now stays in nav and is '
+      + 'rendered disabled instead. Re-adding the filter would '
+      + 'reintroduce the silent-disappearance bug.'))
+})
+
+test('TopBar renders the Synapse tab DISABLED (not hidden) in Basic mode', () => {
+  // Pin the disabled-tab plumbing: the render loop computes a per-
+  // tab `disabled` flag, carries data-testid="topbar-synapse-tab-disabled",
+  // sets aria-disabled, uses cursor: 'help' / reduced opacity, opens
+  // the hint modal on click instead of calling setTab.
+  assert.ok(
+    /const disabled\s*=\s*tab\.id === ['"]synapse['"]\s*&&\s*!synapseAllowed/
+      .test(topbarSrc),
+    v('TopBar button loop must compute `const disabled = tab.id === '
+      + '"synapse" && !synapseAllowed` so the Synapse tab in Basic '
+      + 'mode receives the disabled affordance.'))
+  assert.ok(
+    /data-testid=\{disabled \? ['"]topbar-synapse-tab-disabled['"] : undefined\}/
+      .test(topbarSrc),
+    v('Disabled Synapse tab must expose '
+      + 'data-testid="topbar-synapse-tab-disabled" so acceptance '
+      + 'tests can target it.'))
+  assert.ok(
+    /aria-disabled=\{disabled \|\| undefined\}/.test(topbarSrc),
+    v('Disabled Synapse tab must set aria-disabled for a11y + '
+      + 'automation parity.'))
+  assert.ok(
+    /Available in Synapse Panel mode\s+—\s+switch under Configure\./
+      .test(topbarSrc),
+    v('Disabled Synapse tab tooltip must read exactly '
+      + '"Available in Synapse Panel mode — switch under Configure." '
+      + '(byte-pinned per 2026-10-07 directive).'))
+  assert.ok(
+    /if\s*\(disabled\)\s*\{\s*setShowSynapseHint\(true\);\s*return\s*\}/
+      .test(topbarSrc),
+    v('Disabled Synapse tab click must open the hint modal '
+      + '(setShowSynapseHint(true)) and NOT invoke setTab — the tab '
+      + 'must stay non-navigable while discoverable.'))
+})
+
+test('TopBar renders the Synapse-hint modal with the operator copy + Configure shortcut', () => {
+  // Modal shell + copy pins. Click-through to Configure is the main
+  // affordance: the operator should be ONE tap away from the switch.
+  assert.ok(/data-testid="topbar-synapse-hint-backdrop"/.test(topbarSrc),
+    v('Synapse-hint modal must expose '
+      + 'data-testid="topbar-synapse-hint-backdrop" on its backdrop.'))
+  assert.ok(/data-testid="topbar-synapse-hint-panel"/.test(topbarSrc),
+    v('Synapse-hint modal must expose '
+      + 'data-testid="topbar-synapse-hint-panel" on its dialog panel.'))
+  assert.ok(/role="dialog"/.test(topbarSrc),
+    v('Synapse-hint modal panel must declare role="dialog".'))
+  assert.ok(
+    /The Synapse connection map is only available in Synapse Panel mode\. Go to Configure to switch\./
+      .test(topbarSrc),
+    v('Synapse-hint modal copy must read exactly '
+      + '"The Synapse connection map is only available in Synapse '
+      + 'Panel mode. Go to Configure to switch." (byte-pinned).'))
+  assert.ok(
+    /data-testid="topbar-synapse-hint-goto-configure"/.test(topbarSrc),
+    v('Synapse-hint modal must expose the Configure shortcut button '
+      + 'with data-testid="topbar-synapse-hint-goto-configure".'))
+  assert.ok(
+    /setShowSynapseHint\(false\);\s*setTab\(['"]configure['"]\)/
+      .test(topbarSrc),
+    v('Configure shortcut must dismiss the hint and call '
+      + 'setTab("configure") — one tap from hint to profile switch.'))
+  assert.ok(/data-testid="topbar-synapse-hint-dismiss"/.test(topbarSrc),
+    v('Synapse-hint modal must expose a dismiss button with '
+      + 'data-testid="topbar-synapse-hint-dismiss".'))
 })
 
 test('Configure tab actually survives the TopBar filter at the DEFAULT edition', async () => {

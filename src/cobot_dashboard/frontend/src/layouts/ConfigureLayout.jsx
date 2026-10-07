@@ -1160,8 +1160,9 @@ function HardwareProfileSection() {
       {isOem && (
         <div style={{ fontSize: 12, color: 'var(--text-muted)',
                       lineHeight: 1.5 }}>
-          Synapse tab is hidden. Wizards instruct the operator to wire
-          directly to the controller&rsquo;s DO/DI channels.
+          Synapse tab is shown greyed out in the nav (not clickable).
+          Wizards instruct the operator to wire directly to the
+          controller&rsquo;s DO/DI channels.
         </div>
       )}
       {lastOk && !confirm && !busy && (

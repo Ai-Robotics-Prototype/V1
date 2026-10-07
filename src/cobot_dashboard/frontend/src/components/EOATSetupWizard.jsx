@@ -1535,7 +1535,8 @@ function StandardNameInput({
 // silent-end wizard.
 function SavedScreen({ entry, onViewInMyCell, onSetupAnother, onDone }) {
   // Profile-aware "Ports claimed" + copy that doesn't invoke the
-  // Synapse tab name in OEM installs (the Synapse tab is hidden there).
+  // Synapse tab name in Basic installs (the Synapse tab is rendered
+  // disabled/greyed in nav there — not clickable).
   const profile = useIoHardwareProfile()
   const portmap = useSynapsePortmap()
   const _portOpts = { profile, portmap }

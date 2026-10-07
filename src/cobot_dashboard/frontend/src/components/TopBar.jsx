@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useStore } from '../store/useStore'
 import Brand from './Brand'
 import { isFeatureEnabled, TAB_TO_FEATURE } from '../lib/edition'
@@ -15,10 +16,12 @@ import UserChip from './UserChip'
 // basic-edition tablet still reads Monitor → Program Library → Program
 // → 3D View → Synapse → Event Log → Configure.
 //
-// The Synapse tab is HIDDEN entirely when the operator has declared
-// the OEM profile (no Synapse panel attached) — the Synapse connection
-// map models a panel that doesn't exist in OEM installs, and the
-// Main Internal Robot Controller I/O panel is reachable via Configure.
+// The Synapse tab is DISABLED (greyed, non-navigable, with hover
+// tooltip) when the operator has declared the Basic Robot Controller
+// I/O profile — the Synapse connection map models a panel that
+// doesn't exist in Basic installs, but the tab remains in its normal
+// nav slot so its disappearance is never silent. Clicking the
+// disabled tab opens a hint pointing the operator at Configure.
 //
 // Historic note: the standalone I/O tab was retired 2026-09-21 (its
 // content moved into the Synapse page's expandable section). Stale
@@ -32,7 +35,8 @@ const TABS = [
   { id: 'sensors',          label: 'Cameras & LiDAR' },
   { id: 'adaptive_picking', label: 'Part Recognition' },
   { id: 'safety',           label: 'Safety' },
-  // Synapse — hidden entirely in OEM mode via shouldShowSynapseTab.
+  // Synapse — disabled (not hidden) in Basic Robot Controller I/O
+  // mode via shouldShowSynapseTab; see render loop below.
   { id: 'synapse',          label: 'Synapse' },
   // Event Log.
   { id: 'event_log',        label: 'Event Log' },
@@ -66,19 +70,26 @@ export default function TopBar() {
   const fleetTotal   = useStore((s) => s.fleetTotal)
   const robotName    = useStore((s) => s.robotIdentity?.friendly_name) || ''
 
+  // Discoverability hint when the operator taps the disabled Synapse
+  // tab (Basic Robot Controller I/O mode). Modal, dismissable, with
+  // a one-click shortcut to Configure where the profile is flipped.
+  const [showSynapseHint, setShowSynapseHint] = useState(false)
+  const synapseAllowed = shouldShowSynapseTab(ioProfile)
+
   // Edition filter (2026-09-04): tabs not in this edition's feature
   // map render NOTHING (not disabled-greyed — absent). Safety is
   // edition-INDEPENDENT and left unmapped in TAB_TO_FEATURE, so
   // isFeatureEnabled returns true for every edition on that key.
   //
-  // Hardware-profile filter (2026-10-06): the Synapse tab vanishes
-  // in OEM mode — the connection-map page models a panel that
-  // isn't attached. Configure stays visible in both profiles so the
-  // operator can flip back.
+  // Hardware-profile handling (2026-10-07): the Synapse tab stays in
+  // the nav in every profile — it is RENDERED DISABLED in Basic
+  // Robot Controller I/O mode via `synapseAllowed`, not filtered.
+  // Participation in the responsive nav strip (same button element,
+  // same flexShrink: 0) is preserved so overflow-scroll behaviour at
+  // narrow widths is identical to Synapse mode.
   const visibleTabs = TABS.filter((tab) => {
     const feature = TAB_TO_FEATURE[tab.id] || tab.id
     if (!isFeatureEnabled(feature, edition)) return false
-    if (tab.id === 'synapse' && !shouldShowSynapseTab(ioProfile)) return false
     return true
   })
 
@@ -169,11 +180,24 @@ export default function TopBar() {
         WebkitOverflowScrolling: 'touch',
       }}>
         {visibleTabs.map((tab) => {
-          const active = activeTab === tab.id
+          const active   = activeTab === tab.id
+          // Synapse-in-Basic: disabled affordance. Button stays in the
+          // nav strip so overflow-scroll handling is identical; click
+          // opens the hint modal instead of navigating.
+          const disabled = tab.id === 'synapse' && !synapseAllowed
+          const title    = disabled
+            ? 'Available in Synapse Panel mode — switch under Configure.'
+            : undefined
           return (
             <button
               key={tab.id}
-              onClick={() => setTab(tab.id)}
+              data-testid={disabled ? 'topbar-synapse-tab-disabled' : undefined}
+              aria-disabled={disabled || undefined}
+              title={title}
+              onClick={() => {
+                if (disabled) { setShowSynapseHint(true); return }
+                setTab(tab.id)
+              }}
               style={{
                 background: active ? 'rgba(47,127,255,0.14)' : 'transparent',
                 border:     active ? '1px solid rgba(47,127,255,0.45)' : '1px solid transparent',
@@ -183,13 +207,15 @@ export default function TopBar() {
                 padding: '12px 22px',
                 minHeight: 50,
                 borderRadius: 10,
-                cursor: 'pointer',
+                cursor: disabled ? 'help' : 'pointer',
+                opacity: disabled ? 0.45 : 1,
+                fontStyle: disabled ? 'italic' : 'normal',
                 whiteSpace: 'nowrap',
                 flexShrink: 0,
                 transition: 'background 120ms, border-color 120ms, color 120ms',
               }}
-              onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(255,255,255,0.06)' }}
-              onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent' }}
+              onMouseEnter={(e) => { if (!active && !disabled) e.currentTarget.style.background = 'rgba(255,255,255,0.06)' }}
+              onMouseLeave={(e) => { if (!active && !disabled) e.currentTarget.style.background = 'transparent' }}
             >
               {tab.label}
             </button>
@@ -294,6 +320,86 @@ export default function TopBar() {
           )}
         </button>
       </div>
+
+      {/* Discoverability hint — opens when the operator taps the
+          disabled Synapse tab in Basic Robot Controller I/O mode.
+          Modal: fixed overlay, role=dialog, Escape/backdrop close,
+          with a one-tap shortcut to Configure (where the profile is
+          flipped). Standard modal shape (ArmEnableControl family). */}
+      {showSynapseHint && (
+        <div
+          data-testid="topbar-synapse-hint-backdrop"
+          onClick={() => setShowSynapseHint(false)}
+          style={{
+            position: 'fixed', inset: 0,
+            background: 'rgba(0,0,0,0.45)',
+            zIndex: 1000,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            data-testid="topbar-synapse-hint-panel"
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'var(--bg-panel)',
+              border: '1px solid var(--border)',
+              borderRadius: 10,
+              padding: 20,
+              maxWidth: 440,
+              color: 'var(--text-primary)',
+              boxShadow: '0 10px 30px rgba(0,0,0,0.55)',
+              fontFamily: 'inherit',
+            }}
+          >
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 8 }}>
+              Synapse tab unavailable
+            </div>
+            <div
+              data-testid="topbar-synapse-hint-copy"
+              style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16, lineHeight: 1.4 }}
+            >
+              The Synapse connection map is only available in Synapse Panel mode. Go to Configure to switch.
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                data-testid="topbar-synapse-hint-dismiss"
+                onClick={() => setShowSynapseHint(false)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-primary)',
+                  padding: '8px 14px',
+                  borderRadius: 8,
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}
+              >
+                Dismiss
+              </button>
+              <button
+                type="button"
+                data-testid="topbar-synapse-hint-goto-configure"
+                onClick={() => { setShowSynapseHint(false); setTab('configure') }}
+                style={{
+                  background: 'rgba(47,127,255,0.14)',
+                  border: '1px solid rgba(47,127,255,0.45)',
+                  color: 'var(--text-primary)',
+                  fontWeight: 600,
+                  padding: '8px 14px',
+                  borderRadius: 8,
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}
+              >
+                Go to Configure
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
