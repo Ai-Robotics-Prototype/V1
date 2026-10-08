@@ -486,6 +486,134 @@ test('non-motion whitelist includes close_gripper + open_gripper tokens', () => 
   }
 })
 
+test('semantic roundtrip whitelist accepts close_gripper + open_gripper tokens', () => {
+  // 2026-10-08 operator field report — SAVE flow refused with
+  // "Controller refused the save — program not loaded" + raw
+  // "semantic_roundtrip_error" in technicalDetail. Root cause:
+  // lua_semantic_roundtrip._ACTION_TO_LEGAL_VERBS had the
+  // inverted gripper_close/gripper_open tokens but the wizard
+  // emits close_gripper/open_gripper. Pin all four token forms
+  // here so a future refactor can't silently drop one again.
+  const rtSrc = readFileSync(new URL(
+    '../../../../estun_driver/estun_driver/lua_semantic_roundtrip.py',
+    import.meta.url), 'utf8')
+  for (const tok of ['"close_gripper"', '"open_gripper"',
+                     '"gripper_close"', '"gripper_open"']) {
+    assert.ok(rtSrc.includes(tok),
+      v(`lua_semantic_roundtrip._ACTION_TO_LEGAL_VERBS must include `
+        + `${tok} — pre-fix the save flow refused finger programs `
+        + `with kind='unknown_action'.`))
+  }
+  // The marker that codegen's new finger-dispatch emits on
+  // tool-IO setup gaps must be recognised by the gate so the
+  // sweep classifier surfaces it as tool_io_refused rather than
+  // step_drop.
+  assert.ok(/_TOOL_IO_REFUSED_RE\s*=/.test(rtSrc),
+    v('lua_semantic_roundtrip must define _TOOL_IO_REFUSED_RE '
+      + '— the codegen marker for a bound EOAT without a valve.'))
+  assert.ok(/kind="tool_io_refused"/.test(rtSrc),
+    v('lua_semantic_roundtrip must emit RoundTripFinding kind='
+      + '"tool_io_refused" for the gripper setup-incomplete case.'))
+})
+
+test('codegen emits raw DO channels for close_gripper / open_gripper (no Synapse names)', () => {
+  // Pin that the gripper-dispatch branch emits setDO(<port>,<val>)
+  // directly — codegen's wire output must carry raw controller
+  // channels, never "Valve 03" or other Synapse labels. The
+  // addressing doctrine (ADR + rebind layer) keeps Synapse names
+  // in display surfaces; codegen converts to DO<n> at emit.
+  const opsSrc = readFileSync(new URL(
+    '../../../../estun_driver/estun_driver/program_ops.py',
+    import.meta.url), 'utf8')
+  assert.ok(/action in \('close_gripper', 'open_gripper',\s*'gripper_close', 'gripper_open'\)/
+              .test(opsSrc),
+    v('program_ops.codegen must dispatch on close_gripper / '
+      + 'open_gripper / gripper_close / gripper_open as a group '
+      + '— pre-fix these actions fell through to the generic '
+      + 'motion branch and got silent-skipped.'))
+  // The emitted line uses setDO + raw port int, not a Synapse id.
+  assert.ok(/f'setDO\(\{port\},\{value\}\)/.test(opsSrc),
+    v('codegen must emit setDO(<port>,<value>) literals — not '
+      + 'Synapse names. The addressing doctrine keeps Synapse '
+      + 'display at the UI layer; the wire is raw DO<n>.'))
+  // Bind-by-id: codegen re-resolves io_close/io_open from the
+  // cell's current EOAT valve so a stored DO0 placeholder from
+  // pre-cell wizard output doesn't poison the emission.
+  assert.ok(/_tool_valve_raw\s*=\s*None/.test(opsSrc),
+    v('codegen must cache _tool_valve_raw per codegen call for '
+      + 'the bind-by-id gripper resolve.'))
+  assert.ok(/_cell_eoat_id/.test(opsSrc),
+    v('codegen must read program.config.cell_eoat_id for the '
+      + 'bind-by-id resolve.'))
+  // The REFUSED marker surfaces an operator-actionable reason
+  // (never raw gate jargon). String is split across adjacent
+  // f-string literals in the source, so grep for the two key
+  // phrases independently.
+  assert.ok(/has no valve/.test(opsSrc)
+             && /finish its setup/.test(opsSrc)
+             && /EOAT Setup before saving/.test(opsSrc),
+    v('codegen must emit the "no valve assigned — finish its '
+      + 'setup in EOAT Setup" marker when the bind-by-id resolve '
+      + 'finds no valve. The dashboard save-flow translates this '
+      + 'into the plain-language toast.'))
+})
+
+test('save-flow translates semantic_roundtrip_error to plain operator copy', () => {
+  // 2026-10-08: pre-fix the save handler surfaced the raw
+  // "semantic_roundtrip_error" code to the frontend; the
+  // operator saw "Controller refused the save — program not
+  // loaded" + jargon in technicalDetail. The handler must now
+  // parse the body_head for the gate's kind and route into a
+  // named outcome (tool_io_unassigned / pallet_refused / codegen)
+  // so loadOutcome.js can render operator-language copy.
+  const dashSrc = readFileSync(new URL(
+    '../../../cobot_dashboard/dashboard_server.py',
+    import.meta.url), 'utf8')
+  assert.ok(/code == "semantic_roundtrip_error"/.test(dashSrc),
+    v('save-flow error extractor must branch on '
+      + 'code=="semantic_roundtrip_error" so the raw code never '
+      + 'reaches the operator.'))
+  assert.ok(/outcome_kind_override = "tool_io_unassigned"/.test(dashSrc),
+    v('save-flow must map a tool_io_refused finding to the '
+      + 'named outcome kind "tool_io_unassigned".'))
+  assert.ok(/outcome_kind_override = "pallet_refused"/.test(dashSrc),
+    v('save-flow must map a pallet_ik_refused finding to the '
+      + 'named outcome kind "pallet_refused".'))
+  assert.ok(/not a teaching gap/.test(dashSrc),
+    v('tool_io_unassigned operator copy must disclaim "this is '
+      + 'a tool setup gap, not a teaching gap" so the operator '
+      + 'is pointed at EOAT Setup not the Program Editor.'))
+})
+
+test('loadOutcome: tool_io_unassigned renders plain operator copy', async () => {
+  const { namedLoadError } = await import('../../src/lib/loadOutcome.js')
+  const out = namedLoadError({
+    outcome: {
+      kind: 'tool_io_unassigned',
+      eoat_name: 'Finger Gripper',
+      reason: "The gripper's valve isn't assigned on its cell record"
+        + " — finish the tool's setup in EOAT Setup, then save again.",
+    },
+    error: 'raw',
+  }, 400)
+  assert.equal(out.code, 'tool_io_unassigned',
+    v('tool_io_unassigned must produce a shaped outcome with the '
+      + 'same code.'))
+  assert.match(out.title, /Finger Gripper/,
+    v('tool_io_unassigned title must interpolate the EOAT name '
+      + 'so the operator knows which tool is missing a valve.'))
+  // No raw gate jargon in the operator-visible strings.
+  for (const banned of ['semantic_roundtrip', 'unknown_action',
+                        'line_map', 'tool_io_refused']) {
+    assert.ok(!out.title.includes(banned),
+      v(`tool_io_unassigned title must not contain gate jargon `
+        + `(${banned})`))
+    assert.ok(!out.detail.includes(banned),
+      v(`tool_io_unassigned detail must not contain gate jargon `
+        + `(${banned})`))
+  }
+})
+
 test('backend tool-IO gate names its outcome kind + the EOAT', () => {
   // The pre-run gate for the "tool IO unassigned" case must return
   // a NAMED outcome kind separate from pending_poses, with the

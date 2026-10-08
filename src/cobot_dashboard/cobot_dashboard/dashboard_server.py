@@ -8635,6 +8635,15 @@ if FASTAPI_AVAILABLE:
             # frontend gets a NAMED refusal — never "network hiccup"
             # for something the wire actually told us about.
             step_reason = None
+            # 2026-10-08: when the failing step is the semantic
+            # roundtrip gate, translate its internal finding kinds
+            # into operator-actionable copy BEFORE we hand the string
+            # to the frontend. "semantic_roundtrip_error" is not
+            # actionable; the operator needs to know what to do.
+            # Named outcome kinds give the frontend a stable branch
+            # so the toast copy stays operator-language.
+            outcome_kind_override = None
+            outcome_extra = {}
             for step in (save_event or {}).get("steps", []):
                 if not _save_step_ok(step):
                     # For failed CHECK steps the reason lives in
@@ -8643,20 +8652,58 @@ if FASTAPI_AVAILABLE:
                     code = step.get("code")
                     check_reason = (code if isinstance(code, str) and code != "909"
                                     else None)
+                    body_head = step.get("body_head") or ""
+                    if code == "semantic_roundtrip_error":
+                        # The gate's body_head carries the stringified
+                        # first findings; parse out the kind so the
+                        # operator sees the actual problem instead of
+                        # a generic save-rejected toast.
+                        if "tool_io_refused" in body_head:
+                            outcome_kind_override = "tool_io_unassigned"
+                            outcome_extra["reason"] = (
+                                "The gripper's valve isn't assigned "
+                                "on its cell record — finish the "
+                                "tool's setup in EOAT Setup, then "
+                                "save again.")
+                            step_reason = outcome_extra["reason"]
+                            break
+                        if "pallet_ik_refused" in body_head:
+                            outcome_kind_override = "pallet_refused"
+                            outcome_extra["reason"] = (
+                                "A pallet step couldn't be placed by "
+                                "codegen — re-check the pallet's "
+                                "rows/cols/layers or the reachable "
+                                "Z before saving.")
+                            step_reason = outcome_extra["reason"]
+                            break
+                        if "unknown_action" in body_head:
+                            # Shouldn't happen after the close/open
+                            # gripper fix lands, but surface a
+                            # bounded message so the operator sees a
+                            # Support path rather than raw jargon.
+                            outcome_kind_override = "codegen"
+                            outcome_extra["reason"] = (
+                                "Codegen produced a step the "
+                                "roundtrip gate didn't recognise. "
+                                "Report this to Support.")
+                            step_reason = outcome_extra["reason"]
+                            break
                     step_reason = (step.get("reason")
                                    or step.get("error")
                                    or step.get("body")
                                    or check_reason
-                                   or step.get("body_head"))
+                                   or body_head)
                     if step_reason:
                         break
             if step_reason:
+                outcome = {"kind": outcome_kind_override or "save_rejected",
+                           "reason": str(step_reason),
+                           "save": save_event}
+                outcome.update(outcome_extra)
                 return JSONResponse({
                     "ok": False,
                     "error": str(step_reason),
-                    "outcome": {"kind": "save_rejected",
-                                "reason": str(step_reason),
-                                "save": save_event},
+                    "outcome": outcome,
                 }, status_code=400)
             return JSONResponse({
                 "ok": False,

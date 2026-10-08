@@ -44,6 +44,12 @@ export const LOAD_OUTCOME_KINDS = [
   'pending_poses',
   'arity_assertion_failed',
   'quarantined',
+  // 2026-10-08 tool-IO setup gaps — the gripper's valve isn't
+  // assigned on the bound EOAT's cell record. Distinct from
+  // pending_poses so the operator is pointed at EOAT Setup
+  // instead of the Program Editor.
+  'tool_io_unassigned',
+  'pallet_refused',
 ]
 
 // Tokens that must never appear in operator-facing strings
@@ -135,6 +141,37 @@ export function namedLoadError(body, httpStatus) {
       title:   'Controller link is down — program not loaded.',
       detail:  'The controller kept the previous program. '
              + 'Wait for the driver to reconnect, then try again.',
+      technicalDetail: rawReason,
+    })
+  }
+
+  if (kind === 'pallet_refused') {
+    const seed = body?.outcome?.reason
+    return _shape({
+      code:    'pallet_refused',
+      title:   "A pallet step couldn't be placed.",
+      detail:  seed
+        || 'Re-check the pallet rows/cols/layers and the reachable '
+         + 'Z, then save again.',
+      technicalDetail: rawReason,
+    })
+  }
+
+  if (kind === 'tool_io_unassigned') {
+    // 2026-10-08: the pre-run / pre-save tool-IO gate caught a
+    // program whose bound EOAT has no valve to resolve against.
+    // The operator-visible path leads to EOAT Setup, not the
+    // Program Editor — this is a tool setup gap, not a teaching
+    // gap. Named kind so the toast rendering is stable across
+    // every save-refusal and run-refusal path.
+    const name  = body?.outcome?.eoat_name || 'the selected tool'
+    const seed  = body?.outcome?.reason
+    return _shape({
+      code:    'tool_io_unassigned',
+      title:   `${name}'s valve isn't assigned.`,
+      detail:  seed
+        || `Finish ${name}'s setup in EOAT Setup, then save again. `
+         + 'This is a tool setup gap, not a teaching gap.',
       technicalDetail: rawReason,
     })
   }

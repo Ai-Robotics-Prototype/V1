@@ -83,6 +83,19 @@ _ACTION_TO_LEGAL_VERBS = {
     "gripper":           {"setDO", "wait", "sys.sleep"},
     "gripper_close":     {"setDO", "wait", "sys.sleep"},
     "gripper_open":      {"setDO", "wait", "sys.sleep"},
+    # 2026-10-08 operator field report: the wizard emits finger
+    # gripper steps as action='close_gripper' / 'open_gripper'
+    # (effectorVocab.js:190, 250), which did not appear in this map.
+    # Codegen also emits the setDO primitive on these — see the new
+    # gripper-dispatch branch in program_ops.py — so the legal verb
+    # set mirrors the gripper_close/gripper_open row above. Carrying
+    # BOTH token forms so legacy / externally-authored programs with
+    # the inverted shape stay recognised. Pre-fix this gap caused
+    # kind='unknown_action' findings → semantic_roundtrip_error → the
+    # save flow refused with "Controller refused the save — program
+    # not loaded" + raw gate jargon in technicalDetail.
+    "close_gripper":     {"setDO", "wait", "sys.sleep"},
+    "open_gripper":      {"setDO", "wait", "sys.sleep"},
     "vacuum_on":         {"setDO", "wait", "sys.sleep"},
     "vacuum_off":        {"setDO", "wait", "sys.sleep"},
     # Input-conditional (G3 addition — pallet detect uses waitCondition/getDI)
@@ -184,6 +197,13 @@ _ABSORBED_RE  = re.compile(r"--\s*absorbed\s+into\s+move_to_pallet\s+cycle")
 # CAUGHT with the pallet_ik_refused kind, not generic step_drop.
 _PALLET_IK_FAIL_RE = re.compile(r"--\s*PALLET\s+IK\s+FAILED:")
 _PALLET_REFUSED_RE = re.compile(r"--\s*REFUSED\s+'move_to_pallet':")
+# 2026-10-08 gripper setup-incomplete refusal — same shape as
+# pallet refusals but keyed to the finger-gripper dispatch's
+# "no valve assigned" / "port outside range" cases. The sweep
+# classifier surfaces these as CAUGHT with kind='tool_io_refused'
+# so the operator sees the EOAT Setup path, not a raw code.
+_TOOL_IO_REFUSED_RE = re.compile(
+    r"--\s*REFUSED\s+'(close_gripper|open_gripper|gripper_close|gripper_open)':")
 
 _MOTION_ACTIONS = frozenset({
     "move_home", "move_joint", "move_linear", "move_arc",
@@ -386,6 +406,27 @@ def check_consistency(
             skipped_m = _SKIPPED_RE.search(raw_slice)
             ik_fail_m = _PALLET_IK_FAIL_RE.search(raw_slice)
             pallet_refused_m = _PALLET_REFUSED_RE.search(raw_slice)
+            tool_io_refused_m = _TOOL_IO_REFUSED_RE.search(raw_slice)
+            if tool_io_refused_m:
+                # Finger-gripper step emitted a REFUSED marker from
+                # the bind-by-id resolver — operator sees an EOAT
+                # Setup prompt (not raw "unknown_action" jargon).
+                reason_line = next(
+                    (L.strip() for L in slice_lines
+                     if "-- REFUSED '" in L
+                     and "_gripper" in L),
+                    "(marker present)",
+                )
+                r.findings.append(RoundTripFinding(
+                    kind="tool_io_refused", step_idx=e.step_idx,
+                    detail=(
+                        "codegen refused this gripper step because "
+                        "the bound tool has no valve assigned on "
+                        "its cell record. Finish the tool's setup "
+                        "in EOAT Setup, then save again. Marker: "
+                        f"{reason_line[:180]}"),
+                ))
+                continue
             if ik_fail_m or pallet_refused_m:
                 # G6: codegen-time refusal of a pallet expansion.
                 # This IS the §644 hand-queued class from the
