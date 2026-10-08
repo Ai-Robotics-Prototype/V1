@@ -543,14 +543,33 @@ test('ProgramWizard tool step render is ToolFromCellStep (shared component)', ()
   assert.ok(/import ToolFromCellStep from '\.\/ToolFromCellStep'/
               .test(wizardSrc),
     v('ProgramWizard must import ToolFromCellStep'))
-  // The gripper_type page's render is now the imported component
-  // itself, not an inline function.
-  assert.ok(/id:\s*['"]gripper_type['"],\s*\n\s*render:\s*ToolFromCellStep/
+  // 2026-10-08 merge (operator field report): the standalone
+  // gripper_type step is retired. The merged tool_and_payload step
+  // hosts ToolFromCellStep (embedded=true) inside the
+  // ToolAndPayloadStep wrapper, which is the PAGES render target.
+  // The operator-visible "tool/payload" step now literally renders
+  // the cell-EOAT cards — resolving the pre-merge confusion where
+  // the mass step's question "What tool or payload…" implied cards
+  // but showed only a text input.
+  assert.ok(/id:\s*['"]tool_and_payload['"],\s*\n\s*render:\s*ToolAndPayloadStep/
               .test(wizardSrc),
-    v('gripper_type step render must be `ToolFromCellStep` (shared '
-      + 'component) — one mount serves every program-creation path '
-      + '(palletize + machine-tend + pick-and-place ride the same '
-      + 'PAGES list).'))
+    v('tool_and_payload step render must be `ToolAndPayloadStep` — '
+      + 'the merged wrapper that embeds ToolFromCellStep + mass.'))
+  // The retired standalone gripper_type page must NOT be declared
+  // as a PAGES entry anymore.
+  assert.equal(/\n\s*id:\s*['"]gripper_type['"],\s*\n\s*render:/.test(wizardSrc),
+               false,
+    v('standalone gripper_type page must be retired (merged into '
+      + 'tool_and_payload).'))
+  // ToolAndPayloadStep wrapper must mount <ToolFromCellStep /> with
+  // embedded=true + autoAdvance=false so the parent owns Next.
+  assert.ok(/function ToolAndPayloadStep\(/.test(wizardSrc),
+    v('ProgramWizard must define the ToolAndPayloadStep wrapper'))
+  assert.ok(/<ToolFromCellStep\b[\s\S]*?autoAdvance=\{false\}[\s\S]*?embedded/
+              .test(wizardSrc),
+    v('ToolAndPayloadStep must mount <ToolFromCellStep /> with '
+      + 'autoAdvance={false} and embedded — the parent owns '
+      + 'advancement so cards select without jumping to the next page.'))
 })
 
 test('single-EOAT preselect + zero-EOAT empty state present in ToolFromCellStep', () => {
@@ -608,20 +627,32 @@ test('bind-by-id: commit writes cell_eoat_id and derives gripper_type + custom_t
 })
 
 test('palletizing rides the same tool step (single PAGES mount, no fork)', () => {
-  // The gripper_type step has NO skip predicate — palletize +
-  // machine_tend + pick_and_place all pass through it.
+  // 2026-10-08: merge consolidates tool-selection + payload mass
+  // under id='tool_and_payload' with render=ToolAndPayloadStep. The
+  // step has NO skip predicate so palletize + machine_tend +
+  // pick_and_place all pass through it (same contract the retired
+  // gripper_type step enforced).
   const stepBlock = wizardSrc.match(
-    /\{\s*\n?\s*id:\s*['"]gripper_type['"],[\s\S]*?render:\s*ToolFromCellStep[\s\S]*?\}/)
-  assert.ok(stepBlock, v('gripper_type step block must exist'))
+    /\{\s*\n?\s*id:\s*['"]tool_and_payload['"],[\s\S]*?render:\s*ToolAndPayloadStep[\s\S]*?\}/)
+  assert.ok(stepBlock, v('tool_and_payload step block must exist'))
   assert.equal(/skip:/.test(stepBlock[0]), false,
-    v('gripper_type step must have NO skip predicate — every '
+    v('tool_and_payload step must have NO skip predicate — every '
       + 'program-creation path (palletize / machine-tend / '
-      + 'pick-and-place) shares this ONE tool step.'))
-  // And there's exactly ONE mount site — grep for the render binding.
-  const mounts = wizardSrc.match(/render:\s*ToolFromCellStep/g) || []
-  assert.equal(mounts.length, 1,
-    v(`ToolFromCellStep must be mounted EXACTLY once in the PAGES `
-      + `list — found ${mounts.length}.`))
+      + 'pick-and-place) shares this ONE tool/payload step.'))
+  // ToolFromCellStep must be used EXACTLY once in the wizard — the
+  // single mount is now a JSX usage inside ToolAndPayloadStep rather
+  // than a direct PAGES render binding.
+  const jsxMounts = wizardSrc.match(/<ToolFromCellStep\b/g) || []
+  assert.equal(jsxMounts.length, 1,
+    v(`ToolFromCellStep must be used EXACTLY once in the wizard `
+      + `— found ${jsxMounts.length}.`))
+  // And it must not reappear as a direct render target (would be a
+  // second mount alongside the embedded one).
+  const renderMounts = wizardSrc.match(/render:\s*ToolFromCellStep/g) || []
+  assert.equal(renderMounts.length, 0,
+    v(`ToolFromCellStep must not be used as a direct PAGES render `
+      + `target — the merged ToolAndPayloadStep wrapper hosts it. `
+      + `Found ${renderMounts.length} direct render(s).`))
 })
 
 test('type-question absent everywhere in program-creation flows (grep pin)', () => {

@@ -4,14 +4,16 @@ import { typeLabel } from '../lib/cellEntryDisplay'
 import { QuestionCard } from './WizardStepCard'
 import EOATSetupWizard from './EOATSetupWizard'
 
-// ToolFromCellStep — the program wizard's "Which tool will this
-// program use?" step (2026-09-22 operator directive).
+// ToolFromCellStep — the program wizard's "Which tool/payload will
+// this program use?" step (2026-09-22 operator directive, extended
+// 2026-10-08 to host the payload mass merge).
 //
 // Cards render from cell.eoats ONLY. No tool-type / gripper-type /
 // actuation questions live in this component — every choice is a
 // pre-registered cell entry. Three states:
 //
-//   * 2+ eoats  → cards; single-tap picks + advances.
+//   * 2+ eoats  → cards; single-tap picks (+ advances when
+//                 autoAdvance).
 //   * 1  eoat   → preselected + one-tap Confirm.
 //   * 0  eoats  → "You haven't set up a tool yet" + [Set up a tool]
 //                 only. The operator cannot advance from this state.
@@ -22,18 +24,32 @@ import EOATSetupWizard from './EOATSetupWizard'
 // is preselected. Wizard state around this step is preserved
 // (ProgramWizard's answers state doesn't unmount).
 //
-// Shared component: this file is the ONE tool step both the new-
-// program wizard AND the palletizing sub-flow render. Import-
-// identity pin in D_cell.test.js locks in the no-fork invariant.
+// 2026-10-08 autoAdvance prop (operator field report 2026-10-08):
+// callers that host ToolFromCellStep alongside other inputs (e.g.
+// the merged tool-and-payload step) pass autoAdvance=false so a
+// card tap SELECTS without advancing the wizard. The parent owns
+// its own Next button. Default stays true so legacy call sites keep
+// their single-tap UX.
 //
-// Chrome: this step renders inside the canonical <QuestionCard>
-// imported from ./WizardStepCard — same header/padding/width as
-// every other PAGES entry so the window chrome is identical across
-// the wizard (2026-10-01 operator field report — the tool step was
-// previously forking its own prompt header + no outer card).
+// Shared component: this file is the ONE tool step the new-program
+// wizard renders (merged tool_and_payload step as of 2026-10-08).
+// Import-identity pin in D_cell.test.js locks in the no-fork
+// invariant.
+//
+// Chrome: when standalone (as a PAGES render target) this step
+// renders inside the canonical <QuestionCard> imported from
+// ./WizardStepCard — same header/padding/width as every other PAGES
+// entry so the window chrome is identical across the wizard
+// (2026-10-01 operator field report — the tool step was previously
+// forking its own prompt header + no outer card). When hosted
+// inside another step (embedded=true), the parent owns the
+// QuestionCard shell and this component renders only the cards +
+// setup modal.
 
 export default function ToolFromCellStep({
   answers, setAnswer, goNext,
+  autoAdvance = true,
+  embedded = false,
 }) {
   const [cell, setCell]     = useState(null)
   const [err, setErr]       = useState(null)
@@ -99,13 +115,17 @@ export default function ToolFromCellStep({
     setAnswer('custom_tool_id',
       entry.tool_ref || (_isCustomEntry(entry) ? entry.id : null))
     // Advance the wizard with the fresh values so a downstream
-    // page's skip predicate sees them.
-    goNext({
-      cell_eoat_id:   entry.id,
-      gripper_type:   _gripperTypeFor(entry),
-      custom_tool_id: entry.tool_ref
-        || (_isCustomEntry(entry) ? entry.id : null),
-    })
+    // page's skip predicate sees them. When embedded in a larger
+    // step (autoAdvance=false), the parent owns advancement — a tap
+    // selects only.
+    if (autoAdvance) {
+      goNext({
+        cell_eoat_id:   entry.id,
+        gripper_type:   _gripperTypeFor(entry),
+        custom_tool_id: entry.tool_ref
+          || (_isCustomEntry(entry) ? entry.id : null),
+      })
+    }
   }
 
   const QUESTION = 'Which tool will this program use?'
@@ -115,34 +135,47 @@ export default function ToolFromCellStep({
     + 'ports change later, the program follows automatically.'
   )
 
+  // When embedded, the parent owns the <QuestionCard> shell (header +
+  // question + description + padding). We render only the body so
+  // the host step can compose cards + its own fields (e.g. mass)
+  // under one canonical card. The 2026-10-08 merged
+  // tool_and_payload step uses this path. Each render-state keeps
+  // its own <QuestionCard> literal so the D_cell canonical-chrome
+  // pin ("<QuestionCard> appears in every state") stays satisfied by
+  // grep.
+
   if (loading) {
+    const body = (
+      <div style={{ padding: 12, color: '#6b7280', fontSize: 13 }}>
+        Loading tools…
+      </div>
+    )
     return (
       <div data-testid="tool-from-cell-step" data-state="loading">
-        <QuestionCard question={QUESTION} description={DESCRIPTION}>
-          <div style={{ padding: 12, color: '#6b7280', fontSize: 13 }}>
-            Loading tools…
-          </div>
-        </QuestionCard>
+        {embedded ? body : (
+          <QuestionCard question={QUESTION} description={DESCRIPTION}>
+            {body}
+          </QuestionCard>
+        )}
       </div>
     )
   }
 
   if (err) {
+    const body = (<div style={_errStyle}>Tool library unavailable: {err}</div>)
     return (
       <div data-testid="tool-from-cell-step" data-state="error">
-        <QuestionCard question={QUESTION} description={DESCRIPTION}>
-          <div style={_errStyle}>Tool library unavailable: {err}</div>
-        </QuestionCard>
+        {embedded ? body : (
+          <QuestionCard question={QUESTION} description={DESCRIPTION}>
+            {body}
+          </QuestionCard>
+        )}
       </div>
     )
   }
 
-  return (
-    <div data-testid="tool-from-cell-step"
-         data-state={eoats.length === 0 ? 'empty'
-                    : eoats.length === 1 ? 'single' : 'multi'}>
-      <QuestionCard question={QUESTION} description={DESCRIPTION}>
-
+  const mainBody = (
+    <>
         {eoats.length === 0 && (
           <div data-testid="tool-from-cell-empty"
                style={{
@@ -225,7 +258,7 @@ export default function ToolFromCellStep({
           </div>
         )}
 
-        {eoats.length === 1 && selected && (
+        {eoats.length === 1 && selected && !embedded && (
           <div style={{
             marginTop: 12, display: 'flex', gap: 8,
           }}>
@@ -237,9 +270,18 @@ export default function ToolFromCellStep({
             </button>
           </div>
         )}
+    </>
+  )
 
-      </QuestionCard>
-
+  return (
+    <div data-testid="tool-from-cell-step"
+         data-state={eoats.length === 0 ? 'empty'
+                    : eoats.length === 1 ? 'single' : 'multi'}>
+      {embedded ? mainBody : (
+        <QuestionCard question={QUESTION} description={DESCRIPTION}>
+          {mainBody}
+        </QuestionCard>
+      )}
       {showSetup && (
         <EOATSetupWizard onClose={closeSetupAndRefresh} />
       )}

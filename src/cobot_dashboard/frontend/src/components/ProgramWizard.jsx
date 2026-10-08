@@ -1646,6 +1646,133 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
   )
 }
 
+// Merged tool-and-payload step (2026-10-08). Hosts the shared
+// ToolFromCellStep selector (embedded, no auto-advance) above a
+// mass + optional CoG input and this step's own Next/Skip row.
+// The operator sees cards for the saved cell EOATs AND captures
+// payload mass under one canonical card — resolving the pre-merge
+// confusion where the mass step's "What tool or payload…" question
+// implied cards but didn't render them.
+function ToolAndPayloadStep({ answers, setAnswer, goNext }) {
+  const kg       = answers.payload_kg
+  const kgNum    = Number(kg)
+  const massOk   = kg === 'skip' || (Number.isFinite(kgNum) && kgNum > 0)
+  const toolPicked = !!answers.cell_eoat_id
+  const canProceed = toolPicked && massOk
+  const [showCog, setShowCog] = useState(false)
+  const cog = answers.payload_cog_mm || {}
+  return (
+    <QuestionCard
+      question="What tool & payload will this program use?"
+      description="Pick the end-of-arm tool, then enter the payload mass so the controller can size collision-detection thresholds correctly. Mass can be skipped and set later in the program editor; the tool is required."
+    >
+      <ToolFromCellStep
+        answers={answers}
+        setAnswer={setAnswer}
+        goNext={goNext}
+        autoAdvance={false}
+        embedded
+      />
+      <div style={{
+        marginTop: 18,
+        padding: '14px 0 2px',
+        borderTop: '1px solid #e5e7eb',
+        display: 'flex', flexDirection: 'column', gap: 12,
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>
+          Payload mass
+        </div>
+        <label
+          data-testid="tool-and-payload-mass"
+          style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>
+          Mass (kg)
+          <input
+            type="number" step="0.1" min="0" max="30"
+            placeholder="e.g. 1.2"
+            value={kg && kg !== 'skip' ? kg : ''}
+            onChange={(e) => setAnswer('payload_kg',
+              e.target.value === '' ? null : Number(e.target.value))}
+            style={{
+              display: 'block', marginTop: 6,
+              padding: '8px 12px', fontSize: 16, fontWeight: 500,
+              border: '1px solid #d1d5db', borderRadius: 8,
+              background: '#fff', color: '#111827', width: 140,
+            }} />
+        </label>
+        <button
+          onClick={() => setShowCog((v) => !v)}
+          style={{
+            background: 'none', border: 'none', padding: 0,
+            fontSize: 13, color: '#2563EB', cursor: 'pointer',
+            fontWeight: 500, textAlign: 'left', maxWidth: 300,
+          }}>
+          {showCog ? '▾ Hide CoG offset' : '▸ Add CoG offset (advanced)'}
+        </button>
+        {showCog && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+            fontSize: 13, color: '#374151',
+          }}>
+            <span>CoG (mm from flange)</span>
+            {['x', 'y', 'z'].map((k) => (
+              <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ color: '#6b7280', fontWeight: 700, textTransform: 'uppercase' }}>{k}</span>
+                <input
+                  type="number" step="1"
+                  placeholder="0"
+                  value={cog[k] ?? ''}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    const next = { ...cog }
+                    if (v === '') delete next[k]
+                    else if (Number.isFinite(Number(v))) next[k] = Number(v)
+                    setAnswer('payload_cog_mm', Object.keys(next).length ? next : null)
+                  }}
+                  style={{
+                    padding: '4px 8px', fontSize: 13,
+                    border: '1px solid #d1d5db', borderRadius: 5,
+                    width: 72, textAlign: 'right',
+                  }} />
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+      <div style={{
+        padding: 12, background: '#EFF6FF', borderRadius: 8,
+        border: '1px solid #bfdbfe', fontSize: 12, color: '#1E3A8A',
+        marginTop: 14, lineHeight: 1.55,
+      }}>
+        <b>Why we ask.</b> Without a payload value the collision
+        monitor uses default (heavier) thresholds — false positives
+        go up and true collisions register later. Programs without
+        a set payload will show a warning until it's filled in.
+      </div>
+      <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center' }}>
+        <button
+          data-testid="tool-and-payload-skip-mass"
+          onClick={() => { setAnswer('payload_kg', 'skip'); goNext({ payload_kg: 'skip' }) }}
+          disabled={!toolPicked}
+          title={toolPicked ? undefined : 'Pick a tool first'}
+          style={{
+            padding: '10px 18px', fontSize: 14, fontWeight: 500,
+            background: 'transparent',
+            color: toolPicked ? '#6b7280' : '#9ca3af',
+            border: '1px solid #d1d5db', borderRadius: 8,
+            cursor: toolPicked ? 'pointer' : 'not-allowed',
+          }}>
+          Not sure yet — skip
+        </button>
+        <div style={{ flex: 1 }} />
+        <NextButton
+          onClick={goNext}
+          label="Next"
+          disabled={!canProceed} />
+      </div>
+    </QuestionCard>
+  )
+}
+
 const PAGES = [
   // 2026-09-08 wizard simplification (operator directive):
   //   * `cell` page RETIRED. Auto-assigned in ProgramWizard mount
@@ -1777,33 +1904,14 @@ const PAGES = [
   // detect-step palette entry stay intact so legacy programs load
   // and detect can be re-wired when vision is in scope.
 
-  // 3: Which tool? (2026-09-22 "The Cell" tool-step directive)
-  //
-  // The old "What type of gripper?" question is retired. This step
-  // now renders CARDS from cell.eoats via the shared
-  // <ToolFromCellStep>, which is also imported by every other
-  // program-creation surface (palletizing, machine-tending — they
-  // ride the same PAGES list, so this file is the single mount).
-  // No tool-type / gripper-type / actuation question survives in
-  // any program-creation flow; every choice is a cell entry set up
-  // in EOAT Setup.
-  //
-  // The retired `gripper_settings` step (STEP upload + name + I/O)
-  // is gone with the type question — custom-tool CREATION lives in
-  // EOAT Setup. When the operator taps "+ Set up a new tool" here,
-  // the step opens EOATSetupWizard as a nested modal; on close, the
-  // cell refetches and the newly-added tool is preselected. Wizard
-  // state (all other answers) is preserved by construction — the
-  // ProgramWizard component doesn't unmount around the nested modal.
-  //
-  // Downstream code that historically read `answers.gripper_type`
-  // still gets it — ToolFromCellStep populates gripper_type +
-  // custom_tool_id + cell_eoat_id from the picked entry so
-  // buildSteps / codegen / tool-hookup lookups keep working.
-  {
-    id: 'gripper_type',
-    render: ToolFromCellStep,
-  },
+  // 2026-10-08: standalone `gripper_type` page RETIRED (operator
+  // field report 2026-10-08). The tool-selection cards and the mass
+  // question are now merged into a single `tool_and_payload` step
+  // (defined below alongside the retired `payload` entry) so the
+  // operator sees ONE "tool/payload" step — cards + mass under one
+  // canonical card — instead of two confusingly-named steps. The
+  // single-mount of ToolFromCellStep still holds: the merged step
+  // hosts the ONE embedded render.
 
   // ──────────────────────────────────────────────────────────────────
   // PALLET PAGES — shared layout + per-mode teach + approach pages.
@@ -2078,128 +2186,31 @@ const PAGES = [
     ),
   },
 
-  // 6b: Tool payload — mass + optional CoG. Stored under
-  // config.payload_kg / config.payload_cog_mm / config.tool_name.
-  // Non-blocking (operators can skip with "Not sure yet"), but every
-  // downstream surface (editor / run modal / monitor chip) will show
-  // an amber warning until it's filled in. See the codegen header
-  // and lib/payload.js for the full policy.
+  // Tool + payload (merged, 2026-10-08 operator field report).
+  //
+  // The old split — a standalone `gripper_type` step for the tool-
+  // selection cards + a separate `payload` step for mass — surfaced
+  // as a UX bug: the payload step's question "What tool or payload
+  // does this program use?" led operators to expect the cell-EOAT
+  // cards here too. The cards were on the earlier step; the payload
+  // step was a different / older question that never got wired to
+  // the cell. Fix: merge the two under one canonical card. The
+  // operator-visible "tool/payload" step renders the saved cell
+  // EOATs as cards (via the SAME ToolFromCellStep selector, now
+  // embedded) with the mass + optional CoG + Next below.
+  //
+  // Payload mass is still non-blocking (Skip is available); the
+  // editor's payload card is where it's typically tuned after
+  // creation. The tool-selection, by contrast, is required to
+  // advance — a program must bind to an EOAT.
+  //
+  // ToolFromCellStep stays mounted EXACTLY once in the PAGES list
+  // (D_cell single-mount pin); the embedded=true flag suppresses
+  // its auto-advance and its outer <QuestionCard>, letting this
+  // step host both concerns under one card.
   {
-    id: 'payload',
-    render: ({ answers, setAnswer, goNext }) => {
-      const kg = answers.payload_kg
-      const kgNum = Number(kg)
-      const canProceed = kg === 'skip' || (Number.isFinite(kgNum) && kgNum > 0)
-      // render() is always invoked from the wizard's <PageHost> as a
-      // component, so hook order stays stable. Rule flags the lowercase
-      // property name only.
-      // eslint-disable-next-line react-hooks/rules-of-hooks
-      const [showCog, setShowCog] = useState(false)
-      const cog = answers.payload_cog_mm || {}
-      return (
-        <QuestionCard
-          question="What tool or payload does this program use?"
-          description="Enter the tool's mass so the controller can size collision-detection thresholds correctly. If you don't know yet you can skip this and set it later in the program editor."
-        >
-          <div style={{
-            display: 'flex', flexDirection: 'column', gap: 12,
-            padding: '4px 2px',
-          }}>
-            <label style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>
-              Tool mass (kg)
-              <input
-                type="number" step="0.1" min="0" max="30"
-                placeholder="e.g. 1.2"
-                value={kg && kg !== 'skip' ? kg : ''}
-                onChange={(e) => setAnswer('payload_kg',
-                  e.target.value === '' ? null : Number(e.target.value))}
-                autoFocus
-                style={{
-                  display: 'block', marginTop: 6,
-                  padding: '8px 12px', fontSize: 16, fontWeight: 500,
-                  border: '1px solid #d1d5db', borderRadius: 8,
-                  background: '#fff', color: '#111827', width: 140,
-                }} />
-            </label>
-            <label style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>
-              Tool name (optional)
-              <input
-                type="text" maxLength={40}
-                placeholder="e.g. vacuum tool, welding gun, adaptive gripper"
-                value={answers.tool_name || ''}
-                onChange={(e) => setAnswer('tool_name', e.target.value)}
-                style={{
-                  display: 'block', marginTop: 6,
-                  padding: '8px 12px', fontSize: 14,
-                  border: '1px solid #d1d5db', borderRadius: 8,
-                  background: '#fff', color: '#111827', width: 340,
-                }} />
-            </label>
-            <button
-              onClick={() => setShowCog((v) => !v)}
-              style={{
-                background: 'none', border: 'none', padding: 0,
-                fontSize: 13, color: '#2563EB', cursor: 'pointer',
-                fontWeight: 500, textAlign: 'left', maxWidth: 300,
-              }}>
-              {showCog ? '▾ Hide CoG offset' : '▸ Add CoG offset (advanced)'}
-            </button>
-            {showCog && (
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
-                fontSize: 13, color: '#374151',
-              }}>
-                <span>CoG (mm from flange)</span>
-                {['x', 'y', 'z'].map((k) => (
-                  <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                    <span style={{ color: '#6b7280', fontWeight: 700, textTransform: 'uppercase' }}>{k}</span>
-                    <input
-                      type="number" step="1"
-                      placeholder="0"
-                      value={cog[k] ?? ''}
-                      onChange={(e) => {
-                        const v = e.target.value
-                        const next = { ...cog }
-                        if (v === '') delete next[k]
-                        else if (Number.isFinite(Number(v))) next[k] = Number(v)
-                        setAnswer('payload_cog_mm', Object.keys(next).length ? next : null)
-                      }}
-                      style={{
-                        padding: '4px 8px', fontSize: 13,
-                        border: '1px solid #d1d5db', borderRadius: 5,
-                        width: 72, textAlign: 'right',
-                      }} />
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-          <div style={{
-            padding: 12, background: '#EFF6FF', borderRadius: 8,
-            border: '1px solid #bfdbfe', fontSize: 12, color: '#1E3A8A',
-            marginTop: 14, lineHeight: 1.55,
-          }}>
-            <b>Why we ask.</b> Without a payload value the collision
-            monitor uses default (heavier) thresholds — false positives
-            go up and true collisions register later. Programs without
-            a set payload will show a warning until it's filled in.
-          </div>
-          <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center' }}>
-            <button
-              onClick={() => { setAnswer('payload_kg', 'skip'); goNext({ payload_kg: 'skip' }) }}
-              style={{
-                padding: '10px 18px', fontSize: 14, fontWeight: 500,
-                background: 'transparent', color: '#6b7280',
-                border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
-              }}>
-              Not sure yet — skip
-            </button>
-            <div style={{ flex: 1 }} />
-            <NextButton onClick={goNext} label="Next" disabled={!canProceed} />
-          </div>
-        </QuestionCard>
-      )
-    },
+    id: 'tool_and_payload',
+    render: ToolAndPayloadStep,
   },
 
   // 7: Where to place? (for pick_and_place)
