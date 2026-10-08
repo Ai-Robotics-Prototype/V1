@@ -44,6 +44,7 @@ function v(msg) { return `DOCTRINE JOG_STEP VIOLATED: ${msg}` }
 
 const jogControlsSrc = readSrc('components/JogControls.jsx')
 const progEdSrc      = readSrc('components/ProgramEditor.jsx')
+const progWizSrc     = readSrc('components/ProgramWizard.jsx')
 const storeSrc       = readSrc('store/useStore.js')
 const backendSrc     = readRepo(
   'src/cobot_dashboard/cobot_dashboard/dashboard_server.py')
@@ -148,6 +149,102 @@ test('driver cart pulse keeps the legacy 150 ms fallback (back-compat)', () => {
 
 
 // ── (5) Teach drawer exposes the Step/Continuous toggle ───────────
+
+// ── (6) Program Wizard teach step rides the SAME shared jog path ──
+//
+// 2026-10-08 Bug-2 unify (operator field report 2026-10-07): the
+// program-wizard TeachSequence had forked its own jog UI. It read
+// jogStyle/step from local component state only, WizardJogArrow
+// hard-coded jogStyle="CONTINUOUS", and no `tap` dispatch ever ran.
+// Result: step chips were visually decorative (clicking them did
+// nothing on the wire) and no Step↔Continuous toggle was offered.
+// The unify ports the 626bb4e / 2026-10-06 TeachDrawer pattern to
+// the wizard teach surface: shared setJogStyle, shared
+// jogIncrement/jogPulseCartesian dispatch, WizardJogArrow accepts
+// jogStyle + onTap.
+
+test('ProgramWizard TeachSequence pulls shared jogStyle + setJogStyle', () => {
+  assert.ok(
+    /jogStyleShared\s*=\s*useStore\(\(s\)\s*=>\s*s\.jogStyle\)/
+      .test(progWizSrc),
+    v('TeachSequence must pull jogStyle from the SHARED store — the '
+      + 'wizard pre-fix had no toggle at all, and the HoldButton was '
+      + 'hard-coded to CONTINUOUS so step chips were decorative.'))
+  assert.ok(
+    /setJogStyleShared\s*=\s*useStore\(\(s\)\s*=>\s*s\.setJogStyle\)/
+      .test(progWizSrc),
+    v('TeachSequence must pull setJogStyle from the SHARED store so '
+      + 'a flip in the wizard propagates to the pendant + TeachDrawer '
+      + '— no local-state fork.'))
+})
+
+test('ProgramWizard TeachSequence has a tap() that dispatches STEP mode', () => {
+  // Byte-for-byte the same STEP dispatch JogControls.tap() and
+  // ProgramEditor.TeachDrawer.tap() run.
+  assert.ok(
+    /jogPulseCartesian\(axis,\s*direction,\s*speedRef\.current,\s*stepRef\.current\)/
+      .test(progWizSrc),
+    v('TeachSequence tap() must call jogPulseCartesian(axis, direction, '
+      + 'speedRef.current, stepRef.current) — the chip label must '
+      + 'reach the wire.'))
+  assert.ok(
+    /jogIncrement\(axis,\s*deltaDeg\)/.test(progWizSrc),
+    v('TeachSequence tap() must call jogIncrement(axis, deltaDeg) for '
+      + 'joint-mode step — same path TeachDrawer + pendant use.'))
+})
+
+test('ProgramWizard WizardJogArrow forwards jogStyle + onTap to HoldButton', () => {
+  // WizardJogArrow accepts the two props the HoldButton STEP/CONTINUOUS
+  // contract needs. Pre-fix the wrapper hard-coded jogStyle=CONTINUOUS
+  // and never surfaced onTap.
+  assert.ok(
+    /function WizardJogArrow\(\{\s*\n\s*jogStyle,\s*onTap,/.test(progWizSrc),
+    v('WizardJogArrow must accept jogStyle + onTap props — pre-fix it '
+      + 'hard-coded jogStyle="CONTINUOUS" and no onTap.'))
+  assert.ok(
+    /jogStyle=\{jogStyle \|\| 'CONTINUOUS'\}/.test(progWizSrc),
+    v('WizardJogArrow must pass jogStyle through to HoldButton (defaulting '
+      + 'to CONTINUOUS for legacy TeachWithJog callers).'))
+})
+
+test('ProgramWizard teach control bar renders a Step/Continuous toggle', () => {
+  assert.ok(
+    /data-testid="wizard-teach-jog-style-toggle"/.test(progWizSrc),
+    v('TeachSequence must render data-testid="wizard-teach-jog-style-toggle" '
+      + '— the operator-visible mode row in the wizard teach step.'))
+  assert.ok(
+    /data-testid="wizard-teach-jog-style-button"/.test(progWizSrc),
+    v('TeachSequence must render data-testid="wizard-teach-jog-style-button" '
+      + 'per Step/Continuous choice.'))
+  assert.ok(
+    /opacity:\s*jogStyleShared === 'STEP' \? 1 : 0\.4/.test(progWizSrc),
+    v('TeachSequence step chips must dim (opacity 0.4) when the shared '
+      + 'jogStyle is not STEP — same affordance as pendant + TeachDrawer.'))
+})
+
+// ── (7) Bug-1 scope-leak pin: no spontaneous reuse on fresh program ──
+//
+// 2026-10-08 Bug-1 scope fix (operator field report 2026-10-07): the
+// wizard pre-seeded answers.taught_home from /api/robot/home on mount,
+// which fired the reuse-choice screen on a brand-new program. The
+// trigger was too loose — reuse should fire only on prior saves of
+// THIS program (intra-session re-entry or edit-mode) and NEVER
+// spontaneously on a fresh program. Pin: no fetch to /api/robot/home
+// inside ProgramWizard, no setAnswer with source: 'global'.
+
+test('ProgramWizard does not auto-seed taught_home from the global home endpoint', () => {
+  assert.ok(
+    !/fetch\(['"]\/api\/robot\/home['"]/.test(progWizSrc),
+    v('ProgramWizard must NOT fetch /api/robot/home on mount — the '
+      + 'global-home seed caused brand-new programs to show "already '
+      + 'taught" + Reuse/Re-teach on the HOME POSITION step (2026-10-07 '
+      + 'operator field report).'))
+  assert.ok(
+    !/source:\s*['"]global['"]/.test(progWizSrc),
+    v('ProgramWizard must not stamp source: "global" on any taught '
+      + 'position — that marker belonged to the retired global-home seed.'))
+})
+
 
 test('TeachDrawer renders a Step/Continuous toggle using the shared setter', () => {
   // Shared setter — SAME action useStore exposes for the main pendant.

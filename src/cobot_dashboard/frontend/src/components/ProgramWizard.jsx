@@ -164,8 +164,15 @@ function PadCenterTile({ label, width = 64, height = 64 }) {
 // (never `s.jog` — that store action doesn't exist, so joint-mode
 // jog was a silent TypeError). Now uses the same WS transport +
 // hold_id/seq/keepalive the main pendant does.
+//
+// 2026-10-08 Bug-2 unify: accepts jogStyle + onTap from the caller so
+// the wizard teach surface rides the SAME HoldButton STEP/CONTINUOUS
+// contract as the main pendant + TeachDrawer. Prior form hard-coded
+// jogStyle="CONTINUOUS", making the wizard step-chip row visually
+// dead. Default stays CONTINUOUS so legacy TeachWithJog callers keep
+// their pre-unify behavior.
 function WizardJogArrow({
-  onPressStart, onPressTick, onPressEnd,
+  jogStyle, onTap, onPressStart, onPressTick, onPressEnd,
   color, label, rotation, size = 64, svgSize,
   disabled,
 }) {
@@ -173,7 +180,8 @@ function WizardJogArrow({
   const lp = Math.max(10, Math.floor(size * 0.10))
   return (
     <HoldButton
-      jogStyle="CONTINUOUS"
+      jogStyle={jogStyle || 'CONTINUOUS'}
+      onTap={onTap}
       onPressStart={onPressStart}
       onPressTick={onPressTick}
       onPressEnd={onPressEnd}
@@ -690,6 +698,16 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   const jogHold          = useStore((s) => s.jogHold)
   const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
   const jogRelease       = useStore((s) => s.jogRelease)
+  // 2026-10-08 Bug-2 unify: pull the STEP-mode dispatchers + shared
+  // jogStyle slice from the SAME store the main pendant and
+  // TeachDrawer use. No fork — one implementation, three mount
+  // points. Pre-fix the wizard rendered a Step chip row that was
+  // visually decorative because WizardJogArrow was hard-coded to
+  // CONTINUOUS and the wire function never supplied onTap.
+  const jogIncrement       = useStore((s) => s.jogIncrement)
+  const jogPulseCartesian  = useStore((s) => s.jogPulseCartesian)
+  const jogStyleShared     = useStore((s) => s.jogStyle) || 'CONTINUOUS'
+  const setJogStyleShared  = useStore((s) => s.setJogStyle)
   const homeRobot    = useStore((s) => s.homeRobot)
   const triggerEstop = useStore((s) => s.triggerEstop)
 
@@ -753,40 +771,18 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     return () => { alive = false; clearInterval(iv) }
   }, [])
 
-  // 2026-09-15 reuse UX: on mount, if THIS program has no locally
-  // taught home yet, consult the program-independent global home
-  // (/opt/cobot/home.json). When present, seed answers.taught_home
-  // with source='global' so the existing reuse-choice screen fires
-  // when the wizard reaches the HOME POSITION step. Never auto-
-  // applied — operator must click "Reuse This Position" (default
-  // action stays "Teach now"). If the global home is absent this
-  // is a no-op; if the program already carries a local taught_home
-  // (edit-mode, or the wizard back-navigated) we don't overwrite.
-  useEffect(() => {
-    let alive = true
-    const th = answers?.taught_home
-    const alreadyTaughtLocally = th && !th.skipped &&
-      (Array.isArray(th.joints) || Array.isArray(th.tcp))
-    if (alreadyTaughtLocally) return
-    ;(async () => {
-      try {
-        const res = await fetch('/api/robot/home')
-        if (!alive || !res.ok) return
-        const g = await res.json()
-        if (!g?.present) return
-        if (!Array.isArray(g.joints) && !Array.isArray(g.tcp)) return
-        setAnswer('taught_home', {
-          joints:    g.joints || null,
-          tcp:       Array.isArray(g.tcp) ? g.tcp : null,
-          taught_at: g.taught_at || null,
-          source:    'global',
-          skipped:   false,
-        })
-      } catch {}
-    })()
-    return () => { alive = false }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // 2026-10-08 Bug-1 scope-leak fix (operator field report 2026-10-07):
+  // the prior global-home seed (fetched /api/robot/home on mount and
+  // populated answers.taught_home with source='global') caused a NEW
+  // program to show "This position is already taught — Reuse/Re-teach"
+  // on the HOME POSITION step before the operator had taught anything.
+  // Reuse was triggered by cell/global data instead of only by prior
+  // saves of THIS program — the trigger was too loose. The reuse
+  // feature still fires intra-session (teaching HOME POSITION at step
+  // 1 populates taught_home and the HOME (return) step reuses it) and
+  // for existing programs re-opened for edit (saved taught_home flows
+  // in through answers). It no longer fires spontaneously on a fresh
+  // program.
 
   // Migrated 2026-07-22 from the discrete HTTP-pulse `s.jog` /
   // `s.jogCartesian` pattern (see TeachWithJog above for the full
@@ -799,11 +795,27 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   }, [jogHold, jogHoldCartesian])
   const holdEnd = useCallback((meta) => jogRelease(modeRef.current, meta),
     [jogRelease])
+  // 2026-10-08 Bug-2 unify: STEP-mode tap — one increment per press.
+  // Byte-for-byte the same dispatch main JogControls.tap() + the
+  // TeachDrawer tap() use. Joint uses the driver's time-boxed
+  // delta_deg path; Cartesian passes stepRef.current (mm) so the
+  // driver derives duration from the labelled distance (2026-10-06
+  // cart-step correctness fix).
+  const tap = useCallback((axis, direction) => {
+    if (modeRef.current === 'joint') {
+      const deltaDeg = direction * stepRef.current
+      jogIncrement(axis, deltaDeg)
+    } else {
+      jogPulseCartesian(axis, direction, speedRef.current, stepRef.current)
+    }
+  }, [jogIncrement, jogPulseCartesian])
   const wire = useCallback((axis, direction) => ({
+    jogStyle:     jogStyleShared,
+    onTap:        () => tap(axis, direction),
     onPressStart: (meta) => holdStart(axis, direction, meta),
     onPressTick:  (meta) => holdStart(axis, direction, meta),
     onPressEnd:   (meta) => holdEnd(meta),
-  }), [holdStart, holdEnd])
+  }), [holdStart, holdEnd, tap, jogStyleShared])
 
   // Compute per-position status (recorded / reused / skipped / pending)
   // for the progress dots and Review page card. A step marked 'reused'
@@ -1300,16 +1312,10 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               </div>
               <div style={{ fontSize: 13, color: '#6b7280' }}>
                 {(() => {
-                  const src = existingForCurrent?.source
-                  const at  = existingForCurrent?.taught_at
+                  const at = existingForCurrent?.taught_at
                   let when = null
                   if (at) {
                     try { when = new Date(at).toLocaleString() } catch { when = at }
-                  }
-                  if (src === 'global') {
-                    return when
-                      ? `From your saved home position (taught ${when}).`
-                      : 'From your saved home position.'
                   }
                   return when
                     ? `Taught earlier in this setup on ${when}.`
@@ -1353,15 +1359,50 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
           }}>
             <button onClick={() => setJogMode('cartesian')} style={modeBtn(jogMode === 'cartesian')}>XYZ</button>
             <button onClick={() => setJogMode('joint')}     style={modeBtn(jogMode === 'joint')}>Joint</button>
-            <span style={{ fontSize: 12, color: '#6b7280', marginLeft: 8 }}>Step:</span>
+            {/* 2026-10-08 Bug-2 unify: Step/Continuous toggle rides the
+                SHARED setJogStyle setter — flipping here propagates to
+                the main pendant and the TeachDrawer and vice-versa. */}
+            <div
+              data-testid="wizard-teach-jog-style-toggle"
+              data-jog-style={jogStyleShared}
+              style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 8 }}>
+              <span style={{ fontSize: 12, color: '#6b7280' }}>Mode:</span>
+              {['STEP', 'CONTINUOUS'].map((style) => (
+                <button
+                  key={style}
+                  data-testid="wizard-teach-jog-style-button"
+                  data-jog-style={style}
+                  data-active={String(jogStyleShared === style)}
+                  onClick={() => setJogStyleShared(style)}
+                  style={{
+                    padding: '10px 12px', minHeight: 44,
+                    fontSize: 13, fontWeight: 600, borderRadius: 6,
+                    cursor: 'pointer',
+                    background: jogStyleShared === style ? '#2563EB' : '#fff',
+                    color:      jogStyleShared === style ? '#fff'    : '#374151',
+                    border:     jogStyleShared === style ? 'none'    : '1px solid #d1d5db',
+                  }}>
+                  {style === 'STEP' ? 'Step' : 'Continuous'}
+                </button>
+              ))}
+            </div>
+            <span style={{
+              fontSize: 12, color: '#6b7280', marginLeft: 8,
+              opacity: jogStyleShared === 'STEP' ? 1 : 0.4,
+            }}>Step:</span>
             {[0.1, 0.5, 1, 5, 10].map((s) => (
-              <button key={s} onClick={() => setStep(s)} style={{
-                padding: '10px 12px', fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
-                minHeight: 44, minWidth: 48,
-                background: step === s ? '#2563EB' : '#f3f4f6',
-                color:      step === s ? '#fff'    : '#374151',
-                border:     step === s ? 'none'    : '1px solid #e5e7eb',
-              }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+              <button key={s}
+                onClick={() => { if (jogStyleShared === 'STEP') setStep(s) }}
+                disabled={jogStyleShared !== 'STEP'}
+                style={{
+                  padding: '10px 12px', fontSize: 13, fontWeight: 600, borderRadius: 6,
+                  cursor: jogStyleShared === 'STEP' ? 'pointer' : 'not-allowed',
+                  minHeight: 44, minWidth: 48,
+                  opacity: jogStyleShared === 'STEP' ? 1 : 0.4,
+                  background: step === s ? '#2563EB' : '#f3f4f6',
+                  color:      step === s ? '#fff'    : '#374151',
+                  border:     step === s ? 'none'    : '1px solid #e5e7eb',
+                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
             ))}
             <div style={{ flex: 1, minWidth: 120, display: 'flex', alignItems: 'center', gap: 8, marginLeft: 8 }}>
               <span style={{ fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap' }}>Speed {speed}%</span>
