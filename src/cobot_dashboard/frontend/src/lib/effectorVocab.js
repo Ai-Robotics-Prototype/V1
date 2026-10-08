@@ -30,10 +30,10 @@
 
 // Default IO ports — fallback ONLY when the caller does not pass a
 // cell-sourced Synapse valve id via opts.vacuumValve / opts.magnetValve
-// / opts.blowOffValve. Same values as program_composer.py's
-// _VACUUM_DEFAULT_PORT / _BLOWOFF_DEFAULT_PORT / _MAGNET_DEFAULT_PORT
-// so a cold-boot wizard (no cell entry yet) still emits deterministic
-// steps the backend composer agrees with.
+// / opts.blowOffValve / opts.fingerValve. Same values as
+// program_composer.py's _VACUUM_DEFAULT_PORT / _BLOWOFF_DEFAULT_PORT
+// / _MAGNET_DEFAULT_PORT so a cold-boot wizard (no cell entry yet)
+// still emits deterministic steps the backend composer agrees with.
 //
 // 2026-10-05 operator field report (vacuum program showed "Valve 02"
 // when the cell's vacuum EOAT is assigned to Valve 03): wizard
@@ -41,10 +41,21 @@
 // picked cell entry. When present, the emitter resolves raw channel
 // via the single-source portmap (rawForSynapse). Fallback to these
 // hardcoded defaults ONLY when no cell binding is provided.
+//
+// 2026-10-08 operator field report (finger-gripper program showed
+// a "position not taught" error AND silently emitted io_close=DO0 /
+// io_open=DO1 regardless of the cell's Finger Gripper valve
+// assignment): finger branch now consumes opts.fingerValve + the
+// per-side sensor opts (fingerCloseConfirmInput / fingerOpenConfirmInput)
+// so a bind-by-id authored program carries the operator's actual
+// EOAT ports instead of pre-cell placeholder defaults.
 const V_DEFAULT_PORT = 2   // DO2 — vacuum
 const B_DEFAULT_PORT = 3   // DO3 — blow-off (must differ from V_PORT
                            //       for the disengage triplet)
 const M_DEFAULT_PORT = 3   // DO3 — magnet (single-DO effector)
+const FC_DEFAULT_PORT = 0  // DO0 — finger CLOSE (legacy pre-cell default)
+const FO_DEFAULT_PORT = 1  // DO1 — finger OPEN  (legacy pre-cell default)
+const FCS_DEFAULT_PORT = 0 // DI0 — finger CLOSE confirm (legacy default)
 
 import { cachedPortmap, rawForSynapse } from './synapsePortmap.js'
 
@@ -110,6 +121,7 @@ export function effectorDisplayName(cfg) {
 export function effectorReady(cfg, opts = {}) {
   const { spd = 60, gripW = 85, customActivate = 'DO3',
           vacuumValve = null, magnetValve = null,
+          fingerValve = null, fingerOpenConfirmInput = null,
           cellBinding = null, portmap = null } = opts
   const e = effectorOf(cfg)
   if (e === 'vacuum') {
@@ -132,11 +144,22 @@ export function effectorReady(cfg, opts = {}) {
     action: 'set_io', label: 'Gripper off (ready)',
     io_id:  customActivate, value: 0,
   }, cellBinding)]
-  return [{
+  // Finger: ready = open. Resolve ports from the bound EOAT's cell
+  // record when fingerValve is passed; fall back to pre-cell
+  // defaults (DO1/DI1) otherwise. The ready step uses the finger
+  // valve as io_open — a double-acting valve toggles to its open
+  // state when the valve DO is driven low (handled by the executor
+  // for close_gripper/open_gripper).
+  const io_open = _rawFromSynapseOrDefault(
+    fingerValve, `DO${FO_DEFAULT_PORT}`, portmap)
+  const io_open_confirm = _rawFromSynapseOrDefault(
+    fingerOpenConfirmInput, 'DI1', portmap)
+  return [_withBinding({
     action:  'open_gripper', label: 'Open gripper',
     width_mm: gripW, speed_pct: spd,
-    io_open: 'DO1', io_open_confirm: 'DI1',
-  }]
+    io_open, io_open_confirm,
+    io_role: 'gripper_open',
+  }, cellBinding)]
 }
 
 // ENGAGE after the arm reaches the pick contact.
@@ -157,6 +180,7 @@ export function effectorEngage(cfg, opts = {}) {
           labelOverride = null,
           customConfirm = null,
           vacuumValve = null, magnetValve = null,
+          fingerValve = null, fingerCloseConfirmInput = null,
           cellBinding = null, portmap = null } = opts
   const e = effectorOf(cfg)
   if (e === 'vacuum') {
@@ -186,11 +210,24 @@ export function effectorEngage(cfg, opts = {}) {
     io_id:  customActivate, value: 1,
     ...(customConfirm ? { io_close_confirm: customConfirm } : {}),
   }, cellBinding)]
-  return [{
+  // Finger: engage = close. Resolve ports from the bound EOAT's
+  // cell record when fingerValve is passed; fall back to pre-cell
+  // defaults (DO0 / DI0) otherwise. For a double-acting EOAT with
+  // ONE valve + two sensors, actuators[0].valve is the valve DO and
+  // inputs[0] is the "part gripped" DI; the wizard's _cellVocabOpts
+  // threads them through. io_role='gripper_close' marks the step
+  // for the cell-rebind resolver so a post-create port change on
+  // the EOAT propagates to existing programs.
+  const io_close = _rawFromSynapseOrDefault(
+    fingerValve, `DO${FC_DEFAULT_PORT}`, portmap)
+  const io_close_confirm = _rawFromSynapseOrDefault(
+    fingerCloseConfirmInput, `DI${FCS_DEFAULT_PORT}`, portmap)
+  return [_withBinding({
     action: 'close_gripper',
     label:  labelOverride || 'Grip part',
-    force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0',
-  }]
+    force_pct: gripF, io_close, io_close_confirm,
+    io_role: 'gripper_close',
+  }, cellBinding)]
 }
 
 // DISENGAGE after arriving at the place contact. Vacuum adds the
@@ -201,6 +238,7 @@ export function effectorDisengage(cfg, opts = {}) {
           withBlowOff = true, labelOverride = null,
           vacuumValve = null, blowOffValve = null,
           magnetValve = null,
+          fingerValve = null, fingerOpenConfirmInput = null,
           cellBinding = null, portmap = null } = opts
   const e = effectorOf(cfg)
   if (e === 'vacuum') {
@@ -246,11 +284,24 @@ export function effectorDisengage(cfg, opts = {}) {
     label:  labelOverride || 'Gripper off — release part',
     io_id:  customActivate, value: 0,
   }, cellBinding)]
-  return [{
+  // Finger: disengage = open. Resolve from the bound EOAT's cell
+  // record when fingerValve is passed; pre-cell default DO1
+  // otherwise. For a double-acting EOAT, actuators[0].valve is the
+  // same valve as close — the executor drops the DO to open the
+  // gripper. io_role='gripper_open' marks the step for cell-rebind.
+  const io_open = _rawFromSynapseOrDefault(
+    fingerValve, `DO${FO_DEFAULT_PORT}`, portmap)
+  const openStep = {
     action: 'open_gripper',
     label:  labelOverride || 'Release part',
-    width_mm: gripW, io_open: 'DO1',
-  }]
+    width_mm: gripW, io_open,
+    io_role: 'gripper_open',
+  }
+  if (fingerOpenConfirmInput) {
+    openStep.io_open_confirm = _rawFromSynapseOrDefault(
+      fingerOpenConfirmInput, 'DI1', portmap)
+  }
+  return [_withBinding(openStep, cellBinding)]
 }
 
 // ── Palette label rendering — Add Step dropdown ──────────────────

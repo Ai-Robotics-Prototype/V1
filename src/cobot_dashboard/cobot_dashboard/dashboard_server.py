@@ -3339,6 +3339,99 @@ _ros_node: DashboardServer = None
 # check it for the small window between import and startup.
 _joint_recorder = None
 
+
+# ── Tool-IO setup-gap check (2026-10-08) ───────────────────────────
+#
+# Pre-run guard that distinguishes an UNASSIGNED EOAT IO from an
+# UNTAUGHT POSITION. The field report that drove this fix: an
+# operator built a finger-gripper program via the wizard, taught
+# every position, pressed Run — and got "untaught positions". The
+# primary bug was the whitelist mismatch
+# (close_gripper/open_gripper vs gripper_close/gripper_open) that
+# sent gripper IO steps through the pose scan; this helper closes
+# the second half of the directive: when a bound EOAT genuinely has
+# no valve to resolve against, the operator sees a NAMED tool-IO
+# error that points them at EOAT Setup — not a false teaching gap.
+#
+# Returns a dict {eoat_id, eoat_name, reason} describing the first
+# gap found, or None when every bound tool has a valve on the cell.
+# Programs that don't bind an EOAT (no config.cell_eoat_id) return
+# None — nothing to validate.
+_CELL_FILE_FOR_TOOL_IO = os.environ.get(
+    'COBOT_CELL', '/opt/cobot/cell.json')
+
+
+def _check_program_tool_io(program: dict):
+    """Return a tool-IO gap finding when the program binds a cell
+    EOAT that has no valve assigned. None when there's no gap or
+    no binding to check.
+    """
+    cfg = (program or {}).get('config') or {}
+    eoat_id = cfg.get('cell_eoat_id')
+    if not eoat_id:
+        return None
+    # Does the program actually emit any gripper IO steps that would
+    # need the tool's valve? If every step is motion/comment/wait,
+    # a missing valve isn't a run-time hazard (nothing to resolve).
+    steps = (program or {}).get('steps') or []
+    _TOOL_IO_ACTIONS = frozenset({
+        'close_gripper', 'open_gripper',
+        'gripper_close', 'gripper_open', 'gripper',
+    })
+    has_tool_step = any(
+        str(s.get('action') or '').lower() in _TOOL_IO_ACTIONS
+        for s in steps if isinstance(s, dict))
+    # Also catch wizard-emitted set_io steps that carry a cell_binding
+    # pointing at the tool — a vacuum/magnet tool whose valve was
+    # dropped post-create would otherwise slip through.
+    if not has_tool_step:
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            cb = s.get('cell_binding') or {}
+            if cb.get('eoat_id') == eoat_id:
+                has_tool_step = True
+                break
+    if not has_tool_step:
+        return None
+    try:
+        with open(_CELL_FILE_FOR_TOOL_IO) as fh:
+            cell = json.load(fh)
+    except Exception:
+        # Cell file unavailable (dev / early boot) — don't block
+        # with a tool-IO error; let the downstream codegen path
+        # surface its own gap if any.
+        return None
+    eoats = (cell or {}).get('eoats') or []
+    entry = next((e for e in eoats if e.get('id') == eoat_id), None)
+    if entry is None:
+        # Program references an EOAT that no longer exists in the
+        # cell — distinct error from "no valve", but still a
+        # tool-side gap (not a teaching gap). Report with the id so
+        # the operator knows what to look for.
+        return {
+            'eoat_id':   eoat_id,
+            'eoat_name': None,
+            'reason':    'bound EOAT not found in cell',
+        }
+    name = entry.get('name') or 'the selected tool'
+    # Any actuator with a valve counts as "setup complete" from the
+    # tool-IO perspective; a bare `valve` field (pre-multi-actuator
+    # schema) also qualifies.
+    valves = []
+    for a in (entry.get('actuators') or []):
+        if isinstance(a, dict) and a.get('valve'):
+            valves.append(a.get('valve'))
+    if entry.get('valve') and entry.get('valve') not in valves:
+        valves.append(entry.get('valve'))
+    if not valves:
+        return {
+            'eoat_id':   eoat_id,
+            'eoat_name': name,
+            'reason':    'no valve assigned',
+        }
+    return None
+
 def _joint_recorder_snapshot():
     """Snapshot provider passed into JointRecorder. Reads STATE under
     _state_lock, returns None when joints haven't been published yet
@@ -8214,6 +8307,40 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"error": f"program_ops import: {e}"},
                                 status_code=500)
 
+        # 2026-10-08 Tool-IO setup gate (runs BEFORE the teaching gate
+        # so a tool-side gap is never misreported as a teaching gap).
+        # Field report: an operator taught every position of a finger-
+        # gripper program, pressed Run, and got "untaught positions"
+        # — the gripper IO steps had slipped through a token-mismatch
+        # hole in the pose scan and the cell's EOAT valve was being
+        # silently defaulted. The scan is also fixed in this commit
+        # (close_gripper/open_gripper added to the whitelist); this
+        # gate makes the second half of the directive explicit by
+        # refusing with a NAMED tool-IO error whenever a bound EOAT
+        # has no valve to resolve against. The copy points the
+        # operator at EOAT Setup, not the Program Editor.
+        try:
+            _tool_io_gap = _check_program_tool_io(program)
+        except Exception as _tie:
+            print(f'[run] WARN tool-io check raised: {_tie}', flush=True)
+            _tool_io_gap = None
+        if _tool_io_gap:
+            name = _tool_io_gap.get('eoat_name') or 'the selected tool'
+            return JSONResponse({
+                "ok": False,
+                "error": (
+                    f'{name} has no valve assigned — finish its setup '
+                    f'in EOAT Setup before running. (This is a tool '
+                    f'setup gap, not a teaching gap.)'),
+                "outcome": {
+                    "kind": "tool_io_unassigned",
+                    "eoat_id":   _tool_io_gap.get('eoat_id'),
+                    "eoat_name": _tool_io_gap.get('eoat_name'),
+                    "reason":    _tool_io_gap.get('reason'),
+                },
+                "program_id": prog_id,
+            }, status_code=400)
+
         # D14 pending-pose gate (2026-08-04) — runs BEFORE codegen so
         # a program with untaught anchors never even reaches Lua
         # emission. Firmware bug #3 (three holepartpalletize kills
@@ -11737,6 +11864,16 @@ if FASTAPI_AVAILABLE:
     _NON_MOTION_ACTIONS = frozenset({
         'set_io', 'wait', 'wait_input', 'loop', 'gripper',
         'gripper_close', 'gripper_open', 'pause', 'comment', 'end',
+        # 2026-10-08 field report: wizard-emitted finger grippers
+        # use the close_gripper/open_gripper token form (see
+        # effectorVocab.js finger branches + executor dispatch at
+        # program_executor_node.py:618-635). Pre-fix the whitelist
+        # only recognised the gripper_close/gripper_open form so a
+        # wizard-authored finger program's gripper steps dropped
+        # through _has_taught_poses, which produced the misleading
+        # "untaught positions" load/run refusal. Mirrors the
+        # program_ops.py:_NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK fix.
+        'close_gripper', 'open_gripper',
         'vacuum_on', 'vacuum_off',
         # 2026-07-31: camera / config-driven verbs. Added after the
         # operator caught `detect` showing up in a Teach All queue —

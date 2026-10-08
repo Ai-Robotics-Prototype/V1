@@ -43,9 +43,27 @@ import { rawForSynapse, displayNameForRaw } from './synapsePortmap.js'
 // Roles that cell-rebind touches today. Fixture roles are left out
 // (fixture steps come from cellActions.compileFixtureAction which
 // already consults the entry at compile time).
+//
+// 2026-10-08: gripper_close + gripper_open added for finger EOATs.
+// Their rebind writes io_close / io_open (not io_id) — see
+// _CELL_IO_FIELD_FOR_ROLE below.
 const _CELL_EOAT_ROLES = Object.freeze(new Set([
   'vacuum', 'magnet', 'blow_off',
+  'gripper_close', 'gripper_open',
 ]))
+
+// Role → the step field whose value is the raw IO channel for the
+// role. Vacuum/magnet steps carry `io_id` (set_io shape);
+// close_gripper/open_gripper carry `io_close`/`io_open` on the same
+// step (two-DO finger shape, or single-valve double-acting shape
+// where close == open channel).
+const _CELL_IO_FIELD_FOR_ROLE = Object.freeze({
+  vacuum:        'io_id',
+  magnet:        'io_id',
+  blow_off:      'io_id',
+  gripper_close: 'io_close',
+  gripper_open:  'io_open',
+})
 
 // Map io_role → cell EOAT type the role implies. Used to infer a
 // cell binding for LEGACY programs that pre-date the cell_eoat_id
@@ -53,8 +71,12 @@ const _CELL_EOAT_ROLES = Object.freeze(new Set([
 // in config. When exactly one cell EOAT of that type exists, the
 // rebinder treats it as if the operator had bound the program to it.
 const _ROLE_TO_EOAT_TYPE = Object.freeze({
-  vacuum:   'vacuum',
-  magnet:   'magnetic',
+  vacuum:        'vacuum',
+  magnet:        'magnetic',
+  // 2026-10-08 finger: close + open both resolve against a finger
+  // EOAT's single valve (actuators[0].valve for double-acting).
+  gripper_close: 'finger',
+  gripper_open:  'finger',
   // blow_off has no distinct cell entry today — handled downstream.
 })
 
@@ -113,12 +135,24 @@ function _cellRawForRole(step, program, cell, portmap) {
   return raw || null
 }
 
+// The IO value currently carried on the step for this role. For
+// vacuum/magnet/blow_off that's `step.io_id`; for the two gripper
+// roles it's `step.io_close` / `step.io_open`.
+function _storedIoForRole(step) {
+  const role = String(step?.io_role || '').toLowerCase()
+  const field = _CELL_IO_FIELD_FOR_ROLE[role]
+  if (!field) return step?.io_id || null
+  return step?.[field] || null
+}
+
 // Primary display resolver. detailLine (and any other step-row
 // surface) calls this so the row shows the Synapse name for the
 // CELL's current valve when the program is cell-bound, falling
 // through to the honest raw-channel reverse-lookup otherwise.
 export function displayIoForStep(step, program, cell, portmap) {
-  if (!step || !step.io_id) return null
+  if (!step) return null
+  const stored = _storedIoForRole(step)
+  if (!stored) return null
   const cellRaw = _cellRawForRole(step, program, cell, portmap)
   if (cellRaw) {
     return {
@@ -128,15 +162,15 @@ export function displayIoForStep(step, program, cell, portmap) {
     }
   }
   return {
-    raw: step.io_id,
-    display: displayNameForRaw(portmap, step.io_id),
+    raw: stored,
+    display: displayNameForRaw(portmap, stored),
     source: 'legacy',
   }
 }
 
 // Open-time migration: walk the program and, for each cell-role
-// step whose stored io_id disagrees with the cell's current valve,
-// rewrite io_id to match. Returns a new program object with the
+// step whose stored IO disagrees with the cell's current valve,
+// rewrite it to match. Returns a new program object with the
 // patched steps, or the SAME object reference when nothing changed
 // (caller uses the identity check to skip a store write).
 //
@@ -144,8 +178,9 @@ export function displayIoForStep(step, program, cell, portmap) {
 //   * Same program + same cell → same output every time.
 //   * Running twice on the output of itself is a no-op.
 //
-// The step's cell_binding is preserved; io_id is the only field
-// that changes. If the role has no cell binding to anchor on
+// The step's cell_binding is preserved; only the role-specific IO
+// field changes (io_id for vacuum/magnet; io_close/io_open for the
+// finger roles). If the role has no cell binding to anchor on
 // (role not in _CELL_EOAT_ROLES, program has no cell_eoat_id,
 // cell entry missing, cell valve missing), the step is left
 // verbatim — honest-copy behavior, no silent invention.
@@ -155,15 +190,17 @@ export function rebindProgramToCell(program, cell, portmap) {
   const nextSteps = program.steps.map((step) => {
     const cellRaw = _cellRawForRole(step, program, cell, portmap)
     if (!cellRaw) return step
-    if (step.io_id === cellRaw) return step
+    const role = String(step.io_role || '').toLowerCase()
+    const field = _CELL_IO_FIELD_FOR_ROLE[role] || 'io_id'
+    if (step[field] === cellRaw) return step
     changed = true
-    return { ...step, io_id: cellRaw }
+    return { ...step, [field]: cellRaw }
   })
   if (!changed) return program
   return { ...program, steps: nextSteps }
 }
 
-// Diagnostic: return the list of steps whose stored io_id disagrees
+// Diagnostic: return the list of steps whose stored IO disagrees
 // with the cell's current valve. Used by pins + any UI that wants
 // to surface the mismatch count before migration lands.
 export function stepsNeedingRebind(program, cell, portmap) {
@@ -173,9 +210,11 @@ export function stepsNeedingRebind(program, cell, portmap) {
     const step = program.steps[i]
     const cellRaw = _cellRawForRole(step, program, cell, portmap)
     if (!cellRaw) continue
-    if (step.io_id === cellRaw) continue
-    out.push({ index: i, stored: step.io_id, cell: cellRaw,
-               io_role: step.io_role })
+    const role = String(step.io_role || '').toLowerCase()
+    const field = _CELL_IO_FIELD_FOR_ROLE[role] || 'io_id'
+    if (step[field] === cellRaw) continue
+    out.push({ index: i, stored: step[field], cell: cellRaw,
+               io_role: step.io_role, field })
   }
   return out
 }

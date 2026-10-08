@@ -3022,12 +3022,28 @@ function _cellVocabOpts(cellEoat, synapsePortmap) {
   if (!cellEoat) return { withBlowOff: false }
   const opts = { portmap: synapsePortmap || null }
   if (cellEoat.valve) {
-    // Single-valve EOATs (vacuum, magnet, custom-tool-with-one-valve)
-    // all have one Synapse valve assignment on the entry. The emitter
-    // picks the right field by effector kind.
+    // Single-valve EOATs (vacuum, magnet, custom-tool-with-one-valve,
+    // finger-with-one-double-acting-valve) all have one Synapse valve
+    // assignment on the entry. The emitter picks the right field by
+    // effector kind — the extras are inert for mismatched effectors.
     opts.vacuumValve = cellEoat.valve
     opts.magnetValve = cellEoat.valve
+    // 2026-10-08 operator field report: finger EOATs also need their
+    // Synapse valve threaded through — pre-fix emission hardcoded
+    // io_close='DO0' / io_open='DO1' regardless of the cell. For a
+    // standard finger EOAT the single valve controls both clamp and
+    // release (double-acting); the emitter re-uses the same valve id
+    // for both the close and open steps.
+    opts.fingerValve = cellEoat.valve
   }
+  // Finger sensor inputs: cell.eoats[].inputs[] carries the sensor
+  // Synapse ids in setup order. Convention — index 0 is the "part
+  // gripped / close confirm" sensor, index 1 is the "fully open /
+  // open confirm" sensor. Absent sensors fall through to the
+  // defaults inside effectorVocab (DI0 / DI1).
+  const inputs = Array.isArray(cellEoat.inputs) ? cellEoat.inputs : []
+  if (inputs[0]) opts.fingerCloseConfirmInput = inputs[0]
+  if (inputs[1]) opts.fingerOpenConfirmInput  = inputs[1]
   // 2026-10-05 capability-driven blow-off: a tool emits a blow-off
   // step at the CLEAR anchor (after release, before retreat-place)
   // ONLY when its cell record carries a distinct blow_off actuator.

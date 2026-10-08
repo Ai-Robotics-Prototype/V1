@@ -310,3 +310,204 @@ test('displayIoForStep: unmapped channel falls back to honest copy', async () =>
       + 'copy via displayNameForRaw — never silently invent a '
       + 'Synapse name.'))
 })
+
+
+// ── (9) Finger-gripper rebind (2026-10-08) ────────────────────────
+//
+// Operator field report (2026-10-08): a finger-gripper program's
+// gripper steps carried the pre-cell hardcoded io_close='DO0' /
+// io_open='DO1' instead of the EOAT's actual Synapse valve. The
+// rebind layer now also tracks close_gripper/open_gripper roles so
+// a port change on the cell's finger EOAT propagates to existing
+// programs at load time (same path the vacuum/magnet rebind takes).
+
+test('rebindProgramToCell: finger program with legacy DO0/DO1 → cell V05 rewrites both fields', async () => {
+  const { rebindProgramToCell }
+    = await import('../../src/lib/programCellRebind.js')
+  const seed = {
+    version: 1,
+    rows: [
+      { synapse: 'V05', raw: 'DO5' },
+      { synapse: 'V01', raw: 'DO1' },
+      { synapse: 'V00', raw: 'DO0' },
+    ],
+  }
+  const cell = {
+    eoats: [{
+      id: 'eoat_f1', name: 'Finger Gripper', type: 'finger',
+      valve: 'V05',
+      actuators: [{ type: 'double_acting', valve: 'V05' }],
+      inputs: ['IN01', 'IN02'], sensor_count: 2,
+    }],
+  }
+  const prog = {
+    id: 'p1', config: { cell_eoat_id: 'eoat_f1' },
+    steps: [
+      // Pre-fix wizard emission — hardcoded placeholders.
+      { action: 'close_gripper', io_close: 'DO0', io_close_confirm: 'DI0',
+        io_role: 'gripper_close' },
+      { action: 'open_gripper',  io_open:  'DO1',
+        io_role: 'gripper_open' },
+    ],
+  }
+  const out = rebindProgramToCell(prog, cell, seed)
+  assert.notEqual(out, prog,
+    v('Finger program bound to a V05 EOAT must get a NEW object '
+      + 'from rebind (both gripper steps need io rewrite).'))
+  assert.equal(out.steps[0].io_close, 'DO5',
+    v('close_gripper.io_close must rewrite to the cell valve raw '
+      + '(V05 → DO5).'))
+  assert.equal(out.steps[1].io_open, 'DO5',
+    v('open_gripper.io_open must rewrite to the cell valve raw '
+      + '(same V05, double-acting valve shared by both halves).'))
+  // Second pass is identity (idempotent).
+  const out2 = rebindProgramToCell(out, cell, seed)
+  assert.equal(out2, out,
+    v('rebindProgramToCell must be idempotent for finger rebinds — '
+      + 'same input + same cell → same output reference.'))
+})
+
+test('displayIoForStep: finger close_gripper routes io_close through cell-aware display', async () => {
+  const { displayIoForStep }
+    = await import('../../src/lib/programCellRebind.js')
+  const seed = {
+    version: 1,
+    rows: [
+      { synapse: 'V05', raw: 'DO5' },
+      { synapse: 'V00', raw: 'DO0' },
+    ],
+  }
+  const cell = {
+    eoats: [{
+      id: 'eoat_f1', name: 'Finger Gripper', type: 'finger',
+      valve: 'V05',
+    }],
+  }
+  const program = { config: { cell_eoat_id: 'eoat_f1' } }
+  const step = { action: 'close_gripper', io_close: 'DO0',
+                 io_role: 'gripper_close' }
+  const res = displayIoForStep(step, program, cell, seed)
+  assert.equal(res.source, 'cell',
+    v('A cell-bound finger step must take the cell branch.'))
+  assert.equal(res.raw, 'DO5',
+    v('displayIoForStep must prefer the cell valve raw (V05 → DO5) '
+      + 'over the step\'s stored io_close.'))
+})
+
+test('wizard _cellVocabOpts passes fingerValve + sensor inputs to effectorVocab', () => {
+  // Grep-pin the wizard's bridge from the picked cell EOAT to the
+  // emitter opts. Without these, the finger branch of effectorVocab
+  // keeps emitting the pre-cell DO0/DO1/DI0 defaults even on a
+  // cell-bound program.
+  const wizSrc = readFileSync(
+    new URL('../../src/components/ProgramWizard.jsx', import.meta.url),
+    'utf8')
+  assert.ok(/opts\.fingerValve\s*=\s*cellEoat\.valve/.test(wizSrc),
+    v('_cellVocabOpts must set opts.fingerValve = cellEoat.valve so '
+      + 'the finger emitter resolves the Synapse valve from the '
+      + 'bound EOAT (not the pre-cell DO0/DO1 default).'))
+  assert.ok(/opts\.fingerCloseConfirmInput\s*=\s*inputs\[0\]/.test(wizSrc),
+    v('_cellVocabOpts must thread inputs[0] through as the close-'
+      + 'confirm sensor DI.'))
+  assert.ok(/opts\.fingerOpenConfirmInput\s*=\s*inputs\[1\]/.test(wizSrc),
+    v('_cellVocabOpts must thread inputs[1] through as the open-'
+      + 'confirm sensor DI (when present).'))
+})
+
+test('effectorVocab finger branches honor the cell-sourced fingerValve', async () => {
+  const { effectorEngage, effectorDisengage, effectorReady }
+    = await import('../../src/lib/effectorVocab.js')
+  const seed = {
+    version: 1,
+    rows: [
+      { synapse: 'V05', raw: 'DO5' },
+      { synapse: 'IN01', raw: 'DI1' },
+      { synapse: 'IN02', raw: 'DI2' },
+    ],
+  }
+  const cfg = { effector: 'finger' }
+  const opts = {
+    fingerValve: 'V05',
+    fingerCloseConfirmInput: 'IN01',
+    fingerOpenConfirmInput: 'IN02',
+    cellBinding: { eoat_id: 'eoat_f1' },
+    portmap: seed,
+  }
+  const engage = effectorEngage(cfg, opts)
+  assert.equal(engage[0].action, 'close_gripper',
+    v('finger engage emits close_gripper'))
+  assert.equal(engage[0].io_close, 'DO5',
+    v('finger engage must resolve io_close from the cell valve '
+      + '(V05 → DO5) instead of the pre-cell DO0 default.'))
+  assert.equal(engage[0].io_close_confirm, 'DI1',
+    v('finger engage must resolve io_close_confirm from the cell '
+      + 'inputs[0] (IN01 → DI1).'))
+  assert.equal(engage[0].io_role, 'gripper_close',
+    v('finger engage must carry io_role=gripper_close for the '
+      + 'cell-rebind resolver.'))
+  assert.equal(engage[0].cell_binding?.eoat_id, 'eoat_f1',
+    v('finger engage must carry cell_binding so a later rebind can '
+      + 'anchor on it.'))
+  const disengage = effectorDisengage(cfg, opts)
+  assert.equal(disengage[0].io_open, 'DO5',
+    v('finger disengage must resolve io_open from the cell valve.'))
+  assert.equal(disengage[0].io_role, 'gripper_open',
+    v('finger disengage must carry io_role=gripper_open.'))
+  const ready = effectorReady(cfg, opts)
+  assert.equal(ready[0].io_open, 'DO5',
+    v('finger ready must resolve io_open from the cell valve.'))
+})
+
+test('non-motion whitelist includes close_gripper + open_gripper tokens', () => {
+  // 2026-10-08 operator field report — the three whitelists must
+  // all recognise the wizard-emitted token form. Grep-pin all
+  // three in the same test so a token split can't be re-introduced
+  // in one copy without the pin firing.
+  const programTruthSrc = readFileSync(
+    new URL('../../src/lib/programTruth.js', import.meta.url), 'utf8')
+  const dashSrc = readFileSync(new URL(
+    '../../../cobot_dashboard/dashboard_server.py',
+    import.meta.url), 'utf8')
+  const programOpsSrc = readFileSync(new URL(
+    '../../../../estun_driver/estun_driver/program_ops.py',
+    import.meta.url), 'utf8')
+  for (const [label, src] of [
+    ['programTruth.NON_MOTION_ACTIONS', programTruthSrc],
+    ['dashboard_server._NON_MOTION_ACTIONS', dashSrc],
+    ['program_ops._NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK', programOpsSrc],
+  ]) {
+    assert.ok(/'close_gripper'/.test(src),
+      v(`${label} must whitelist 'close_gripper' — the wizard emits `
+        + `this token form (effectorVocab.js finger engage).`))
+    assert.ok(/'open_gripper'/.test(src),
+      v(`${label} must whitelist 'open_gripper' — the wizard emits `
+        + `this token form (effectorVocab.js finger ready + `
+        + `disengage).`))
+  }
+})
+
+test('backend tool-IO gate names its outcome kind + the EOAT', () => {
+  // The pre-run gate for the "tool IO unassigned" case must return
+  // a NAMED outcome kind separate from pending_poses, with the
+  // EOAT name interpolated into the operator-facing copy so the
+  // operator knows which tool to finish setting up.
+  const dashSrc = readFileSync(new URL(
+    '../../../cobot_dashboard/dashboard_server.py',
+    import.meta.url), 'utf8')
+  assert.ok(/def _check_program_tool_io\(program: dict\)/.test(dashSrc),
+    v('dashboard_server must define _check_program_tool_io(program).'))
+  assert.ok(/"kind": "tool_io_unassigned"/.test(dashSrc),
+    v('tool-IO gate outcome kind must be tool_io_unassigned — '
+      + 'distinct from pending_poses so the UI can render the '
+      + 'right copy.'))
+  assert.ok(/has no valve assigned/.test(dashSrc)
+             && /finish its setup/.test(dashSrc)
+             && /EOAT Setup/.test(dashSrc),
+    v('tool-IO gate operator copy must say "has no valve assigned '
+      + '— finish its setup in EOAT Setup" so the operator is '
+      + 'pointed at the right place (NOT the Program Editor).'))
+  assert.ok(/not a teaching gap/.test(dashSrc),
+    v('tool-IO gate copy must explicitly disclaim "this is a tool '
+      + 'setup gap, not a teaching gap" so the operator doesn\'t '
+      + 'retrace their steps looking for an untaught position.'))
+})

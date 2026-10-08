@@ -252,6 +252,32 @@ def test_pending_poses_skips_non_motion_actions():
         f'non-motion actions falsely flagged as pending: {findings!r}')
 
 
+def test_pending_poses_skips_close_gripper_open_gripper_tokens():
+    """2026-10-08 regression pin — operator field report. The wizard
+    emits finger-gripper steps as action='close_gripper'/'open_gripper'
+    (effectorVocab.js emits this token end-to-end; the executor's
+    program_executor_node.py:618-635 dispatches on the same tokens).
+    Pre-fix the non-motion whitelist only recognised the inverted
+    gripper_close/gripper_open form, so a wizard-authored finger
+    program fell through the gate and emerged with a false "untaught
+    positions" error — classic misclassification of a tool-IO
+    concern as a teaching gap.
+    """
+    prog = _prog_with(steps=[
+        {'id': 1, 'action': 'move_home', 'position_role': 'home',
+         'taught_joints': [0]*6, 'taught': True},
+        {'id': 2, 'action': 'close_gripper', 'io_close': 'DO1',
+         'io_role': 'gripper_close'},
+        {'id': 3, 'action': 'open_gripper', 'io_open': 'DO1',
+         'io_role': 'gripper_open'},
+    ])
+    findings = check_program_pending_poses(prog)
+    assert findings == [], (
+        f'close_gripper/open_gripper must be whitelisted alongside '
+        f'gripper_close/gripper_open — pre-fix a finger wizard '
+        f'program produced {findings!r}')
+
+
 def test_pending_poses_catches_holepartpalletize_shape():
     """Regression pin against the 2026-08-03/04 controller-crash shape.
     Data-independent — uses a synthetic copy of the exact untaught

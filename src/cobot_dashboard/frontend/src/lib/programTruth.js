@@ -36,6 +36,17 @@
 export const NON_MOTION_ACTIONS = new Set([
   'set_io', 'wait', 'wait_input', 'loop', 'gripper',
   'gripper_close', 'gripper_open', 'pause', 'comment', 'end',
+  // 2026-10-08 field report: wizard emits finger-gripper steps as
+  // close_gripper/open_gripper (effectorVocab.js:190,250); the
+  // executor dispatches on the SAME tokens. The pre-fix whitelist
+  // only carried gripper_close/gripper_open, so UI consumers of
+  // NON_MOTION_ACTIONS (teach-all queue, isStepTaught via
+  // isTeachable's TEACHABLE_ACTIONS positive list is unaffected,
+  // but any direct NON_MOTION_ACTIONS lookup drifts) misclassified
+  // these steps. Kept in sync with the two backend whitelists
+  // (program_ops.py _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK +
+  // dashboard_server.py _NON_MOTION_ACTIONS).
+  'close_gripper', 'open_gripper',
   'vacuum_on', 'vacuum_off',
   'detect',
   'scan_workspace', 'scan_identify_each', 'sort_scanned', 'remove_defects',

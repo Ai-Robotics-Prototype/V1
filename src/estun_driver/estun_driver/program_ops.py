@@ -1462,7 +1462,19 @@ def _lookahead_next_motion_target_tcp(steps: list, i: int,
 
 _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK = frozenset({
     'set_io', 'wait', 'wait_input', 'loop',
+    # 2026-10-08 field report: the wizard emits finger-gripper steps
+    # with action='close_gripper'/'open_gripper' (effectorVocab.js
+    # emits that token end-to-end — the executor's
+    # program_executor_node.py:618-635 dispatch on the same tokens).
+    # The pre-fix whitelist carried the inverted 'gripper_close' /
+    # 'gripper_open' tokens, so a wizard-authored finger program's
+    # gripper steps fell through the whitelist, into the motion-pose
+    # scan, and emerged as spurious "untaught positions" findings —
+    # the operator saw a false teaching gap when the real gap was
+    # elsewhere. Carry BOTH token forms so legacy/externally-authored
+    # programs with gripper_close/gripper_open also stay recognised.
     'gripper', 'gripper_close', 'gripper_open',
+    'close_gripper', 'open_gripper',
     'pause', 'comment', 'end',
     'vacuum_on', 'vacuum_off',
     'detect',
