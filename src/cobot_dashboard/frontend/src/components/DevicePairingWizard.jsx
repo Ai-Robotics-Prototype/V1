@@ -18,6 +18,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   storePairing, clearPairing, probeRobotIdentity, getToken,
 } from '../lib/pairedDevice'
+import { kbSafeModalContentStyle } from '../lib/keyboardInset'
 
 const NEURO_COLORS = {
   bg:      '#0C0C0E',
@@ -49,6 +50,7 @@ function Panel({ children }) {
       width: '100%', maxWidth: 520, background: NEURO_COLORS.panel,
       border: `1px solid ${NEURO_COLORS.border}`, borderRadius: 16,
       padding: 32, margin: 16, boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
+      ...kbSafeModalContentStyle(),
     }}>{children}</div>
   )
 }

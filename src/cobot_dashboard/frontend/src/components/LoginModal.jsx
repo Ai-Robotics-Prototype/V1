@@ -13,6 +13,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { storePairing } from '../lib/pairedDevice'
+import { kbSafeModalContentStyle } from '../lib/keyboardInset'
 
 const C = {
   bg:      '#0C0C0E',
@@ -97,6 +98,7 @@ export default function LoginModal() {
         background: C.panel, border: `1px solid ${C.border}`,
         borderRadius: 16, padding: 28, width: '100%', maxWidth: 420,
         boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+        ...kbSafeModalContentStyle(),
       }}>
         <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 6 }}>
           Sign in to control the robot

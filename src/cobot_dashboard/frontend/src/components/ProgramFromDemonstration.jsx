@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import LiveRecorder from './LiveRecorder'
 import NumericField from './NumericField'
 import { useStore } from '../store/useStore'
+import { kbSafeModalContentStyle } from '../lib/keyboardInset'
 
 /*
  * Program from Demonstration — three-step modal mirroring the wizard's
@@ -492,14 +493,16 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         // `height: 100dvh` is the modern fix for tablet/phone where the
         // URL bar makes `vh` lie. The earlier overlay padding already
         // respects safe areas, so the card itself just needs to fill
-        // what's available.
+        // what's available. 2026-10-09: keyboard-safe maxHeight on top
+        // so the review step's text inputs (program name/description,
+        // ambiguity labels, object/landmark edits) don't go behind the
+        // on-screen keyboard on tablet.
         height: '100dvh',
-        maxHeight: '100dvh',
         background: '#fff', borderRadius: 12,
         boxShadow: '0 25px 60px rgba(0,0,0,0.25)',
         display: 'flex', flexDirection: 'column',
-        overflow: 'hidden',
         boxSizing: 'border-box',
+        ...kbSafeModalContentStyle(100, 0),
       }}>
         {/* Header — never compresses under content pressure. */}
         <div style={{

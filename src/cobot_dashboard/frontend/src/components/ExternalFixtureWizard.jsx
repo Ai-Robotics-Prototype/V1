@@ -17,7 +17,9 @@ import {
 } from '../lib/cellEntryDisplay'
 import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
 import { useSynapsePortmap } from '../lib/synapsePortmap'
-import { useKeyboardInset, scrollFocusedIntoView } from '../lib/keyboardInset'
+import {
+  useKeyboardInset, scrollFocusedIntoView, kbSafeModalContentStyle,
+} from '../lib/keyboardInset'
 
 // External Fixture Wizard (2026-09-22 operator directive).
 //
@@ -848,14 +850,12 @@ const _backdrop = {
 const _panel = {
   background: '#fff', borderRadius: 12,
   padding: 24, width: 'min(960px, 96vw)',
-  // Consume the keyboard inset so the modal shrinks around the
-  // on-screen keyboard on tablet. Falls back cleanly when --kb-inset
-  // is 0 (desktop / no keyboard).
-  maxHeight: 'calc(92vh - var(--kb-inset, 0px))',
-  paddingBottom: 'calc(24px + var(--kb-inset, 0px))',
-  overflow: 'auto',
   boxShadow: '0 20px 40px rgba(0,0,0,0.3)',
   fontFamily: 'inherit',
+  // Shared keyboard-safe sizing — the one snippet every prompt /
+  // modal / wizard container spreads to stay above the on-screen
+  // keyboard on tablet. See lib/keyboardInset.kbSafeModalContentStyle.
+  ...kbSafeModalContentStyle(),
 }
 const _title = {
   fontSize: 20, fontWeight: 700, marginBottom: 12, color: '#111827',

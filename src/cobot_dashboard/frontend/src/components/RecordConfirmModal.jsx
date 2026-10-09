@@ -34,6 +34,7 @@
 
 import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
+import { kbSafeModalContentStyle } from '../lib/keyboardInset'
 
 function radiansToJointDegrees(positions) {
   if (!Array.isArray(positions)) return [0, 0, 0, 0, 0, 0]
@@ -92,6 +93,7 @@ export default function RecordConfirmModal({ onConfirm, onCancel }) {
           borderRadius: 12, width: '100%', maxWidth: 420,
           boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
           overflow: 'hidden',
+          ...kbSafeModalContentStyle(),
         }}
       >
         <div style={{ padding: '20px 24px 8px 24px' }}>

@@ -397,11 +397,16 @@ test('fixture wizard consumes useKeyboardInset + scrolls focused field into view
     v('ExternalFixtureWizard must call useKeyboardInset() at top-level'))
   assert.ok(/scrollFocusedIntoView/.test(wizardSrc),
     v('Text inputs must call scrollFocusedIntoView on focus'))
-  // The panel style must consume the CSS var (so the modal shrinks
-  // around the on-screen keyboard).
-  assert.ok(/var\(--kb-inset[^)]*\)/.test(wizardSrc),
-    v('Panel style must reference var(--kb-inset, ...) so the modal '
-      + 'shrinks around the keyboard.'))
+  // The panel style must consume the CSS var — either as a direct
+  // reference OR by spreading the shared kbSafeModalContentStyle()
+  // helper (2026-10-09 refactor: the inline calc moved behind the
+  // helper so every modal in the app can spread the same snippet).
+  assert.ok(
+    /var\(--kb-inset[^)]*\)/.test(wizardSrc)
+    || /kbSafeModalContentStyle\s*\(/.test(wizardSrc),
+    v('Panel style must shrink around the keyboard — either reference '
+      + 'var(--kb-inset, ...) directly OR spread the shared '
+      + 'kbSafeModalContentStyle() helper.'))
 })
 
 

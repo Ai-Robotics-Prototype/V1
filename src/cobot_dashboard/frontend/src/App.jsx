@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, Component } from 'react'
 import { useStore } from './store/useStore'
 import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
+import { useGlobalKeyboardAutoScroll } from './lib/keyboardInset'
 import DevicePairingWizard from './components/DevicePairingWizard'
 import PairRequestModal from './components/PairRequestModal'
 import LoginModal from './components/LoginModal'
@@ -211,6 +212,18 @@ const gridStyle = {
 }
 
 export default function App() {
+  // 2026-10-09 operator directive (tablet keyboard covering fields):
+  // mount the global keyboard-inset auto-scroll ONCE at the root so
+  // every prompt / modal / wizard in the app — LoginModal,
+  // DevicePairingWizard, EOATSetupWizard, ExternalFixtureWizard,
+  // ProgramWizard name/number fields, confirm dialogs — gets the
+  // focused field scrolled into view when the on-screen keyboard
+  // opens. The hook also seeds --kb-inset on :root; any modal whose
+  // content container reads var(--kb-inset) via kbSafeModalContentStyle
+  // will shrink its maxHeight by that amount so the prompt + action
+  // buttons stay visible above the keyboard. Inert on desktop
+  // (no virtualKeyboard, visualViewport unchanged → inset stays 0).
+  useGlobalKeyboardAutoScroll()
   // Auth model pivot (add-61 §690, 2026-09-18). The dashboard NO
   // LONGER blocks on the pairing wizard for unauthenticated
   // clients — everyone sees the dashboard in view-only mode, and
