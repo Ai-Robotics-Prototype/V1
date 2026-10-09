@@ -64,6 +64,54 @@ export const TEACHABLE_ACTIONS = new Set([
   'approach',  'pick',       'place',
 ])
 
+// Actions that EMIT a corner-smoothing (blend) emission at codegen.
+// Mirrored by the backend `_blend_mm_for_step` + pallet expansion:
+// taught motion steps carry a `b=…` on their mov* arg table when
+// the lookahead classifier doesn't force a fine stop, and
+// move_to_pallet's expansion threads the step's smoothing level
+// through to every per-cycle waypoint. IO / wait / comment / control-
+// flow steps emit no motion and therefore no smoothing control is
+// rendered on their row.
+export const MOTION_SMOOTHING_ACTIONS = new Set([
+  'move_home', 'move_joint', 'move_linear',
+  'approach',  'pick',       'place',
+  'move_to_pallet',
+])
+
+// Operator-facing smoothing levels. The backend's authoritative
+// level map lives in codegen_blend.py:SMOOTHING_LEVELS; this list
+// mirrors the ordered spectrum the operator picks from on BOTH the
+// program-wide default control AND each motion step's row override.
+// 'inherit' is the per-step default — the step uses the program-wide
+// value and emits byte-identical Lua to a step with no smoothing
+// field. Added `none` and `very_smooth` 2026-10-09 so the full range
+// the operator asked for ("none → very smooth") is reachable.
+export const SMOOTHING_LEVEL_OPTIONS = [
+  { value: 'none',        label: 'None'       },
+  { value: 'low',         label: 'Low'        },
+  { value: 'medium',      label: 'Medium'     },
+  { value: 'high',        label: 'High'       },
+  { value: 'very_smooth', label: 'Very smooth'},
+]
+
+export function isMotionSmoothingStep(step) {
+  if (!step) return false
+  const action = String(step.action || '').toLowerCase()
+  return MOTION_SMOOTHING_ACTIONS.has(action)
+}
+
+// Resolve the EFFECTIVE smoothing level a motion step will emit at.
+// Mirror of the backend `resolve_step_smoothing_level`. 'inherit' or
+// missing → program default; explicit non-inherit → that level.
+export function resolveEffectiveSmoothing(step, programLevel) {
+  const prog = (programLevel && String(programLevel).toLowerCase()) || 'medium'
+  if (!step) return prog
+  const v = String(step.smoothing || '').toLowerCase().trim()
+  if (!v || v === 'inherit') return prog
+  const known = new Set(SMOOTHING_LEVEL_OPTIONS.map((o) => o.value))
+  return known.has(v) ? v : prog
+}
+
 // A derived offset move (descend / lift / retreat / "approach
 // finished part") computes its target at runtime as
 //   <source taught_tcp> + Z offset

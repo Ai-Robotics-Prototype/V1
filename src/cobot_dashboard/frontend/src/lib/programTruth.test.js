@@ -26,6 +26,10 @@ import {
   TEACHABLE_ACTIONS,
   isTeachable,
   isDerivedOffsetMove,
+  MOTION_SMOOTHING_ACTIONS,
+  SMOOTHING_LEVEL_OPTIONS,
+  isMotionSmoothingStep,
+  resolveEffectiveSmoothing,
 } from './programTruth.js'
 
 // ── isStepTaught — mirror of dashboard_server._has_taught_poses ──
@@ -599,4 +603,80 @@ test('isTeachable(move_home) without program context → true (no siblings visib
   // get the step-local answer — the auto-share rule requires the
   // program to compare against.
   assert.equal(isTeachable({ action: 'move_home' }), true)
+})
+
+// ─────────────────────────────────────────────────────────────
+// Per-step corner smoothing (2026-10-09)
+// ─────────────────────────────────────────────────────────────
+
+test('MOTION_SMOOTHING_ACTIONS covers all motion-emitting kinds', () => {
+  // Every TEACHABLE action emits motion → must be present.
+  for (const a of TEACHABLE_ACTIONS) {
+    assert.ok(MOTION_SMOOTHING_ACTIONS.has(a),
+      `${a} should be a motion-smoothing action (it emits motion at codegen)`)
+  }
+  // move_to_pallet's expansion ALSO emits motion, through its own
+  // per-cycle waypoints — the per-step smoothing level is threaded
+  // into ExpandCtx on the backend.
+  assert.ok(MOTION_SMOOTHING_ACTIONS.has('move_to_pallet'))
+})
+
+test('MOTION_SMOOTHING_ACTIONS excludes IO / wait / control-flow', () => {
+  // These actions must NOT render a smoothing dropdown — they emit
+  // no mov* / have no corner.
+  for (const a of ['set_io', 'wait', 'comment', 'loop', 'pause',
+                   'gripper_close', 'gripper_open', 'close_gripper',
+                   'open_gripper', 'vacuum_on', 'vacuum_off']) {
+    assert.equal(MOTION_SMOOTHING_ACTIONS.has(a), false,
+      `${a} is non-motion; should not expose smoothing control`)
+  }
+})
+
+test('SMOOTHING_LEVEL_OPTIONS spans the full operator spectrum', () => {
+  // Names must line up with the backend SMOOTHING_LEVELS dict so
+  // frontend-chosen values are codegen-recognised.
+  const values = SMOOTHING_LEVEL_OPTIONS.map((o) => o.value)
+  assert.deepEqual(values,
+    ['none', 'low', 'medium', 'high', 'very_smooth'])
+})
+
+test('isMotionSmoothingStep: motion steps YES, non-motion NO', () => {
+  assert.equal(isMotionSmoothingStep({ action: 'move_linear' }), true)
+  assert.equal(isMotionSmoothingStep({ action: 'move_to_pallet' }), true)
+  assert.equal(isMotionSmoothingStep({ action: 'set_io' }), false)
+  assert.equal(isMotionSmoothingStep({ action: 'wait' }), false)
+  assert.equal(isMotionSmoothingStep({}), false)
+  assert.equal(isMotionSmoothingStep(null), false)
+})
+
+test('resolveEffectiveSmoothing: missing field → program default (inherit)', () => {
+  assert.equal(
+    resolveEffectiveSmoothing({ action: 'move_linear' }, 'medium'),
+    'medium')
+  assert.equal(
+    resolveEffectiveSmoothing({ action: 'move_linear' }, 'high'),
+    'high')
+})
+
+test('resolveEffectiveSmoothing: explicit inherit → program default', () => {
+  assert.equal(
+    resolveEffectiveSmoothing(
+      { action: 'move_linear', smoothing: 'inherit' }, 'low'),
+    'low')
+})
+
+test('resolveEffectiveSmoothing: explicit non-inherit wins over program', () => {
+  for (const lvl of ['none', 'low', 'medium', 'high', 'very_smooth']) {
+    assert.equal(
+      resolveEffectiveSmoothing(
+        { action: 'move_linear', smoothing: lvl }, 'medium'),
+      lvl)
+  }
+})
+
+test('resolveEffectiveSmoothing: unknown value falls back to program', () => {
+  assert.equal(
+    resolveEffectiveSmoothing(
+      { action: 'move_linear', smoothing: 'bogus' }, 'high'),
+    'high')
 })

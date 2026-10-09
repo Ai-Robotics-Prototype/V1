@@ -25,7 +25,9 @@ import { displayIoForStep, rebindProgramToCell, stepsNeedingRebind }
 import { getCell } from '../lib/cellStore'
 import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
          palletFrameStatus, firstUntaughtPalletRole, PALLET_ROLE_ORDER,
-         TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove }
+         TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove,
+         SMOOTHING_LEVEL_OPTIONS, isMotionSmoothingStep,
+         resolveEffectiveSmoothing }
   from '../lib/programTruth'
 import { isFeatureEnabled } from '../lib/edition'
 import { PALLET_ROLE_TO_FIELD, modeForRole, taughtCount,
@@ -5840,17 +5842,21 @@ export default function ProgramEditor() {
           {steps.length} step{steps.length === 1 ? '' : 's'}
         </span>
 
-        {/* Corner smoothing — program-level setting. Higher = faster,
-            wider arcs through travel points. Applies to every
-            intermediate move in both pallet and non-pallet paths;
-            never to a taught contact (the classifier keeps those
-            as fine stops for IO transitions). Wizard defaults new
-            programs to MEDIUM; the operator retunes here in the
-            editor.  Value flows through program.config.corner_smoothing
-            and is consumed by codegen_blend at emit time. */}
+        {/* Corner smoothing — program-level DEFAULT. Each motion step
+            inherits this value unless the operator sets its own
+            per-step override on the row (dropdown next to the Edit
+            button). None = fine stop at every intermediate corner;
+            VERY SMOOTH = widest arcs through travel points. Applies
+            to every intermediate move in both pallet and non-pallet
+            paths; never to a taught contact (the lookahead classifier
+            still forces fine stops before set_io / gripper / vacuum /
+            wait). Wizard defaults new programs to MEDIUM; the
+            operator retunes here in the editor. Value flows through
+            program.config.corner_smoothing and is consumed by
+            codegen_blend at emit time. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 4,
                       flexShrink: 0 }}
-             title="Corner smoothing (blend radius policy). LOW ≤ 60mm, MEDIUM ≤ 100mm, HIGH ≤ 200mm. Higher = faster, wider arcs through travel points. Taught contacts always stop.">
+             title="Default corner smoothing (blend radius policy). NONE emits bare fine stops; LOW ≤ 60mm, MEDIUM ≤ 100mm, HIGH ≤ 200mm, VERY SMOOTH ≤ 300mm. Taught contacts (before IO / gripper / vacuum / wait) always stop regardless. Override per step in the step rows below.">
           <span style={{ fontSize: 11, color: '#6b7280' }}>Smoothing</span>
           <select
             value={String(currentProgram?.config?.corner_smoothing || 'medium').toLowerCase()}
@@ -5866,9 +5872,9 @@ export default function ProgramEditor() {
               border: '1px solid #d1d5db', borderRadius: 4,
               cursor: 'pointer',
             }}>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
+            {SMOOTHING_LEVEL_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
           </select>
         </div>
 
@@ -6673,6 +6679,90 @@ export default function ProgramEditor() {
                       : <div style={{ color: '#9ca3af' }}>No position recorded yet.</div>}
                   </div>
                 )}
+                {/* Per-step corner smoothing override. Only motion-
+                    emitting actions get this control (set_io / wait /
+                    comment / control-flow carry no blend radius). The
+                    row stores `step.smoothing`; absence or 'inherit'
+                    = program default — codegen then emits byte-
+                    identical Lua to a program with no per-step field.
+                    An explicit non-inherit value re-levels only this
+                    step's corner. The lookahead classifier still runs
+                    on top: a motion step whose successor is a gripper /
+                    vacuum / wait / set_io emits a fine stop regardless
+                    of the operator's chosen level — that invariant is
+                    what makes a taught pick/place safe even if the
+                    program-wide default is Very smooth. */}
+                {isMotionSmoothingStep(step) && !locked && (() => {
+                  const programDefault = String(
+                    currentProgram?.config?.corner_smoothing || 'medium'
+                  ).toLowerCase()
+                  const raw = String(step.smoothing || '').toLowerCase().trim()
+                  const isInheriting = !raw || raw === 'inherit'
+                  const effective = resolveEffectiveSmoothing(step, programDefault)
+                  const effectiveLabel = (
+                    SMOOTHING_LEVEL_OPTIONS.find((o) => o.value === effective) || { label: 'Medium' }
+                  ).label
+                  return (
+                    <div
+                      data-testid="step-smoothing-control"
+                      data-step-id={step.id}
+                      data-inheriting={isInheriting ? 'true' : 'false'}
+                      data-effective={effective}
+                      onClick={(e) => e.stopPropagation()}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 6,
+                        marginTop: 4, fontSize: 11, color: '#6b7280',
+                      }}
+                      title={
+                        isInheriting
+                          ? `Smoothing inherits the program default (${effectiveLabel}). `
+                            + `Change here to override this step only. `
+                            + `Taught contacts before a gripper/vacuum/wait stop fine regardless.`
+                          : `Smoothing OVERRIDDEN to ${effectiveLabel} on this step. `
+                            + `Set to "Inherit" to track the program default.`
+                      }
+                    >
+                      <span>Smoothing</span>
+                      <select
+                        aria-label={`Smoothing for step ${idx + 1}`}
+                        value={isInheriting ? 'inherit' : raw}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          const next = v === 'inherit' ? undefined : v
+                          handleEditSave(step.id, { smoothing: next })
+                        }}
+                        style={{
+                          padding: '2px 6px', fontSize: 11, fontWeight: 600,
+                          background: isInheriting ? '#f8fafc' : '#fef3c7',
+                          color: isInheriting ? '#374151' : '#92400e',
+                          border: isInheriting
+                            ? '1px solid #d1d5db'
+                            : '1px solid #f59e0b',
+                          borderRadius: 4, cursor: 'pointer',
+                        }}
+                      >
+                        <option value="inherit">
+                          Inherit ({effectiveLabel})
+                        </option>
+                        {SMOOTHING_LEVEL_OPTIONS.map((o) => (
+                          <option key={o.value} value={o.value}>{o.label}</option>
+                        ))}
+                      </select>
+                      {!isInheriting && (
+                        <span
+                          style={{
+                            fontSize: 10, fontWeight: 700,
+                            padding: '1px 6px', borderRadius: 10,
+                            background: '#fef3c7', color: '#92400e',
+                            border: '1px solid #f59e0b',
+                          }}
+                        >
+                          OVERRIDE
+                        </span>
+                      )}
+                    </div>
+                  )
+                })()}
               </div>
 
               {/* RIGHT — Edit, Teach, Del */}

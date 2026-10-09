@@ -39,11 +39,23 @@ from __future__ import annotations
 # larger radius on a given corner; the level cap is the operator-
 # facing shorthand, not a controller invariant.
 SMOOTHING_LEVELS = {
-    'low':    (0.35,  60.0),
-    'medium': (0.50, 100.0),
-    'high':   (0.75, 200.0),
+    # (fraction of shorter adjoining segment, hard cap mm).
+    # NONE: force 0 radius — bare fine stop at every corner on this
+    # scope. VERY_SMOOTH: operator-reachable high-end extension of
+    # HIGH, same evidence basis (no documented ceiling on the `b=`
+    # arg); same vertical-landing invariant applies.
+    'none':         (0.0,   0.0),
+    'low':          (0.35,  60.0),
+    'medium':       (0.50, 100.0),
+    'high':         (0.75, 200.0),
+    'very_smooth':  (0.90, 300.0),
 }
 DEFAULT_SMOOTHING_LEVEL = 'medium'
+
+# Per-step inherit sentinel. Motion steps default to this when no
+# explicit override is set — codegen reads the program-wide level
+# in that case (byte-identical to the pre-per-step emission).
+STEP_SMOOTHING_INHERIT = 'inherit'
 
 # VERTICAL-LANDING INVARIANT — always wins over the level cap.
 # The corner leading INTO a FINE waypoint (pick / place / slot
@@ -75,6 +87,33 @@ def resolve_smoothing_level(config: dict | None) -> str:
         return DEFAULT_SMOOTHING_LEVEL
     v = str(config.get('corner_smoothing') or '').strip().lower()
     return v if v in SMOOTHING_LEVELS else DEFAULT_SMOOTHING_LEVEL
+
+
+def resolve_step_smoothing_level(step: dict | None,
+                                 program_level: str) -> str:
+    """Return the effective smoothing level for a motion step.
+
+    Priority:
+      * explicit `step.smoothing` naming a known level (none / low /
+        medium / high / very_smooth) → that level
+      * `step.smoothing == 'inherit'` OR missing OR unknown →
+        `program_level` (the program-wide default)
+
+    Operator-facing meaning: a step with no `smoothing` field is
+    byte-identical to the pre-per-step emission (inheritance is the
+    silent default). An explicit override only affects THIS step's
+    corner radius computation; the classifier's fine-stop lookahead
+    (`step_forces_stop`) still runs on top and WINS — a step whose
+    successor is set_io / gripper / vacuum emits `b=0` regardless of
+    the operator's smoothing choice, so the IO transition still
+    happens at a geometric stand-still.
+    """
+    if not isinstance(step, dict):
+        return program_level
+    v = str(step.get('smoothing') or '').strip().lower()
+    if not v or v == STEP_SMOOTHING_INHERIT:
+        return program_level
+    return v if v in SMOOTHING_LEVELS else program_level
 
 
 def _level_params(level: str) -> tuple[float, float]:

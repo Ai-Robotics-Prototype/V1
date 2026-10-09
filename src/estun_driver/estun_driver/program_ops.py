@@ -1388,7 +1388,9 @@ from .codegen_blend import (
     BLEND_RADIUS_MAX_MM,
     SMOOTHING_LEVELS,
     DEFAULT_SMOOTHING_LEVEL,
+    STEP_SMOOTHING_INHERIT,
     resolve_smoothing_level as _resolve_smoothing_level,
+    resolve_step_smoothing_level as _resolve_step_smoothing_level,
     mov_blend_suffix,
     mov_blend_kv,
     mov_options_suffix,
@@ -4183,14 +4185,21 @@ def codegen_lua_from_program(
 
         Returns 0 when the classifier says this step is FINE OR the
         geometry is degenerate (missing prev-tcp / zero prev-seg).
+
+        Per-step smoothing: when `current_step.smoothing` names an
+        explicit level (`none` / `low` / `medium` / `high` /
+        `very_smooth`), THAT level drives the corner on this step —
+        'inherit' or missing falls back to the program-wide level.
         """
         if step_forces_stop(steps, step_i):
             return 0
+        _step_level = _resolve_step_smoothing_level(
+            current_step, _smoothing_level)
         _ov = current_step.get('blend_override_mm') if isinstance(current_step, dict) else None
         if prev_tcp is None or this_tcp is None:
             return blend_radius_for_corner(
                 10_000.0, 10_000.0,
-                level=_smoothing_level,
+                level=_step_level,
                 cap_mm=BLEND_RADIUS_MM,
                 step_override_mm=_ov)
         prev_seg = _seg_mm_from_tcps(prev_tcp, this_tcp)
@@ -4204,7 +4213,7 @@ def codegen_lua_from_program(
         return blend_radius_for_corner(
             prev_seg,
             _next_seg if _next_seg is not None else 10_000.0,
-            level=_smoothing_level,
+            level=_step_level,
             into_fine=_into_fine,
             next_seg_for_fine_mm=_next_seg if _into_fine else None,
             step_override_mm=_ov)
@@ -4469,7 +4478,8 @@ def codegen_lua_from_program(
                 max_mmps=float(max_mmps),
                 default_accl_mm_s2=float(mc['default_accL_mm_per_s2']),
                 gentle_accl_mm_s2=float(mc['gentle_descent_accL_mm_per_s2']),
-                smoothing_level=_smoothing_level,
+                smoothing_level=_resolve_step_smoothing_level(
+                    step, _smoothing_level),
                 step_blend_override_mm=(
                     int(step['blend_override_mm'])
                     if isinstance(step.get('blend_override_mm'), (int, float))
@@ -4956,10 +4966,12 @@ def codegen_lua_from_program(
             if _is_stop:
                 _b = 0
             else:
+                _step_level = _resolve_step_smoothing_level(
+                    step, _smoothing_level)
                 _ov = step.get('blend_override_mm') if isinstance(step, dict) else None
                 _b = blend_radius_for_corner(
                     10_000.0, 10_000.0,
-                    level=_smoothing_level,
+                    level=_step_level,
                     cap_mm=BLEND_RADIUS_MM,
                     step_override_mm=_ov)
             _kv_parts = [f'coor=0', 'tool=0', f'v={int(round(_v))}']
@@ -5200,11 +5212,13 @@ def codegen_lua_from_program(
                 # 40% straight run is preserved even at HIGH level.
                 _contact_tcp = _tcp_from_joints_m([float(v) for v in taught])
                 _next_seg_local = _seg_mm_from_tcps(_this_tcp, _contact_tcp)
+                _step_level = _resolve_step_smoothing_level(
+                    step, _smoothing_level)
                 _ov = step.get('blend_override_mm') if isinstance(step, dict) else None
                 _b = blend_radius_for_corner(
                     prev_seg_mm=(_prev_seg if _prev_seg is not None else 10_000.0),
                     next_seg_mm=(_next_seg_local if _next_seg_local is not None else float(split_z)),
-                    level=_smoothing_level,
+                    level=_step_level,
                     into_fine=True,
                     next_seg_for_fine_mm=(_next_seg_local if _next_seg_local is not None else float(split_z)),
                     step_override_mm=_ov,
