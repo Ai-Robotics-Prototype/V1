@@ -92,10 +92,14 @@ export const MOTION_SMOOTHING_ACTIONS = new Set([
 // level map lives in codegen_blend.py:SMOOTHING_LEVELS; this list
 // mirrors the ordered spectrum the operator picks from on BOTH the
 // program-wide default control AND each motion step's row override.
-// 'inherit' is the per-step default — the step uses the program-wide
-// value and emits byte-identical Lua to a step with no smoothing
-// field. Added `none` and `very_smooth` 2026-10-09 so the full range
-// the operator asked for ("none → very smooth") is reachable.
+// When a step has no stored smoothing field, codegen tracks the
+// program-wide default and emits byte-identical Lua to a step with
+// no per-step field. 2026-10-09 operator directive: the per-step
+// UI never shows the word "inherit"; a tracking row simply renders
+// its current effective level with a muted style, an overridden row
+// renders amber with an OVERRIDE chip + a ✕ reset affordance.
+// Added `none` and `very_smooth` 2026-10-09 so the full range the
+// operator asked for ("none → very smooth") is reachable.
 export const SMOOTHING_LEVEL_OPTIONS = [
   { value: 'none',        label: 'None'       },
   { value: 'low',         label: 'Low'        },
@@ -111,8 +115,10 @@ export function isMotionSmoothingStep(step) {
 }
 
 // Resolve the EFFECTIVE smoothing level a motion step will emit at.
-// Mirror of the backend `resolve_step_smoothing_level`. 'inherit' or
-// missing → program default; explicit non-inherit → that level.
+// Mirror of the backend `resolve_step_smoothing_level`. A missing
+// field falls back to the program default; the legacy sentinel
+// value 'inherit' (kept for back-compat with any already-stored
+// row) resolves the same way. An explicit known level wins.
 export function resolveEffectiveSmoothing(step, programLevel) {
   const prog = (programLevel && String(programLevel).toLowerCase()) || 'medium'
   if (!step) return prog

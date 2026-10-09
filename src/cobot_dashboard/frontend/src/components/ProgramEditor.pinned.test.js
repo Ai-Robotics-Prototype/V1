@@ -148,3 +148,66 @@ test('verb-divergence chip knows waypoint implies movL', () => {
     'when codegen emits anything other than movL for a waypoint, '
     + 'the chip must surface the divergence (D3 doctrine)')
 })
+
+// ─────────────────────────────────────────────────────────────
+// Per-step smoothing — operator never sees "inherit" (2026-10-09)
+// ─────────────────────────────────────────────────────────────
+
+test('per-step smoothing control carries no "Inherit (…)" dropdown label', () => {
+  // Operator directive: a tracking step shows its effective value
+  // directly ("Medium"), never "Inherit (Medium)". Any new site that
+  // reintroduces the Inherit-N label is caught here.
+  assert.doesNotMatch(source, /Inherit\s*\(/,
+    'the dropdown must not render an "Inherit (…)" label')
+  assert.doesNotMatch(source, />\s*Inherit\s*\(/,
+    'no "Inherit (…)" string may appear in JSX option text')
+})
+
+test('per-step smoothing tooltip never contains the word "inherit"', () => {
+  // Pull out the smoothing control subtree + its title={...} branch.
+  const block = source.match(
+    /data-testid=['"]step-smoothing-control['"][\s\S]{0,2500}?<\/select>/)
+  assert.ok(block, 'could not locate the per-step smoothing control block')
+  const titleBranch = block[0].match(/title=\{[\s\S]{0,1500}?\}/)
+  assert.ok(titleBranch, 'could not locate the control title branch')
+  assert.doesNotMatch(titleBranch[0], /\binherit(s|ed|ing)?\b/i,
+    'tooltip must not use the word "inherit" — operator-facing copy')
+})
+
+test('per-step smoothing dropdown value tracks the EFFECTIVE level directly', () => {
+  // Behaviour pin: the <select>'s value prop binds to `effective`,
+  // so the closed-state display is the resolved effective level
+  // (e.g. "Medium") regardless of whether the step is tracking the
+  // program default or carrying an explicit override.
+  assert.match(source, /aria-label=\{`Smoothing for step [\s\S]{0,120}?value=\{effective\}/,
+    'select.value must bind to `effective` so the closed state '
+    + 'reads the effective level without the "inherit" label')
+})
+
+test('override chip + ✕ clear button appear only when the step overrides', () => {
+  // Visual indicator: tracking rows are muted, override rows carry
+  // the amber OVERRIDE chip and a ✕ reset affordance that clears
+  // the override back to tracking. The clear button writes
+  // smoothing:undefined (NOT 'inherit') so the stored row stays
+  // byte-compatible with brand-new programs.
+  assert.match(source, /data-testid=['"]step-smoothing-override-chip['"]/,
+    'the OVERRIDE chip must exist and be test-targetable')
+  assert.match(source, /data-testid=['"]step-smoothing-clear-override['"]/,
+    'the ✕ clear-override button must exist and be test-targetable')
+  assert.match(source,
+    /data-testid=['"]step-smoothing-clear-override['"][\s\S]{0,500}?handleEditSave\(step\.id,\s*\{\s*smoothing:\s*undefined\s*\}\)/,
+    'clear-override must reset step.smoothing to undefined (not to '
+    + 'the legacy "inherit" sentinel) so new rows match today\'s '
+    + 'missing-field shape')
+})
+
+test('data attributes name the state as "tracking" (not "inheriting")', () => {
+  // The operator-facing vocabulary swap must land in the dev-tool
+  // view too — data-* attributes are frequently copied into bug
+  // reports and screenshots, and "inheriting" would betray the
+  // internal sentinel. The state is now called tracking.
+  assert.match(source, /data-tracking=\{isTracking \? 'true' : 'false'\}/,
+    'the control exposes its tracking vs override state via data-tracking')
+  assert.doesNotMatch(source, /data-inheriting=/,
+    'the previous data-inheriting attribute must not resurface')
+})

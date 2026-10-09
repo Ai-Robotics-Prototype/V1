@@ -649,7 +649,7 @@ test('isMotionSmoothingStep: motion steps YES, non-motion NO', () => {
   assert.equal(isMotionSmoothingStep(null), false)
 })
 
-test('resolveEffectiveSmoothing: missing field → program default (inherit)', () => {
+test('resolveEffectiveSmoothing: missing field tracks program default', () => {
   assert.equal(
     resolveEffectiveSmoothing({ action: 'move_linear' }, 'medium'),
     'medium')
@@ -658,14 +658,18 @@ test('resolveEffectiveSmoothing: missing field → program default (inherit)', (
     'high')
 })
 
-test('resolveEffectiveSmoothing: explicit inherit → program default', () => {
+test("resolveEffectiveSmoothing: legacy sentinel 'inherit' still resolves to program default (back-compat)", () => {
+  // The 'inherit' string is the legacy sentinel from the pre-
+  // 2026-10-09 UI; keep the resolver accepting it so any already-
+  // saved program with a stored smoothing:'inherit' row keeps the
+  // same effective level. The UI never writes this value any more.
   assert.equal(
     resolveEffectiveSmoothing(
       { action: 'move_linear', smoothing: 'inherit' }, 'low'),
     'low')
 })
 
-test('resolveEffectiveSmoothing: explicit non-inherit wins over program', () => {
+test('resolveEffectiveSmoothing: explicit non-tracking level wins over program', () => {
   for (const lvl of ['none', 'low', 'medium', 'high', 'very_smooth']) {
     assert.equal(
       resolveEffectiveSmoothing(
