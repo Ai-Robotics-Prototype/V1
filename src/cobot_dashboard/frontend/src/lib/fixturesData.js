@@ -72,7 +72,7 @@ export { slotAcceptsType }
 export const FIXTURE_TYPES = Object.freeze({
   vice: {
     key: 'vice', label: 'Vice / Clamp',
-    desc: 'Grips a workpiece. The robot opens and closes it.',
+    desc: 'Grips a workpiece.',
     icon: 'vice',
     defaults: {
       power_mode: 'air',
@@ -87,7 +87,7 @@ export const FIXTURE_TYPES = Object.freeze({
   },
   indexer: {
     key: 'indexer', label: 'Rotary Table / Indexer',
-    desc: 'Spins to a new position. Usually has its own controls.',
+    desc: 'Spins to a new position.',
     icon: 'indexer',
     defaults: {
       power_mode: 'own_controller',
@@ -100,7 +100,7 @@ export const FIXTURE_TYPES = Object.freeze({
   },
   feeder: {
     key: 'feeder', label: 'Part Feeder / Conveyor',
-    desc: 'Delivers the next part into place. The robot tells it to go.',
+    desc: 'Delivers the next part.',
     icon: 'feeder',
     defaults: {
       power_mode: 'own_controller',
@@ -113,7 +113,7 @@ export const FIXTURE_TYPES = Object.freeze({
   },
   blow_off: {
     key: 'blow_off', label: 'Air Blast / Blow-off',
-    desc: 'Pulses air to clean a part or clear chips. Off by default.',
+    desc: 'Pulses air to clear chips.',
     icon: 'blow_off',
     defaults: {
       power_mode: 'air',
@@ -127,7 +127,7 @@ export const FIXTURE_TYPES = Object.freeze({
   },
   door: {
     key: 'door', label: 'Door / Slide',
-    desc: 'Opens and closes a guard, chute, or slide.',
+    desc: 'Opens and closes a guard.',
     icon: 'door',
     defaults: {
       power_mode: 'air',
@@ -144,7 +144,7 @@ export const FIXTURE_TYPES = Object.freeze({
   },
   other: {
     key: 'other', label: 'Something else',
-    desc: 'Any other device around the robot — pick this and answer the questions.',
+    desc: 'Any other device.',
     icon: 'other',
     defaults: {
       power_mode: null,

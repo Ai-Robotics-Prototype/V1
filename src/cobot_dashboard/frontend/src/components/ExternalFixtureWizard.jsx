@@ -436,6 +436,17 @@ function FixturePicker({ fixtures, onNew, onEdit, onDelete }) {
 }
 
 function DeviceTypeStep({ selected, onPick }) {
+  // 2026-10-09 operator directive: the picker shows the device NAME
+  // + ONE short plain line (≤8 words). The behavioural detail that
+  // used to live in each card's italic `why` paragraph (hold-on-
+  // loss defaults, "robot tells it to go", safety-guard caveats)
+  // has been moved to the LATER wizard steps where those questions
+  // are actually asked (PowerForkStep covers "robot tells it to go",
+  // AirActuationStep covers hold-on-loss + the safety-guard case).
+  // `t.why` stays on FIXTURE_TYPES as dormant data in case a future
+  // deep-link / help surface wants it — just not rendered here.
+  // Fixed card height (minHeight) keeps the grid scannable even
+  // when a label wraps across two lines on narrow tablets.
   return (
     <div data-testid="fixture-step-type"
          style={{ display: 'grid', gap: 10,
@@ -451,6 +462,7 @@ function DeviceTypeStep({ selected, onPick }) {
                   onClick={() => onPick(k)}
                   style={{
                     textAlign: 'left', padding: '12px 14px',
+                    minHeight: 72,
                     background: on ? '#EFF6FF' : '#fff',
                     border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
                     borderRadius: 8, cursor: 'pointer',
@@ -461,10 +473,6 @@ function DeviceTypeStep({ selected, onPick }) {
             </div>
             <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
               {t.desc}
-            </div>
-            <div style={{ fontSize: 11, color: '#4B5563', marginTop: 6,
-                          fontStyle: 'italic' }}>
-              {t.why}
             </div>
           </button>
         )
