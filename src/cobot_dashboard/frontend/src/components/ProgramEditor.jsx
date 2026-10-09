@@ -6581,20 +6581,21 @@ export default function ProgramEditor() {
                       : <div style={{ color: '#9ca3af' }}>No position recorded yet.</div>}
                   </div>
                 )}
-                {/* Per-step corner smoothing override. Only motion-
-                    emitting actions get this control (set_io / wait /
-                    comment / control-flow carry no blend radius). The
-                    row stores `step.smoothing`; when missing, codegen
-                    falls back to the program-wide default — a step
-                    with no stored override still tracks the program's
-                    smoothing selection and moves with it when the
-                    operator retunes the program default. An explicit
-                    value re-levels only this step's corner. 2026-10-09
-                    (operator directive): the per-step label never
-                    says "inherit"; a tracking step shows just its
-                    effective value and reads as muted; an overridden
-                    step reads amber + carries an OVERRIDE chip and a
-                    ✕ button that clears the override back to tracking.
+                {/* Per-step corner smoothing. Only motion-emitting
+                    actions get this control (set_io / wait / comment /
+                    control-flow carry no blend radius). The row stores
+                    `step.smoothing`; when missing, codegen falls back
+                    to the program-wide default — a step with no stored
+                    override still tracks the program's smoothing and
+                    moves with it when the operator retunes the program
+                    default. 2026-10-09 (operator directive): every
+                    motion row renders the SAME compact dropdown with
+                    its effective value — no OVERRIDE badge, no ✕
+                    clear-button. Changing the dropdown IS how the
+                    operator sets or resets a step; picking a value
+                    that matches the program default effectively clears
+                    the override (same resolved emission as a stored
+                    override to the same level — byte-identical Lua).
                     The lookahead classifier still runs on top: a
                     motion step whose successor is a gripper / vacuum /
                     wait / set_io emits a fine stop regardless of the
@@ -6610,6 +6611,10 @@ export default function ProgramEditor() {
                   // row follows whatever the program default currently
                   // is. Internal sentinel 'inherit' (back-compat for
                   // any legacy stored row) resolves the same way.
+                  // The flag no longer changes the rendered chrome —
+                  // every row is a plain dropdown — but it stays on
+                  // the data-attributes so any analytics / debug tool
+                  // can still read the state.
                   const isTracking = !raw || raw === 'inherit'
                   const effective = resolveEffectiveSmoothing(step, programDefault)
                   const effectiveLabel = (
@@ -6627,12 +6632,11 @@ export default function ProgramEditor() {
                         marginTop: 4, fontSize: 11, color: '#6b7280',
                       }}
                       title={
-                        isTracking
-                          ? `Smoothing: ${effectiveLabel} (program default). `
-                            + `Change here to override this step only. `
-                            + `Taught contacts before a gripper/vacuum/wait stop fine regardless.`
-                          : `Smoothing overridden to ${effectiveLabel} on this step. `
-                            + `Click ✕ to clear the override and track the program default again.`
+                        `Smoothing: ${effectiveLabel}. Change to re-level this `
+                        + `step's corner; pick the same value as the program `
+                        + `default to let it track the default again. Taught `
+                        + `contacts before a gripper / vacuum / wait stop fine `
+                        + `regardless.`
                       }
                     >
                       <span>Smoothing</span>
@@ -6644,11 +6648,8 @@ export default function ProgramEditor() {
                         }}
                         style={{
                           padding: '2px 6px', fontSize: 11, fontWeight: 600,
-                          background: isTracking ? '#f8fafc' : '#fef3c7',
-                          color: isTracking ? '#374151' : '#92400e',
-                          border: isTracking
-                            ? '1px solid #d1d5db'
-                            : '1px solid #f59e0b',
+                          background: '#f8fafc', color: '#374151',
+                          border: '1px solid #d1d5db',
                           borderRadius: 4, cursor: 'pointer',
                         }}
                       >
@@ -6656,39 +6657,6 @@ export default function ProgramEditor() {
                           <option key={o.value} value={o.value}>{o.label}</option>
                         ))}
                       </select>
-                      {!isTracking && (
-                        <>
-                          <span
-                            data-testid="step-smoothing-override-chip"
-                            style={{
-                              fontSize: 10, fontWeight: 700,
-                              padding: '1px 6px', borderRadius: 10,
-                              background: '#fef3c7', color: '#92400e',
-                              border: '1px solid #f59e0b',
-                            }}
-                          >
-                            OVERRIDE
-                          </span>
-                          <button
-                            type="button"
-                            data-testid="step-smoothing-clear-override"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              handleEditSave(step.id, { smoothing: undefined })
-                            }}
-                            title={`Clear this override — track the program default (${programDefault}).`}
-                            aria-label={`Clear smoothing override on step ${idx + 1}`}
-                            style={{
-                              fontSize: 11, fontWeight: 700, lineHeight: 1,
-                              padding: '1px 7px', borderRadius: 10,
-                              background: '#fff', color: '#92400e',
-                              border: '1px solid #f59e0b', cursor: 'pointer',
-                            }}
-                          >
-                            ×
-                          </button>
-                        </>
-                      )}
                     </div>
                   )
                 })()}

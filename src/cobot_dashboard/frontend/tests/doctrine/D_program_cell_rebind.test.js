@@ -539,7 +539,14 @@ test('codegen emits raw DO channels for close_gripper / open_gripper (no Synapse
   // Bind-by-id: codegen re-resolves io_close/io_open from the
   // cell's current EOAT valve so a stored DO0 placeholder from
   // pre-cell wizard output doesn't poison the emission.
-  assert.ok(/_tool_valve_raw\s*=\s*None/.test(opsSrc),
+  // 2026-10-09 (gripper-IO root-cause bundle): the declaration
+  // picked up a `: str | None` type annotation when the shared
+  // cell_resolver landed and program_ops started importing the
+  // resolver's typed return. The regex now matches either shape —
+  // the LOAD-BEARING fact is that _tool_valve_raw is seeded to
+  // None at the top of every codegen call so the fallback path is
+  // deterministic.
+  assert.ok(/_tool_valve_raw(?:\s*:\s*str\s*\|\s*None)?\s*=\s*None/.test(opsSrc),
     v('codegen must cache _tool_valve_raw per codegen call for '
       + 'the bind-by-id gripper resolve.'))
   assert.ok(/_cell_eoat_id/.test(opsSrc),

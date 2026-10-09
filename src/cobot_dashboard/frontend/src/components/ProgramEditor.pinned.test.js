@@ -184,32 +184,70 @@ test('per-step smoothing dropdown value tracks the EFFECTIVE level directly', ()
     + 'reads the effective level without the "inherit" label')
 })
 
-test('override chip + ✕ clear button appear only when the step overrides', () => {
-  // Visual indicator: tracking rows are muted, override rows carry
-  // the amber OVERRIDE chip and a ✕ reset affordance that clears
-  // the override back to tracking. The clear button writes
-  // smoothing:undefined (NOT 'inherit') so the stored row stays
-  // byte-compatible with brand-new programs.
-  assert.match(source, /data-testid=['"]step-smoothing-override-chip['"]/,
-    'the OVERRIDE chip must exist and be test-targetable')
-  assert.match(source, /data-testid=['"]step-smoothing-clear-override['"]/,
-    'the ✕ clear-override button must exist and be test-targetable')
-  assert.match(source,
-    /data-testid=['"]step-smoothing-clear-override['"][\s\S]{0,500}?handleEditSave\(step\.id,\s*\{\s*smoothing:\s*undefined\s*\}\)/,
-    'clear-override must reset step.smoothing to undefined (not to '
-    + 'the legacy "inherit" sentinel) so new rows match today\'s '
-    + 'missing-field shape')
+test('per-step smoothing is dropdown-only — no OVERRIDE chip, no ✕ clear button', () => {
+  // 2026-10-09 operator directive: every motion step row renders
+  // the SAME compact smoothing dropdown. The previous override-
+  // state chrome (amber OVERRIDE badge + a ✕ button that cleared
+  // the override) is retired — changing the dropdown IS how the
+  // operator sets or resets a step. These negative assertions
+  // block any resurrection of the row-level chrome.
+  assert.doesNotMatch(source,
+    /data-testid=['"]step-smoothing-override-chip['"]/,
+    'the OVERRIDE chip must not resurface — the smoothing row is '
+    + 'dropdown-only')
+  assert.doesNotMatch(source,
+    /data-testid=['"]step-smoothing-clear-override['"]/,
+    'the ✕ clear-override button must not resurface — the smoothing '
+    + 'row is dropdown-only')
+  // Positive assertion on the smoothing control: the subtree between
+  // the control's testid and its closing </div> must contain exactly
+  // ONE interactive element (the <select>) — no sibling <button>
+  // and no sibling data-testid-tagged <span> can appear next to it.
+  const block = source.match(
+    /data-testid=['"]step-smoothing-control['"][\s\S]{0,2500}?<\/div>\s*\)\s*}\s*\)\s*\(\s*\)\s*}/)
+  assert.ok(block, 'could not locate the per-step smoothing control block')
+  const buttons = (block[0].match(/<button\b/g) || []).length
+  assert.equal(buttons, 0,
+    `smoothing control block contains ${buttons} <button> element(s); `
+    + 'the dropdown-only directive forbids any button in this subtree')
 })
 
 test('data attributes name the state as "tracking" (not "inheriting")', () => {
   // The operator-facing vocabulary swap must land in the dev-tool
   // view too — data-* attributes are frequently copied into bug
   // reports and screenshots, and "inheriting" would betray the
-  // internal sentinel. The state is now called tracking.
+  // internal sentinel. The state is now called tracking. The
+  // attribute itself stays even after the dropdown-only cleanup
+  // (2026-10-09) so analytics / debug tools can still read whether
+  // the operator has customised the row.
   assert.match(source, /data-tracking=\{isTracking \? 'true' : 'false'\}/,
     'the control exposes its tracking vs override state via data-tracking')
   assert.doesNotMatch(source, /data-inheriting=/,
     'the previous data-inheriting attribute must not resurface')
+})
+
+test('every motion step row renders an identical compact smoothing dropdown', () => {
+  // Consistency pin (2026-10-09 operator directive): the operator
+  // reads step rows top-to-bottom; smoothing on step 1 must look
+  // exactly like smoothing on step 7. The control's rendered style
+  // props must be literals — no `isTracking ?` branching on the
+  // visible <select>'s background / border / colour, which was the
+  // pre-cleanup amber-vs-grey fork.
+  const block = source.match(
+    /data-testid=['"]step-smoothing-control['"][\s\S]{0,2500}?<\/select>/)
+  assert.ok(block, 'could not locate the per-step smoothing control block')
+  const selectStyle = block[0].match(/<select[\s\S]{0,1800}?style=\{\{[\s\S]{0,600}?\}\}/)
+  assert.ok(selectStyle, 'could not locate the select style block')
+  const s = selectStyle[0]
+  assert.doesNotMatch(s, /isTracking\s*\?/,
+    'select style must NOT branch on isTracking — every row renders '
+    + 'the dropdown identically')
+  // Pin the literal muted palette so a future edit can't quietly
+  // reintroduce an amber-only treatment for overridden rows.
+  assert.match(s, /background:\s*'#f8fafc'/,
+    'select background stays muted slate (#f8fafc) on every row')
+  assert.match(s, /border:\s*'1px solid #d1d5db'/,
+    'select border stays muted grey (#d1d5db) on every row')
 })
 
 // ─────────────────────────────────────────────────────────────
