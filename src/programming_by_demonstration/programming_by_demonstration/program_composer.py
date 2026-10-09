@@ -320,34 +320,89 @@ def _place_contact(hint: str, spd: int) -> Dict[str, Any]:
 # artifact stays vision-free.
 
 
-def _grip_open(spd: int) -> Dict[str, Any]:
-    return {
+# ── Finger-gripper IO helpers — cell-resolved, not hardcoded ────────
+#
+# Audit #6 (e749ccb, 2026-10-09): the pre-fix versions emitted
+# hardcoded `DO0` / `DO1` / `DI0` / `DI1` placeholders. On a cell
+# whose actual finger valve is V05/DO5, the composed program fired
+# the WRONG DO at run time — picking up more than metadata, hitting
+# a real coil in the controller cabinet. The frontend wizard already
+# fixed this (effectorVocab.js resolves from the bound EOAT via
+# cellActions.js); the PBD path still forked. These helpers now take
+# a resolved context dict (from cell_resolver.resolve_eoat) and emit
+# ONLY the ports that resolved. Missing/unresolvable → emit no port
+# fields at all so the backend codegen's `-- REFUSED` marker fires
+# and the operator sees "has no valve assigned" instead of
+# metal-firing on DO0.
+#
+# Context shape (what resolve_eoat returns), or None when there's no
+# bound EOAT or the EOAT has no valve:
+#     {'id':…, 'name':…, 'valve_do':'DO<n>',
+#      'inputs':[{'raw':'DI<n>', 'synapse':…, 'label':…}, …], …}
+
+def _finger_close_confirm_di(ctx: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Pick the DI the cell has tagged as the close/clamp sensor."""
+    if not ctx:
+        return None
+    for inp in (ctx.get('inputs') or []):
+        label = str((inp or {}).get('label') or '').lower()
+        if any(w in label for w in ('close', 'clamp', 'grip', 'part')):
+            return inp.get('raw')
+    inps = ctx.get('inputs') or []
+    return inps[0].get('raw') if inps else None
+
+
+def _finger_open_confirm_di(ctx: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Pick the DI the cell has tagged as the open/release sensor."""
+    if not ctx:
+        return None
+    for inp in (ctx.get('inputs') or []):
+        label = str((inp or {}).get('label') or '').lower()
+        if any(w in label for w in ('open', 'release', 'home')):
+            return inp.get('raw')
+    inps = ctx.get('inputs') or []
+    return inps[-1].get('raw') if inps else None
+
+
+def _grip_open(spd: int,
+               eoat_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    step: Dict[str, Any] = {
         'action': 'open_gripper',
         'label':  label_for('open_gripper'),
-        'width_mm':       DEFAULT_GRIPPER_WIDTH,
-        'speed_pct':      int(spd),
-        'io_open':        'DO1',
-        'io_open_confirm': 'DI1',
+        'width_mm':  DEFAULT_GRIPPER_WIDTH,
+        'speed_pct': int(spd),
     }
+    if eoat_ctx and eoat_ctx.get('valve_do'):
+        step['io_open'] = eoat_ctx['valve_do']
+        oci = _finger_open_confirm_di(eoat_ctx)
+        if oci:
+            step['io_open_confirm'] = oci
+    return step
 
 
-def _grip_close() -> Dict[str, Any]:
-    return {
+def _grip_close(eoat_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    step: Dict[str, Any] = {
         'action': 'close_gripper',
         'label':  label_for('grip_part'),
-        'force_pct':       DEFAULT_GRIP_FORCE,
-        'io_close':        'DO0',
-        'io_close_confirm': 'DI0',
+        'force_pct': DEFAULT_GRIP_FORCE,
     }
+    if eoat_ctx and eoat_ctx.get('valve_do'):
+        step['io_close'] = eoat_ctx['valve_do']
+        cci = _finger_close_confirm_di(eoat_ctx)
+        if cci:
+            step['io_close_confirm'] = cci
+    return step
 
 
-def _grip_release() -> Dict[str, Any]:
-    return {
+def _grip_release(eoat_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    step: Dict[str, Any] = {
         'action': 'open_gripper',
         'label':  label_for('release_part'),
         'width_mm':  DEFAULT_GRIPPER_WIDTH,
-        'io_open':   'DO1',
     }
+    if eoat_ctx and eoat_ctx.get('valve_do'):
+        step['io_open'] = eoat_ctx['valve_do']
+    return step
 
 
 # ── IO-map lookup for effector ports ──────────────────────────────
@@ -433,7 +488,9 @@ def _effector_of(op: IntentOperation) -> str:
     return e
 
 
-def _effector_ready(op: IntentOperation, spd: int) -> List[Dict[str, Any]]:
+def _effector_ready(op: IntentOperation, spd: int,
+                    eoat_ctx: Optional[Dict[str, Any]] = None,
+                    ) -> List[Dict[str, Any]]:
     e = _effector_of(op)
     if e == 'vacuum':
         port = _io_map_port_for('vacuum', kind='DO',
@@ -453,10 +510,12 @@ def _effector_ready(op: IntentOperation, spd: int) -> List[Dict[str, Any]]:
             'io_id':  f'DO{port}', 'value': 0,
             'io_role': 'magnet',
         }]
-    return [_grip_open(spd)]
+    return [_grip_open(spd, eoat_ctx)]
 
 
-def _effector_engage(op: IntentOperation) -> List[Dict[str, Any]]:
+def _effector_engage(op: IntentOperation,
+                     eoat_ctx: Optional[Dict[str, Any]] = None,
+                     ) -> List[Dict[str, Any]]:
     """Grip the part after the arm has reached the pick contact."""
     e = _effector_of(op)
     if e == 'vacuum':
@@ -480,10 +539,12 @@ def _effector_engage(op: IntentOperation) -> List[Dict[str, Any]]:
              'io_id':  f'DO{port}', 'value': 1,
              'io_role': 'magnet'},
         ]
-    return [_grip_close()]
+    return [_grip_close(eoat_ctx)]
 
 
-def _effector_disengage(op: IntentOperation) -> List[Dict[str, Any]]:
+def _effector_disengage(op: IntentOperation,
+                        eoat_ctx: Optional[Dict[str, Any]] = None,
+                        ) -> List[Dict[str, Any]]:
     """Release the part after arriving at the place contact. Vacuum
     additionally fires the blow-off pulse (DO on → dwell → off) when
     a "Blow off" port is configured in the io_map (falls back to DO3
@@ -524,7 +585,7 @@ def _effector_disengage(op: IntentOperation) -> List[Dict[str, Any]]:
              'io_id':  f'DO{port}', 'value': 0,
              'io_role': 'magnet'},
         ]
-    return [_grip_release()]
+    return [_grip_release(eoat_ctx)]
 
 
 # ── Per-operation builders ─────────────────────────────────────────
@@ -536,7 +597,8 @@ def _effector_disengage(op: IntentOperation) -> List[Dict[str, Any]]:
 #     → grip_release → retreat-place (derived, +appH)
 
 def _build_pick_and_place(op: IntentOperation, appH: int,
-                          spd: int, slow: int, medium: int) -> Tuple[List[Dict[str, Any]], List[List[int]]]:
+                          spd: int, slow: int, medium: int,
+                          eoat_ctx: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], List[List[int]]]:
     """Emit N pick/place iterations. count=1 → bit-identical to the
     pre-unroll shape (load-bearing back-compat guarantee). count>1 →
     the pair body is emitted N times, with iteration >0 poses derived
@@ -566,11 +628,11 @@ def _build_pick_and_place(op: IntentOperation, appH: int,
             and getattr(op, 'pallet_place', None) is not None):
         n = max(n, op.pallet_place.total_slots())
     s: List[Dict[str, Any]] = []
-    s.extend(_effector_ready(op, spd))
+    s.extend(_effector_ready(op, spd, eoat_ctx))
     iter_ranges: List[List[int]] = []
     for i in range(n):
         _iter_start = len(s)
-        _extend_one_pair(s, op, i, n, appH, spd, slow, medium)
+        _extend_one_pair(s, op, i, n, appH, spd, slow, medium, eoat_ctx)
         iter_ranges.append([_iter_start, len(s)])
     # Single-iteration ops don't need range tracking — the routine
     # detector treats count=1 as flat and decorate_steps writes
@@ -593,7 +655,8 @@ def _iter_label(base: str, i: int, n: int, part_name: str) -> str:
 def _extend_one_pair(steps: List[Dict[str, Any]],
                      op: IntentOperation,
                      i: int, n: int,
-                     appH: int, spd: int, slow: int, medium: int) -> None:
+                     appH: int, spd: int, slow: int, medium: int,
+                     eoat_ctx: Optional[Dict[str, Any]] = None) -> None:
     """One iteration's pick/place body. `i` is the 0-based iteration
     index, `n` the total count. For iteration 0 in a n=1 program the
     labels stay at the pre-unroll wording so the golden test's Lua
@@ -646,7 +709,7 @@ def _extend_one_pair(steps: List[Dict[str, Any]],
             f'(derived: +{pick_step["iter_offset_mm"]["dx"]:g}mm X, '
             f'+{pick_step["iter_offset_mm"]["dy"]:g}mm Y)')
     steps.append(pick_step)
-    steps.extend(_effector_engage(op))
+    steps.extend(_effector_engage(op, eoat_ctx))
     steps.append(_above('pick',
                         _iter_label('Retreat above pick', i, n, part_name),
                         appH, medium))
@@ -742,18 +805,19 @@ def _extend_one_pair(steps: List[Dict[str, Any]],
                     f'from pallet corner)')
         steps.append(place_step)
 
-    steps.extend(_effector_disengage(op))
+    steps.extend(_effector_disengage(op, eoat_ctx))
     steps.append(_above('place',
                         _iter_label('Retreat above place', i, n, part_name),
                         appH, medium))
 
 
 def _build_sort(op: IntentOperation, appH: int,
-                spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
+                spd: int, slow: int, medium: int,
+                eoat_ctx: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Sort = pick + place-by-type. Same body as pick_and_place; the
     place-contact step gets a `sort_bin_hint` from the intent's place
     location for the operator to verify later."""
-    s, _iter_ranges = _build_pick_and_place(op, appH, spd, slow, medium)
+    s, _iter_ranges = _build_pick_and_place(op, appH, spd, slow, medium, eoat_ctx)
     for step in s:
         if step.get('position_role') == 'place':
             step['sort_bin_hint'] = op.place.location_hint
@@ -761,13 +825,15 @@ def _build_sort(op: IntentOperation, appH: int,
 
 
 def _build_machine_tend(op: IntentOperation, appH: int,
-                        spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
+                        spd: int, slow: int, medium: int,
+                        eoat_ctx: Optional[Dict[str, Any]] = None,
+                        ) -> List[Dict[str, Any]]:
     s: List[Dict[str, Any]] = []
-    s.extend(_effector_ready(op, spd))
+    s.extend(_effector_ready(op, spd, eoat_ctx))
     # Detect emission RETIRED — see _build_pick_and_place.
     s.append(_above('pick', 'Approach above pick', appH, spd))
     s.append(_pick_contact(op.pick.location_hint, slow))
-    s.extend(_effector_engage(op))
+    s.extend(_effector_engage(op, eoat_ctx))
     s.append(_above('pick', 'Retreat above pick',  appH, medium))
     # Machine-load contact — the taught anchor for the machine-load
     # role. Approach/retreat steps around it derive from this pose
@@ -776,7 +842,7 @@ def _build_machine_tend(op: IntentOperation, appH: int,
     s.append(_contact('machine_load', 'Machine load — contact',
                       op.place.location_hint or 'machine load fixture',
                       min(spd, 20)))
-    s.extend(_effector_disengage(op))
+    s.extend(_effector_disengage(op, eoat_ctx))
     s.append(_above('machine_load', 'Retreat from machine load', appH, slow))
     s.append({'action': 'set_io', 'label': label_for('start_machine_cycle'),
               'io_id': 'DO4', 'value': 1})
@@ -787,19 +853,21 @@ def _build_machine_tend(op: IntentOperation, appH: int,
     # Re-approach the same machine_load anchor to pick up the
     # finished part — reuses the SAME taught contact pose.
     s.append(_above('machine_load', 'Approach finished part', appH, slow))
-    s.extend(_effector_engage(op))
+    s.extend(_effector_engage(op, eoat_ctx))
     s.append(_above('machine_load', 'Retreat with finished part', appH, medium))
     # Unload contact — separate taught role.
     s.append(_above('unload', 'Approach unload', appH, spd))
     s.append(_contact('unload', 'Unload position — contact',
                       'unload location', slow))
-    s.extend(_effector_disengage(op))
+    s.extend(_effector_disengage(op, eoat_ctx))
     s.append(_above('unload', 'Retreat from unload', appH, medium))
     return s
 
 
 def _build_palletize(op: IntentOperation, mode: str,
-                     appH: int, spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
+                     appH: int, spd: int, slow: int, medium: int,
+                     eoat_ctx: Optional[Dict[str, Any]] = None,
+                     ) -> List[Dict[str, Any]]:
     """Palletize / depalletize use move_to_pallet which the executor
     expands at runtime — pallet geometry is in config.pallet, not in
     individual steps. The taught end of the pair (pick for palletize,
@@ -876,7 +944,7 @@ def _build_palletize(op: IntentOperation, mode: str,
         })
         s.append(_above('place', 'Approach above place', palletH, spd))
         s.append(_place_contact(op.place.location_hint, slow))
-        s.extend(_effector_disengage(op))
+        s.extend(_effector_disengage(op, eoat_ctx))
         s.append(_above('place', 'Retreat above place', palletH, medium))
     s.append(_move_home(label=label_for('return_to_home')))
     return s
@@ -920,18 +988,63 @@ def _build_pallet_config(spec: Optional[PalletSpec], mode: str) -> Dict[str, Any
 
 def compose_program_draft(intent: StructuredIntent,
                           demo_id: str,
-                          program_name: Optional[str] = None) -> ProgramDraft:
+                          program_name: Optional[str] = None,
+                          cell_eoat_id: Optional[str] = None,
+                          cell: Optional[Dict[str, Any]] = None,
+                          ) -> ProgramDraft:
     """Build a ProgramDraft from a StructuredIntent. The composer is
     deterministic — given the same intent it produces the same draft.
 
     If the intent has zero usable operations, we still emit a minimal
     program (just a move_home) so the artifact LOADS in the library
     and the human can see what the AI flagged in ambiguities. Better
-    than dropping the demonstration on the floor."""
+    than dropping the demonstration on the floor.
+
+    `cell_eoat_id` + `cell` (both optional, 2026-10-09 audit #6): bind
+    the composed gripper IO to a specific EOAT in the operator's cell.
+    When BOTH are provided and the id resolves via cell_resolver, the
+    composer emits actual DO/DI ports (not DO0/DO1 placeholders) and
+    stamps `config.cell_eoat_id` on the draft so downstream codegen
+    binds too. When `cell_eoat_id` is None but `cell` has exactly ONE
+    EOAT with a resolvable valve, the composer auto-binds (matches
+    the single-EOAT common case the frontend wizard also auto-binds).
+    When neither resolves, the gripper steps emit WITHOUT port fields
+    so the backend codegen's `-- REFUSED` marker fires — the operator
+    then sees "has no valve assigned" instead of the WRONG DO firing
+    on metal (the pre-fix behaviour)."""
     appH   = DEFAULT_APPROACH_HEIGHT
     spd    = SILENT_SPEED_PCT
     slow   = min(spd, 30)
     medium = min(spd, 40)
+
+    # Resolve the gripper IO context ONCE for the whole compose call.
+    # One place loads cell.json; one place picks a valve. If this
+    # resolution ever forks a per-step copy inside the composer, the
+    # "fixed here still broken there" class returns.
+    eoat_ctx: Optional[Dict[str, Any]] = None
+    try:
+        from cobot_dashboard.cell_resolver import (
+            load_cell as _load_cell,
+            resolve_eoat as _resolve_eoat,
+        )
+        _cell = cell if isinstance(cell, dict) else _load_cell()
+        if cell_eoat_id:
+            eoat_ctx = _resolve_eoat(_cell, cell_eoat_id)
+        else:
+            # Auto-bind when the cell holds exactly ONE resolvable EOAT.
+            eoats = [e for e in (_cell.get('eoats') or [])
+                     if isinstance(e, dict) and e.get('id')]
+            if len(eoats) == 1:
+                tentative = _resolve_eoat(_cell, eoats[0]['id'])
+                if tentative:
+                    eoat_ctx = tentative
+                    cell_eoat_id = tentative.get('id')
+    except Exception:
+        # cell_resolver import failure or cell file read failure →
+        # fall through with eoat_ctx=None; the gripper helpers emit
+        # the backend-REFUSED-compatible shape (no io_* fields) so
+        # the save gate reports the operator-actionable reason.
+        eoat_ctx = None
 
     sorted_ops = sorted(
         list(intent.operations or []),
@@ -1018,7 +1131,8 @@ def compose_program_draft(intent: StructuredIntent,
     for op_index, op in enumerate(sorted_ops):
         _start = len(steps)
         if op.operation_type == 'pick_and_place':
-            _pnp_steps, _pnp_iters = _build_pick_and_place(op, appH, spd, slow, medium)
+            _pnp_steps, _pnp_iters = _build_pick_and_place(
+                op, appH, spd, slow, medium, eoat_ctx)
             steps.extend(_tag_ops_steps(_pnp_steps, op, op_index))
             if _pnp_iters:
                 # Shift the iter_ranges (which are relative to the
@@ -1028,20 +1142,20 @@ def compose_program_draft(intent: StructuredIntent,
                 ]
         elif op.operation_type == 'sort':
             steps.extend(_tag_ops_steps(
-                _build_sort(op, appH, spd, slow, medium), op, op_index))
+                _build_sort(op, appH, spd, slow, medium, eoat_ctx), op, op_index))
         elif op.operation_type == 'machine_tend':
             steps.extend(_tag_ops_steps(
-                _build_machine_tend(op, appH, spd, slow, medium),
+                _build_machine_tend(op, appH, spd, slow, medium, eoat_ctx),
                 op, op_index))
         elif op.operation_type == 'palletize':
-            steps = _build_palletize(op, 'palletize', appH, spd, slow, medium)
+            steps = _build_palletize(op, 'palletize', appH, spd, slow, medium, eoat_ctx)
             primary_op_type = 'palletize'
             pallet_op_mode = 'palletize'
             pallet_spec = op.pallet
             op_step_ranges = [(0, len(steps))]
             break        # pallet programs are single-op by design
         elif op.operation_type == 'depalletize':
-            steps = _build_palletize(op, 'depalletize', appH, spd, slow, medium)
+            steps = _build_palletize(op, 'depalletize', appH, spd, slow, medium, eoat_ctx)
             primary_op_type = 'palletize'
             pallet_op_mode = 'depalletize'
             pallet_spec = op.pallet
@@ -1178,6 +1292,12 @@ def compose_program_draft(intent: StructuredIntent,
         },
         'pbd_metadata': pbd_metadata,
     }
+    # Stamp the bound EOAT (audit #6 anti-recurrence). The downstream
+    # backend codegen (program_ops.py) reads config.cell_eoat_id and
+    # resolves ports from the same cell record this composer did —
+    # one id, one resolver, one truth.
+    if cell_eoat_id:
+        config['cell_eoat_id'] = cell_eoat_id
 
     # Pallet programs: bake the spoken grid into config.pallet so the
     # executor's move_to_pallet expansion (which reads

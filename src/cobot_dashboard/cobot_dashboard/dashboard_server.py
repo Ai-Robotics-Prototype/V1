@@ -3432,6 +3432,77 @@ def _check_program_tool_io(program: dict):
         }
     return None
 
+
+# Audit #3 (2026-10-09): mirror the EOAT gap check for fixtures.
+# When a program references a fixture that no longer exists in the
+# cell OR exists but has no actuation port for its declared power
+# mode, the save/run flow refuses with a NAMED fixture reason.
+#
+# Programs reference fixtures three ways:
+#   1. config.cell_fixture_ids: [...] — declared bindings (frontend
+#      source: cellActions.js:312)
+#   2. step.cell_binding.fixture_id — per-step binding stamped by
+#      the frontend's named-action compiler (cellActions.js:195 etc.)
+#   3. legacy set_io steps with no cell_binding — not caught here
+#      (there's no fixture id to resolve); the operator's io_map
+#      remains authoritative for those.
+def _check_program_fixture_bindings(program: dict):
+    """Return the first fixture-binding gap finding, or None when every
+    bound fixture resolves on the current cell. Mirror of the EOAT
+    gap check — same shape so the dashboard-server error branch can
+    treat both uniformly.
+    """
+    cfg = (program or {}).get('config') or {}
+    steps = (program or {}).get('steps') or []
+    declared_ids = []
+    for fid in (cfg.get('cell_fixture_ids') or []):
+        if isinstance(fid, str) and fid:
+            declared_ids.append(fid)
+    step_ids = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        cb = s.get('cell_binding') or {}
+        fid = cb.get('fixture_id')
+        if isinstance(fid, str) and fid:
+            step_ids.append(fid)
+    all_ids = list(dict.fromkeys(declared_ids + step_ids))  # ordered uniq
+    if not all_ids:
+        return None
+    try:
+        from .cell_resolver import load_cell, resolve_fixture
+    except Exception:
+        return None
+    try:
+        cell = load_cell()
+    except Exception:
+        return None
+    fixtures = (cell or {}).get('fixtures') or []
+    for fid in all_ids:
+        entry = next((f for f in fixtures if f.get('id') == fid), None)
+        if entry is None:
+            return {
+                'fixture_id':   fid,
+                'fixture_name': None,
+                'reason':       'bound fixture not found in cell',
+            }
+        resolved = resolve_fixture(cell, fid)
+        if resolved is None:
+            name = entry.get('name') or 'this fixture'
+            power_mode = str(entry.get('power_mode') or '').lower()
+            if power_mode == 'air':
+                reason = 'no valve assigned'
+            elif power_mode == 'own_controller':
+                reason = 'no start-signal output assigned'
+            else:
+                reason = 'no power mode selected'
+            return {
+                'fixture_id':   fid,
+                'fixture_name': name,
+                'reason':       reason,
+            }
+    return None
+
 def _joint_recorder_snapshot():
     """Snapshot provider passed into JointRecorder. Reads STATE under
     _state_lock, returns None when joints haven't been published yet
@@ -8326,17 +8397,68 @@ if FASTAPI_AVAILABLE:
             _tool_io_gap = None
         if _tool_io_gap:
             name = _tool_io_gap.get('eoat_name') or 'the selected tool'
-            return JSONResponse({
-                "ok": False,
-                "error": (
+            reason = _tool_io_gap.get('reason') or 'no valve assigned'
+            # Audit #4 (error honesty, 2026-10-09): the two distinct
+            # reasons ("no valve assigned" vs "bound EOAT not found in
+            # cell") deserve distinct operator-actionable messages.
+            # Both route to the same kind so the frontend branch is
+            # one; the sentence names the actual gap.
+            if reason == 'bound EOAT not found in cell':
+                sentence = (
+                    f'{name} is no longer set up — the EOAT this '
+                    f'program was bound to has been removed. Pick a '
+                    f'current tool in the Program Editor, or re-create '
+                    f'the tool in EOAT Setup.')
+            else:
+                sentence = (
                     f'{name} has no valve assigned — finish its setup '
                     f'in EOAT Setup before running. (This is a tool '
-                    f'setup gap, not a teaching gap.)'),
+                    f'setup gap, not a teaching gap.)')
+            return JSONResponse({
+                "ok": False,
+                "error": sentence,
                 "outcome": {
                     "kind": "tool_io_unassigned",
                     "eoat_id":   _tool_io_gap.get('eoat_id'),
                     "eoat_name": _tool_io_gap.get('eoat_name'),
-                    "reason":    _tool_io_gap.get('reason'),
+                    "reason":    reason,
+                },
+                "program_id": prog_id,
+            }, status_code=400)
+        # Audit #3 companion (2026-10-09): fixture bind-by-id run gate.
+        # Mirror the EOAT branch above — refuse on any unresolved
+        # fixture binding before codegen. Named reason (fixture name
+        # + what's missing) replaces the pre-fix "position not taught"
+        # misclassification that fired when codegen produced empty
+        # fixture-IO blocks.
+        try:
+            _fix_gap = _check_program_fixture_bindings(program)
+        except Exception as _fe:
+            print(f'[run] WARN fixture-binding check raised: {_fe}',
+                  flush=True)
+            _fix_gap = None
+        if _fix_gap:
+            fname = _fix_gap.get('fixture_name') or 'the referenced fixture'
+            freason = _fix_gap.get('reason') or 'no actuation assigned'
+            if freason == 'bound fixture not found in cell':
+                sentence = (
+                    f'{fname} is no longer set up — the fixture this '
+                    f'program was bound to has been removed. Re-open '
+                    f'External Fixtures setup to re-create it, or '
+                    f'remove the fixture steps from the program.')
+            else:
+                sentence = (
+                    f'{fname} has {freason} — finish its setup in '
+                    f'External Fixtures before running. (This is a '
+                    f'fixture setup gap, not a teaching gap.)')
+            return JSONResponse({
+                "ok": False,
+                "error": sentence,
+                "outcome": {
+                    "kind": "fixture_io_unassigned",
+                    "fixture_id":   _fix_gap.get('fixture_id'),
+                    "fixture_name": _fix_gap.get('fixture_name'),
+                    "reason":       freason,
                 },
                 "program_id": prog_id,
             }, status_code=400)
@@ -10928,6 +11050,22 @@ if FASTAPI_AVAILABLE:
             return JSONResponse(
                 {'ok': False, 'reason_code': 'invalid_body',
                  'detail': 'name is required'}, status_code=400)
+        # Audit #5 (2026-10-09): refuse at the SOURCE — a tool with
+        # no actuator valve cannot be run as a tool. Letting it
+        # persist meant a program binding resolved to no port at
+        # codegen time, which then surfaced downstream as
+        # "position not taught" / raw semantic-roundtrip jargon. The
+        # resolver's definition of "valve assigned" is the authority;
+        # the save endpoint and the run-time resolver agree.
+        from .cell_resolver import eoat_body_has_valve
+        if not eoat_body_has_valve(body):
+            return JSONResponse(
+                {'ok': False, 'reason_code': 'no_valve_assigned',
+                 'detail': (
+                     "This tool has no valve assigned — finish EOAT "
+                     "Setup (pick the valve the tool is wired to) "
+                     "before saving.")},
+                status_code=422)
         with _CELL_LOCK:
             cell = _read_cell()
             eid = body.get('id') or _cell_stable_id('eoat')
@@ -10996,6 +11134,35 @@ if FASTAPI_AVAILABLE:
             return JSONResponse(
                 {'ok': False, 'reason_code': 'invalid_body',
                  'detail': 'name is required'}, status_code=400)
+        # Audit #3 companion (2026-10-09): mirror the EOAT fail-at-
+        # source. A fixture whose declared power_mode has no port
+        # assigned can't be driven; refuse now rather than let a
+        # program bind to it and refuse later as "position not taught".
+        # Manual-mode fixtures (operator-wait only) pass.
+        from .cell_resolver import fixture_body_has_actuation
+        if not fixture_body_has_actuation(body):
+            power_mode = str(body.get('power_mode') or '').lower()
+            if power_mode == 'air':
+                missing = 'valve'
+                nudge = (
+                    "pick the valve this fixture is wired to in "
+                    "External Fixtures setup")
+            elif power_mode == 'own_controller':
+                missing = 'start-signal output'
+                nudge = (
+                    "pick the output wired to the fixture's start-"
+                    "signal line in External Fixtures setup")
+            else:
+                missing = 'power mode'
+                nudge = (
+                    "pick a power mode (air / own-controller / "
+                    "manual) in External Fixtures setup")
+            return JSONResponse(
+                {'ok': False, 'reason_code': 'no_actuation_assigned',
+                 'detail': (
+                     f"This fixture has no {missing} assigned — "
+                     f"{nudge} before saving.")},
+                status_code=422)
         with _CELL_LOCK:
             cell = _read_cell()
             fid = body.get('id') or _cell_stable_id('fx')
