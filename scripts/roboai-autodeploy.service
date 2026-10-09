@@ -1,0 +1,31 @@
+# roboai-autodeploy.service — the service the path unit triggers.
+#
+# One-shot (not long-running). Invokes scripts/autodeploy_wrapper.sh
+# which polls for idle before running scripts/deploy.sh. Logs to
+# /opt/cobot/deploy_log.jsonl (see wrapper for the JSON shape).
+#
+# `TimeoutStartSec=infinity` because a legitimate deploy can wait
+# arbitrarily long for the arm to go idle. `Restart=no` because a
+# path-triggered service must not restart itself on failure — the
+# next commit is what restarts the flow.
+
+[Unit]
+Description=RoboAi auto-deploy runner (path-triggered)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=teddy
+Group=teddy
+WorkingDirectory=/home/teddy/cobot_ws
+ExecStart=/home/teddy/cobot_ws/scripts/autodeploy_wrapper.sh
+# Idle-wait can be long — never time out.
+TimeoutStartSec=infinity
+# Path-triggered: don't self-restart on failure. Every new commit
+# is what re-fires the flow.
+Restart=no
+# The wrapper writes /opt/cobot/deploy_log.jsonl; ensure the dir
+# exists + is writable by teddy.
+StandardOutput=journal
+StandardError=journal

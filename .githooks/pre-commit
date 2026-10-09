@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — Fork Registry gate at commit time (§465 fork-1
+# lesson, 2026-08-04).
+#
+# Runs tools/fork_lint.py before every commit. A hit blocks the commit
+# with a named message pointing at the canonical owner. Install once
+# with scripts/install_git_hooks.sh; the hook is tracked in the repo
+# so all clones share it.
+#
+# Skip the check on merge/rebase/cherry-pick — those aren't authoring
+# events. Skip on --no-verify (git's built-in — respected here because
+# the deploy watcher IS the second gate; --no-verify does not defeat
+# the deploy-time refusal, only the local one).
+
+set -eu
+
+# Merge / rebase / cherry-pick: git sets one of these envs.
+if [[ -n "${GIT_REBASE_HEAD:-}" ]] || [[ -f "$(git rev-parse --git-dir)/MERGE_HEAD" ]]; then
+    exit 0
+fi
+
+WS="$(git rev-parse --show-toplevel)"
+if [[ ! -x "$WS/tools/fork_lint.py" ]] && [[ ! -f "$WS/tools/fork_lint.py" ]]; then
+    # Fork registry not present in this branch — do not block.
+    exit 0
+fi
+
+if ! python3 "$WS/tools/fork_lint.py"; then
+    printf '\n\033[31m═══ pre-commit refused: fork_lint hit ═══\033[0m\n'
+    printf '  A capability registered in tools/fork_registry.yaml has\n'
+    printf '  been duplicated. Route through the canonical owner OR\n'
+    printf '  add a known_debt entry in the same commit.\n'
+    printf '\n'
+    printf '  Bypass (last resort): git commit --no-verify\n'
+    printf '  (the deploy-time gate will still refuse the deploy).\n'
+    exit 1
+fi
+exit 0
