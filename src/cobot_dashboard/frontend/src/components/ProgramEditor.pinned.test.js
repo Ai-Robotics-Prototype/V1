@@ -211,3 +211,46 @@ test('data attributes name the state as "tracking" (not "inheriting")', () => {
   assert.doesNotMatch(source, /data-inheriting=/,
     'the previous data-inheriting attribute must not resurface')
 })
+
+// ─────────────────────────────────────────────────────────────
+// Record-position confirm — shared surface (2026-10-09)
+// ─────────────────────────────────────────────────────────────
+
+test('ProgramEditor imports the shared RecordConfirmModal (no fork)', () => {
+  // The inline RecordConfirmModal was retired 2026-10-09; all teach
+  // surfaces must consume the shared component from
+  // ./RecordConfirmModal.jsx so a copy change lands in one place.
+  assert.match(source,
+    /import\s+RecordConfirmModal\s+from\s+['"]\.\/RecordConfirmModal['"]/,
+    'ProgramEditor must import the shared RecordConfirmModal '
+    + '(no inline fork)')
+  // The old inline definition must not resurface.
+  assert.doesNotMatch(source, /function\s+RecordConfirmModal\s*\(/,
+    'the inline RecordConfirmModal function must not be redeclared '
+    + 'inside ProgramEditor.jsx — the shared component is canonical')
+  // The retired "Confirm capture" header + explanatory sentence
+  // must not reappear elsewhere in the editor source.
+  assert.doesNotMatch(source, /Confirm capture/i,
+    '"Confirm capture" header is retired (operator directive 2026-10-09)')
+  assert.doesNotMatch(source, /pose shown below is the arm/i,
+    'explanatory paragraph is retired (operator directive 2026-10-09)')
+})
+
+test('record capture path untouched: doRecord → onRecord chain intact', () => {
+  // The simplification of the confirm modal must NOT alter which
+  // bytes land in the step. Pin that doRecord still awaits
+  // onRecord() (the parent-supplied callback that routes to
+  // teachOverlayRecord's /api/state re-read).
+  assert.match(source,
+    /async function doRecord\(\)\s*\{[\s\S]{0,400}?await onRecord\(\)/,
+    'doRecord must still await the parent-supplied onRecord '
+    + 'callback — this is the capture path, and the modal change '
+    + 'must not touch it')
+  // Mount site: RecordConfirmModal's onConfirm is doRecord(), its
+  // onCancel is setConfirming(false). No pose-mutating logic lives
+  // in these two closures.
+  assert.match(source,
+    /<RecordConfirmModal[\s\S]{0,200}?onConfirm=\{\(\)\s*=>\s*\{\s*setConfirming\(false\);\s*doRecord\(\)\s*\}\}/,
+    'the modal onConfirm must only fire doRecord() — no additional '
+    + 'pose transformation')
+})

@@ -1022,7 +1022,7 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 7018
+        line: 6905
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
@@ -1075,12 +1075,15 @@ capabilities:
           2026-10-09: 6998 → 7018 (comment-stripped, source 7215)
           when the per-step smoothing "Inherit (…)" label removal
           landed — added the ✕ clear-override button + OVERRIDE
-          chip test-ids + reworded tracking tooltip. fork_lint
-          strips comments before counting; see tools/fork_lint.py
-          _strip_comments.)
+          chip test-ids + reworded tracking tooltip;
+          2026-10-09: 7018 → 6905 (comment-stripped) when the
+          inline RecordConfirmModal was extracted to its own
+          component file (./RecordConfirmModal.jsx) and this file
+          shrank by ~113 lines. fork_lint strips comments before
+          counting; see tools/fork_lint.py _strip_comments.)
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 7060
+        line: 6947
         why: >
           disabledReason string for the single/all-step teach overlay's
           Record button title tooltip. Same rationale as the line
@@ -1116,7 +1119,11 @@ capabilities:
           → 7060 (comment-stripped — source is 7258; 2026-10-09
           per-step smoothing "Inherit (…)" label removal + ✕
           clear-override button + OVERRIDE chip test-ids shifted
-          this site by +20, matching the delta on the first entry).
+          this site by +20, matching the delta on the first entry)
+          → 6947 (comment-stripped — 2026-10-09 inline
+          RecordConfirmModal extraction to ./RecordConfirmModal.jsx
+          removed ~113 lines; this site shifted by -113, matching
+          the delta on the first entry).
         owner: dashboard-frontend
 
   # 22. Page-context persistence (2026-08-05 refresh-loss P0).

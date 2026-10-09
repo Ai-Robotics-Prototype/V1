@@ -6,6 +6,7 @@ import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
 import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 import TeachLockBanner from './TeachLockBanner'
+import RecordConfirmModal from './RecordConfirmModal'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import EOATSetupWizard from './EOATSetupWizard'
@@ -2854,127 +2855,14 @@ function OverlayPadCenter({ label, width = 140, height = 140 }) {
 }
 
 // ────────────────────────────────────────────────────────
-// RecordConfirmModal — confirms the current live pose before it's
-// written into the step. The modal displays a live preview of the
-// robot's pose (joints degrees + tcp) — the store's `joints` slice
-// streams from /ws so the display refreshes as the arm moves; tcp
-// polls /api/state at 500 ms cadence.
-//
-// The actual capture happens in teachOverlayRecord which re-reads
-// /api/state at click time — so the pose the modal shows and the
-// pose that lands in the step are the same value ± sub-second
-// WS/HTTP lag. If the operator jogs while the dialog is open the
-// preview updates; when they hit Record the CURRENT live pose is
-// captured (not whatever was live at the moment the dialog opened).
-//
-// Overlay + card styling mirrors PositionReuseModal so the drawer
-// stays visually consistent with the rest of the app's confirms.
+// RecordConfirmModal — the single shared "Record position?" confirm
+// used by every teach surface. Extracted 2026-10-09 to
+// `./RecordConfirmModal.jsx` so the editor's TeachOverlay, the
+// wizard's teach step, and any future record surface read from the
+// same copy + the same collapsed-by-default details expander. The
+// capture path (doRecord → onRecord → teachOverlayRecord) is
+// untouched; the modal only decides whether `onConfirm` fires.
 // ────────────────────────────────────────────────────────
-function RecordConfirmModal({ stepLabel, onConfirm, onCancel }) {
-  const jointsRad = useStore((s) => s.joints?.positions) || [0, 0, 0, 0, 0, 0]
-  const jointsDeg = radiansToJointDegrees(jointsRad)
-  const [tcp, setTcp] = useState(null)
-  useEffect(() => {
-    let alive = true
-    const poll = async () => {
-      try {
-        const res = await fetch('/api/state')
-        if (!res.ok) return
-        const d = await res.json()
-        if (alive && Array.isArray(d?.tcp_pose)) setTcp(d.tcp_pose)
-      } catch { /* nop */ }
-    }
-    poll()
-    const id = setInterval(poll, 500)
-    return () => { alive = false; clearInterval(id) }
-  }, [])
-  const jointsLine = jointsDeg.slice(0, 6)
-    .map((v, i) => `J${i + 1}:${Number(v).toFixed(2)}`).join('  ')
-  const tcpKeys = ['x', 'y', 'z', 'rx', 'ry', 'rz']
-  const tcpLine = Array.isArray(tcp)
-    ? tcp.slice(0, 6).map((v, i) => `${tcpKeys[i]}:${Number(v).toFixed(3)}`).join('  ')
-    : null
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      style={{
-        position: 'fixed', inset: 0, zIndex: 4000,
-        background: 'rgba(15, 23, 42, 0.55)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        padding: 24,
-      }}
-      onClick={onCancel}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: '#fff', color: '#111827',
-          borderRadius: 12, width: '100%', maxWidth: 560,
-          boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
-          overflow: 'hidden',
-        }}
-      >
-        <div style={{
-          padding: '16px 20px 8px 20px',
-          borderBottom: '1px solid #E5E7EB',
-        }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: '#6B7280',
-                        textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-            Confirm capture
-          </div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827',
-                        marginTop: 4 }}>
-            Record this position?
-          </div>
-          <div style={{ fontSize: 13, color: '#6B7280', marginTop: 6, lineHeight: 1.4 }}>
-            Step: <span style={{ color: '#111827', fontWeight: 600 }}>{stepLabel}</span>.
-            The pose shown below is the arm's live position — it updates as the
-            arm moves. Pressing Record captures the CURRENT live pose.
-          </div>
-        </div>
-        <div style={{ padding: '14px 20px' }}>
-          <div style={{
-            fontFamily: 'monospace', fontSize: 12, color: '#374151',
-            background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6,
-            padding: '10px 12px', lineHeight: 1.6, whiteSpace: 'pre-wrap',
-          }}>
-            joints: {jointsLine}
-            {'\n'}
-            tcp:    {tcpLine || '(awaiting live tcp…)'}
-          </div>
-        </div>
-        <div style={{
-          padding: '10px 20px 16px 20px',
-          display: 'flex', gap: 10, justifyContent: 'flex-end',
-        }}>
-          <button
-            onClick={onCancel}
-            style={{
-              minHeight: 44, padding: '0 16px',
-              background: 'transparent', color: '#6B7280',
-              border: '1px solid #E5E7EB', borderRadius: 8,
-              fontSize: 14, fontWeight: 600, cursor: 'pointer',
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            style={{
-              minHeight: 44, padding: '0 22px',
-              background: '#16A34A', color: '#fff',
-              border: 'none', borderRadius: 8,
-              fontSize: 14, fontWeight: 700, cursor: 'pointer',
-            }}
-          >
-            Record
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
 
 // TeachOverlayDebugHUD (innerH/clientH/vv/drawer scrollH-clientH readout)
 // removed 2026-08-05 per operator request — the tablet-drawer layout
@@ -3680,7 +3568,6 @@ function TeachOverlay({
 
       {confirming && (
         <RecordConfirmModal
-          stepLabel={stepLabel}
           onConfirm={() => { setConfirming(false); doRecord() }}
           onCancel={()  => { setConfirming(false) }}
         />
