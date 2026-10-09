@@ -4627,10 +4627,18 @@ def codegen_lua_from_program(
                               f'(read only; add `expect`+`timeout_ms` to block)')
             continue
 
-        # Verb selection: move_linear → movL, everything else that
-        # reaches here (move_home / move_joint / approach / etc.) →
-        # movJ. Matches program_executor_node.tick semantics.
-        verb = 'movL' if str(action).lower() == 'move_linear' else 'movJ'
+        # Verb selection: move_linear + waypoint → movL (operator
+        # thinks in Cartesian when path-shaping around obstacles),
+        # everything else that reaches here (move_home / move_joint /
+        # approach / etc.) → movJ. Matches program_executor_node.tick
+        # semantics. 2026-10-09: waypoint added — a taught intermediate
+        # the arm flies through under the per-step smoothing policy,
+        # not a stop point. The classifier (step_forces_stop) still
+        # wins for waypoints that precede a gripper / vacuum / wait /
+        # set_io, so IO transitions never happen mid-blend.
+        verb = ('movL'
+                if str(action).lower() in ('move_linear', 'waypoint')
+                else 'movJ')
         # 2026-07-31 §3 STANDARD profile override: column steps
         # (approach-above / contact / retreat-above of a station) →
         # movL orientation-locked; transit steps (between stations,

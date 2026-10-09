@@ -680,3 +680,41 @@ test('resolveEffectiveSmoothing: unknown value falls back to program', () => {
       { action: 'move_linear', smoothing: 'bogus' }, 'high'),
     'high')
 })
+
+// ─────────────────────────────────────────────────────────────
+// Waypoint step (2026-10-09)
+// ─────────────────────────────────────────────────────────────
+
+test('TEACHABLE_ACTIONS includes waypoint', () => {
+  assert.ok(TEACHABLE_ACTIONS.has('waypoint'),
+    'waypoint must be in TEACHABLE_ACTIONS — the operator teaches '
+    + 'the via-point like any other taught pose (the task directive '
+    + 'requires reuse of the shared teach flow, no fork)')
+})
+
+test('MOTION_SMOOTHING_ACTIONS includes waypoint', () => {
+  assert.ok(MOTION_SMOOTHING_ACTIONS.has('waypoint'),
+    'waypoint rows must expose the per-step smoothing control — '
+    + 'fly-through blend is its whole semantic')
+})
+
+test('isTeachable: a waypoint with no pose is teachable (operator must teach it)', () => {
+  const prog = { steps: [{ id: 1, action: 'waypoint' }] }
+  assert.equal(isTeachable(prog.steps[0], prog), true)
+})
+
+test('isTeachable: a waypoint linked to another step is NOT teachable (shares pose)', () => {
+  const prog = { steps: [
+    { id: 1, action: 'move_linear',
+      taught_joints: [1,2,3,4,5,6], taught: true },
+    { id: 2, action: 'waypoint', position_ref: 1 },
+  ]}
+  assert.equal(isTeachable(prog.steps[1], prog), false)
+})
+
+test('NON_MOTION_ACTIONS does NOT include waypoint', () => {
+  assert.equal(NON_MOTION_ACTIONS.has('waypoint'), false,
+    'waypoint is a MOTION step — mislabelling it non-motion would '
+    + 'skip the pose-check scan and surface a false "all taught" '
+    + 'under an untaught waypoint')
+})

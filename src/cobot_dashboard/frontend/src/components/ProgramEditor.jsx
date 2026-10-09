@@ -54,6 +54,7 @@ const ACTION_TYPES = [
   { value: 'close_gripper',      label: 'Close Gripper',    type: 'gripper', tag: 'GRIPPER', fields: ['force_pct', 'io_close', 'io_close_confirm'] },
   { value: 'move_joint',         label: 'Move Joint',       type: 'move',    tag: 'MOVE',    fields: ['joints'] },
   { value: 'move_linear',        label: 'Move Linear',      type: 'move',    tag: 'MOVE',    fields: ['position', 'offset_z_mm', 'speed_pct'] },
+  { value: 'waypoint',           label: 'Waypoint',         type: 'move',    tag: 'WAYPOINT',fields: ['position', 'speed_pct'] },
   { value: 'approach',           label: 'Approach Object',  type: 'move',    tag: 'MOVE',    fields: ['target', 'offset_z_mm'] },
   { value: 'pick',               label: 'Pick and Close',   type: 'gripper', tag: 'PICK',    fields: ['descend_mm'] },
   { value: 'place',              label: 'Place at Target',  type: 'move',    tag: 'PLACE',   fields: ['position'] },
@@ -75,6 +76,9 @@ const TAG_COLORS = {
   HOME: '#6366f1', GRIPPER: '#f59e0b', MOVE: '#2563EB', PICK: '#16A34A',
   PLACE: '#0891b2', WAIT: '#6b7280', DETECT: '#8b5cf6', LOOP: '#ec4899',
   IO: '#f97316', SCAN: '#9333EA', PALLET: '#0f766e',
+  // Waypoint — distinct teal so an operator path-shaping sequence
+  // reads at a glance against surrounding MOVE/PICK/PLACE rows.
+  WAYPOINT: '#0d9488',
 }
 
 // LoadProgramsPanel — the "Load" dropdown for the Program editor.
@@ -2251,6 +2255,15 @@ const STEP_CATEGORIES = [
       { action: 'move_home',   label: 'Move Home',    desc: 'Move robot to home position' },
       { action: 'move_joint',  label: 'Move Joint',   desc: 'Move to a joint position' },
       { action: 'move_linear', label: 'Move Linear',  desc: 'Move in a straight line' },
+      // Manual path shaping — the operator teaches a via-point and
+      // the arm flies through it with blend. Copy is deliberate: the
+      // software does NOT auto-detect obstacles or auto-plan around
+      // them (that is collision-aware planning — out of scope). Use
+      // this to steer the path, not to delegate the choice.
+      { action: 'waypoint',    label: 'Waypoint',
+        desc: 'Add a waypoint the robot passes through — use it to '
+            + 'guide the path around obstacles. Manual routing: you '
+            + 'teach the via-point; the arm does not auto-detect.' },
       { action: 'approach',    label: 'Approach',     desc: 'Move above a target position' },
     ],
   },
@@ -2302,6 +2315,7 @@ function freshStepForAction(action, programCfg = null) {
     case 'close_gripper': return { ...base, force_pct: 50 }
     case 'move_joint':    return { ...base, joints: [0, -90, 0, -90, 0, 0] }
     case 'move_linear':   return { ...base, position: [0.3, -0.2, 0.4], speed_pct: 50 }
+    case 'waypoint':      return { ...base, position: [0.3, -0.2, 0.4], speed_pct: 50 }
     case 'approach':      return { ...base, target: 'auto', offset_z_mm: 150 }
     case 'pick':          return { ...base, descend_mm: 130 }
     case 'place':         return { ...base, position: [0.3, -0.2, 0.4] }
@@ -6507,6 +6521,7 @@ export default function ProgramEditor() {
                     step.action === 'move_home'   ? 'movJ'
                   : step.action === 'move_joint'  ? 'movJ'
                   : step.action === 'move_linear' ? 'movL'
+                  : step.action === 'waypoint'    ? 'movL'
                   : step.action === 'approach'    ? 'movL'
                   : step.action === 'pick'        ? 'movL'
                   : step.action === 'place'       ? 'movL'

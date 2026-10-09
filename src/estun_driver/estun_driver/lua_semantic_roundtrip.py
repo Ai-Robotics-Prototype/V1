@@ -71,6 +71,14 @@ _ACTION_TO_LEGAL_VERBS = {
     "move_linear":       {"movJ", "movL", "movJCoorRel", "movLCoorRel"},
     "move_arc":          {"movC"},
     "move_to_pallet":    {"movJ", "movL", "movJCoorRel"},
+    # 2026-10-09 waypoint step — operator-taught intermediate pose
+    # the arm passes THROUGH (fly-through with blend) en route to
+    # the next pose. Codegen emits movL(pN, {v=…, b=…}) on the
+    # taught joints; the lookahead classifier still forces a fine
+    # stop at a waypoint whose next step is a gripper / vacuum /
+    # wait / set_io, so a chain like move → waypoint → pick → set_io
+    # stops cleanly at the pick (the waypoint stays blended).
+    "waypoint":          {"movJ", "movL"},
     # IO
     "set_io":            {"setDO", "setAO"},
     # Timing

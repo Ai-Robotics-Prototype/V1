@@ -89,3 +89,62 @@ test('editor save round-trips routines[] so the backend can persist the fold sha
   assert.ok(/payload\.routines\s*=\s*currentProgram\.routines/.test(source),
     'handleSave must send routines[] to the backend')
 })
+
+// ─────────────────────────────────────────────────────────────
+// Waypoint step (2026-10-09) — Add Step vocabulary + copy pins
+// ─────────────────────────────────────────────────────────────
+
+test('ACTION_TYPES carries a waypoint entry tagged WAYPOINT', () => {
+  assert.ok(
+    /value:\s*'waypoint',\s*label:\s*'Waypoint'[^,]*,\s*type:\s*'move'[^,]*,\s*tag:\s*'WAYPOINT'/
+    .test(source),
+    'ACTION_TYPES must register waypoint (value=waypoint, label=Waypoint, type=move, tag=WAYPOINT) so '
+    + 'the inline editor + verb-divergence chip + detail line all find it')
+})
+
+test('STEP_CATEGORIES exposes waypoint under the Motion category', () => {
+  assert.ok(
+    /action:\s*'waypoint',\s*label:\s*'Waypoint'/.test(source),
+    'STEP_CATEGORIES Motion group must list waypoint so operators '
+    + 'can add it from the Add Step tab')
+})
+
+test('Add Step copy frames waypoint as MANUAL routing, not auto-avoidance', () => {
+  // The operator order is explicit: NEVER suggest the arm plans
+  // around obstacles automatically — this is a path-shaping tool.
+  // The description string spans multiple concatenated literals;
+  // grab the WHOLE entry up to its closing brace.
+  const addStepCopy = source.match(
+    /action:\s*'waypoint'[\s\S]{0,800}?\}\s*,/)
+  assert.ok(addStepCopy, 'could not locate waypoint STEP_CATEGORIES entry')
+  const desc = addStepCopy[0]
+  assert.match(desc, /guide the path around obstacles/,
+    'copy must name manual guidance, not avoidance')
+  assert.match(desc, /Manual routing/i,
+    'copy must say "Manual routing" so operators do not expect '
+    + 'auto-detection')
+  assert.doesNotMatch(desc, /avoid(s|ance)?\b/i,
+    'copy MUST NOT say "avoids" / "avoidance" — the software does '
+    + 'not auto-detect obstacles (that is collision-aware planning, '
+    + 'out of scope)')
+  assert.doesNotMatch(desc, /\bautomatic(ally)?\b/i,
+    'copy MUST NOT suggest automation — the operator teaches the via')
+})
+
+test('freshStepForAction waypoint carries sane position defaults', () => {
+  assert.ok(
+    /case\s*'waypoint':\s*return\s*{\s*\.\.\.base,\s*position:/.test(source),
+    'freshStepForAction must give waypoint a position seed so the '
+    + 'inline editor renders the pose fields before the operator teaches')
+})
+
+test('WAYPOINT tag has a distinct color in TAG_COLORS', () => {
+  assert.match(source, /TAG_COLORS\s*=\s*{[\s\S]*?WAYPOINT:\s*'#[0-9a-fA-F]{3,8}'/,
+    'WAYPOINT entry in TAG_COLORS makes the row chip readable')
+})
+
+test('verb-divergence chip knows waypoint implies movL', () => {
+  assert.match(source, /step\.action\s*===\s*'waypoint'\s*\?\s*'movL'/,
+    'when codegen emits anything other than movL for a waypoint, '
+    + 'the chip must surface the divergence (D3 doctrine)')
+})

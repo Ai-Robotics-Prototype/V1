@@ -62,6 +62,12 @@ export const NON_MOTION_ACTIONS = new Set([
 export const TEACHABLE_ACTIONS = new Set([
   'move_home', 'move_joint', 'move_linear',
   'approach',  'pick',       'place',
+  // 2026-10-09 waypoint — operator-taught intermediate pose the
+  // arm passes THROUGH to shape the Cartesian path around a
+  // fixture / column / obstacle. Not auto-avoidance: the software
+  // does not detect obstacles; the operator teaches the via-point
+  // and the arm follows that path.
+  'waypoint',
 ])
 
 // Actions that EMIT a corner-smoothing (blend) emission at codegen.
@@ -76,6 +82,10 @@ export const MOTION_SMOOTHING_ACTIONS = new Set([
   'move_home', 'move_joint', 'move_linear',
   'approach',  'pick',       'place',
   'move_to_pallet',
+  // Waypoints are motion steps whose whole point is "fly through
+  // with blend" — the per-step smoothing dropdown on their row is
+  // the operator's primary tuning surface for the pass through.
+  'waypoint',
 ])
 
 // Operator-facing smoothing levels. The backend's authoritative
