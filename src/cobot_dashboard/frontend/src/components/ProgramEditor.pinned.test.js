@@ -292,3 +292,40 @@ test('record capture path untouched: doRecord → onRecord chain intact', () => 
     'the modal onConfirm must only fire doRecord() — no additional '
     + 'pose transformation')
 })
+
+// ─────────────────────────────────────────────────────────────
+// Payload truth line — info severity + plain language (2026-10-09)
+// ─────────────────────────────────────────────────────────────
+
+test('payload truth-line palette split by severity (info is NOT amber)', () => {
+  // 2026-10-09 operator directive: the pre-change code treated
+  // every non-match state as amber, which made the permanently-
+  // unreadable state (this controller doesn't expose its live
+  // payload setting) show as a yellow alarm on every program. The
+  // split: ok=green, info=muted slate, warning=amber.
+  const block = source.match(
+    /data-testid=['"]payload-truth['"][\s\S]{0,2000}?<\/div>/)
+  assert.ok(block, 'could not locate the payload-truth block')
+  assert.match(block[0], /truth\.severity/,
+    'the palette must branch on truth.severity, not truth.state alone')
+  // Info palette uses muted slate (#F1F5F9 bg, #CBD5E1 border,
+  // #334155 fg) — explicitly NOT the amber warning palette.
+  assert.match(source,
+    /truth\.severity === ['"]info['"][\s\S]{0,200}?#F1F5F9/,
+    'info severity must use the muted slate background (#F1F5F9)')
+  assert.match(source,
+    /data-severity=\{truth\.severity\}/,
+    'the control must expose data-severity so analytics / debug '
+    + 'tools can tell the three palettes apart')
+})
+
+test('payload truth-line tooltip surfaces the technical detail', () => {
+  // The operator-facing message is plain language; the longer
+  // technical explanation hides in the hover tooltip so anyone who
+  // wants to understand WHY the dashboard can't verify can read it
+  // without the main copy becoming jargon-heavy.
+  assert.match(source,
+    /data-testid=['"]payload-truth['"][\s\S]{0,500}?title=\{truth\.detail\}/,
+    'the payload-truth block must set title={truth.detail} so the '
+    + 'tooltip carries the technical "why" explanation')
+})

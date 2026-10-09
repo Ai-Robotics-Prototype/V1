@@ -3708,19 +3708,35 @@ function ToolAndPayloadSection({
       </div>
       {expanded && (
         <div style={bodyStyle}>
-          {/* Truth line — live program-vs-controller comparison.
-              Green when they match, amber when they don't OR when
-              we can't read the controller (never implies sync that
-              doesn't exist). Replaces the retired "info only"
-              banner. */}
+          {/* Truth line — program-vs-robot tool-weight comparison.
+              Three severities feed three palettes:
+                * ok      → green (match)
+                * info    → muted slate (unreadable; the FYI case —
+                            this controller doesn't expose its live
+                            payload setting, so the dashboard tells
+                            the operator to confirm it on the pendant
+                            and moves on. Not an alarm.)
+                * warning → amber (unset / mismatch — real action
+                            needed before run)
+              2026-10-09 operator directive: the pre-change code
+              treated anything-not-match as amber, which made the
+              permanently-unreadable state show as a yellow alarm on
+              every program. The severity split keeps alarm colours
+              for genuine problems. */}
           {(() => {
-            const palette = truth.state === 'match'
-              ? { bg: '#ECFDF5', border: '#059669', fg: '#065F46' }
-              : { bg: '#FEF3C7', border: '#F59E0B', fg: '#92400E' }
+            const palette = (
+              truth.severity === 'ok'
+                ? { bg: '#ECFDF5', border: '#059669', fg: '#065F46' }
+              : truth.severity === 'info'
+                ? { bg: '#F1F5F9', border: '#CBD5E1', fg: '#334155' }
+                : { bg: '#FEF3C7', border: '#F59E0B', fg: '#92400E' }
+            )
             return (
               <div
                 data-testid="payload-truth"
                 data-state={truth.state}
+                data-severity={truth.severity}
+                title={truth.detail}
                 style={{
                   padding: '8px 10px',
                   background: palette.bg,

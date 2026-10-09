@@ -142,13 +142,23 @@ test('the retired "Info only" fine-print banner is GONE', () => {
     + 'the copy moved to lib/payloadTruth\'s state-driven messages')
 })
 
-test('truth line severity: green on match, amber otherwise', () => {
+test('truth line severity: green on ok, amber on warning, muted on info', () => {
   // Palette IIFE inside the body decides bg/border/fg from
-  // truth.state === 'match'. Confirm both branches exist.
-  assert.ok(/truth\.state === 'match'/.test(body),
-    'body must branch on truth.state === \'match\'')
-  assert.ok(/#ECFDF5/.test(body),  'green palette present for match state')
-  assert.ok(/#FEF3C7/.test(body),  'amber palette present for non-match states')
+  // truth.severity (reframed 2026-10-09 — see payloadTruth.js). The
+  // three-way split keeps alarm colours for genuine problems and
+  // routes the permanently-unreadable state through a muted info
+  // palette instead of the yellow alarm it rendered pre-fix.
+  assert.ok(
+    /truth\.severity === ['"]ok['"]/.test(body)
+    || /truth\.state === 'match'/.test(body),
+    'body must branch on truth.severity (or legacy truth.state) so '
+    + 'the three palettes are selectable')
+  assert.ok(/#ECFDF5/.test(body),  'green palette present for ok state')
+  assert.ok(/#FEF3C7/.test(body),  'amber palette present for warning states')
+  assert.ok(/#F1F5F9/.test(body),
+    'muted slate palette (#F1F5F9) present for the info severity — '
+    + 'the 2026-10-09 unreadable reframe routes through this palette, '
+    + 'not amber')
 })
 
 

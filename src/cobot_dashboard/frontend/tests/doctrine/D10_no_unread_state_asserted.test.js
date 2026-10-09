@@ -49,10 +49,20 @@ test('D10(a): payloadTruth exposes the "unreadable" state with honest copy', () 
     path.join(FRONTEND_ROOT, 'src', 'lib', 'payloadTruth.js'), 'utf8')
   assert.ok(/state:\s*['"]unreadable['"]/.test(src),
     d10('payloadTruth must expose an explicit unreadable state'))
-  assert.ok(/not readable/.test(src),
-    d10('unreadable copy must use the literal phrase "not readable"'))
+  // 2026-10-09 operator directive reframe: the copy is plain-language
+  // ("can't be read back here"), not the pre-fix "not readable on the
+  // wire" jargon. The post-fix phrase is split across two concatenated
+  // string literals and uses an escaped apostrophe (can\'t). Match on
+  // the distinctive "read back here" tail OR the legacy "not readable"
+  // phrase so a future edit can rephrase without this doctrine blocking.
+  assert.ok(
+    /back here/.test(src)
+    || /not readable/.test(src),
+    d10('unreadable copy must plainly state the dashboard can\'t '
+      + 'read back the robot\'s own setting — in plain operator '
+      + 'language, not jargon'))
   // Bans: no "sync" / "auto-updates" language on the unreadable path.
-  const unreadableBlock = src.match(/state:\s*['"]unreadable['"][\s\S]{0,600}/)
+  const unreadableBlock = src.match(/state:\s*['"]unreadable['"][\s\S]{0,1500}/)
   if (unreadableBlock) {
     assert.equal(/\bsync\b|\bauto[- ]?update/i.test(unreadableBlock[0]), false,
       d10('unreadable copy MUST NOT use "sync" / "auto-update" language — '
