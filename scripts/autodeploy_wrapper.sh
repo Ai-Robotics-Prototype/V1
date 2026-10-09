@@ -106,6 +106,40 @@ if [[ -n "$DIRTY_FILES" && "${ALLOW_DIRTY:-0}" != "1" ]]; then
     exit 2
 fi
 
+# ── Disk-free precondition (2026-10-09 corruption guard) ────────
+# The Jetson's 57 GB eMMC filled to 96 % this week and corrupted a
+# file mid-write. Refuse the deploy BEFORE anything builds into
+# a full disk — vite emits ~500 MB-1 GB of intermediate chunks and
+# deploy.sh writes to /opt/cobot/deploy_log, /tmp/autodeploy_*.log,
+# plus service journals. 3 GiB free is the operator-set floor: it
+# covers one full build + log + headroom, well above the ~1.5 GB
+# tightest-observed working-set during a healthy build.
+# ALLOW_LOW_DISK=1 overrides (matches ALLOW_DIRTY / ALLOW_MOCK
+# pattern) for genuinely emergency deploys that take responsibility
+# for the corruption risk.
+MIN_FREE_BYTES="${AUTODEPLOY_MIN_FREE_BYTES:-$((3 * 1024 * 1024 * 1024))}"
+AVAIL_BYTES=$(df --output=avail -B1 / | tail -1 | tr -d ' ')
+if [[ -z "$AVAIL_BYTES" ]]; then
+    log_entry "fail" step="disk_probe_failed" exit_code="2" \
+        detail="df --output=avail returned empty for /"
+    echo "REFUSED: could not probe free disk space on /" >&2
+    exit 2
+fi
+if (( AVAIL_BYTES < MIN_FREE_BYTES )) && [[ "${ALLOW_LOW_DISK:-0}" != "1" ]]; then
+    avail_gib=$(awk -v b="$AVAIL_BYTES" 'BEGIN{printf "%.2f", b/1024/1024/1024}')
+    min_gib=$(awk -v b="$MIN_FREE_BYTES" 'BEGIN{printf "%.2f", b/1024/1024/1024}')
+    log_entry "fail" \
+        step="disk_insufficient" \
+        exit_code="2" \
+        reason="free disk below ${min_gib} GiB floor; refusing to build into a near-full disk (corruption risk)" \
+        detail="avail=${avail_gib}GiB min=${min_gib}GiB; reclaim via scripts/disk_reclaim.sh or set ALLOW_LOW_DISK=1 to override"
+    echo "REFUSED: free disk on / = ${avail_gib} GiB < ${min_gib} GiB floor." >&2
+    echo "        A build on a near-full disk can corrupt the frontend bundle" >&2
+    echo "        or deploy_log mid-write. Reclaim space, or set" >&2
+    echo "        ALLOW_LOW_DISK=1 if you must deploy despite the risk." >&2
+    exit 2
+fi
+
 waited=0
 while ! is_idle; do
     if (( waited == 0 )); then
