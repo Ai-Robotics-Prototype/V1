@@ -126,7 +126,7 @@ export default function MyCellSection() {
           padding: '10px 12px', background: '#FEE2E2',
           border: '1px solid #FCA5A5', borderRadius: 6,
           color: '#7F1D1D', fontSize: 12,
-        }}>My Cell unavailable: {err}</div>
+        }}>All Tools and Fixtures unavailable: {err}</div>
       </section>
     )
   }
@@ -146,7 +146,7 @@ export default function MyCellSection() {
              }}>
           Nothing set up yet. Open <b>EOAT Setup</b> to register the
           end-of-arm tool, and <b>External Fixtures</b> to register
-          fixtures around the cell. They'll appear here.
+          fixtures around the robot. They'll appear here.
         </div>
       )}
 
@@ -223,12 +223,12 @@ function _Header() {
         letterSpacing: 0.6, textTransform: 'uppercase',
         color: '#111827',
       }}>
-        My Cell
+        All Tools and Fixtures
       </h3>
       <span style={{
         fontSize: 11, color: '#6b7280', letterSpacing: 0.3,
       }}>
-        (the cell at a glance)
+        (every tool and fixture at a glance)
       </span>
     </div>
   )

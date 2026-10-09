@@ -130,7 +130,7 @@ export default function ToolFromCellStep({
 
   const QUESTION = 'Which tool will this program use?'
   const DESCRIPTION = (
-    "Pick from the end-of-arm tools set up in your cell. "
+    "Pick from the end-of-arm tools you've set up. "
     + "The program remembers the choice by id, so if the tool's "
     + 'ports change later, the program follows automatically.'
   )

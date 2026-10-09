@@ -315,7 +315,7 @@ export default function ExternalFixtureWizard({ onClose, initialId = null }) {
                   disabled={busy}
                   onClick={commitSave}
                   style={_btnPrim}>
-                  {busy ? 'Saving…' : 'Save fixture'}
+                  {busy ? 'Saving…' : 'Add Fixture'}
                 </button>
               )}
               {step === 4 && saved && (
@@ -785,8 +785,8 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
                border: '1px solid #6EE7B7', borderRadius: 6,
                color: '#065F46', fontSize: 12,
              }}>
-          Saved — "{saved.name}" is in your fixtures list. Wire the
-          glowing points on the map.
+          "{saved.name}" saved to Fixtures. Wire the glowing points
+          on the map.
         </div>
       )}
       {error && (

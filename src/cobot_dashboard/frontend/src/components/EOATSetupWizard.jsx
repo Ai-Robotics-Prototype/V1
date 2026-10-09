@@ -535,7 +535,7 @@ export default function EOATSetupWizard({
                         opacity: busy ? 0.55 : 1,
                         fontFamily: 'inherit',
                       }}>
-                      {busy ? 'Saving…' : 'All connected — Confirm'}
+                      {busy ? 'Saving…' : 'Add Tool'}
                     </button>
                   </div>
                 )}
@@ -1581,14 +1581,14 @@ function SavedScreen({ entry, onViewInMyCell, onSetupAnother, onDone }) {
         }}>✓</div>
         <div data-testid="hardware-setup-saved-headline"
              style={{ fontSize: 18, fontWeight: 700, color: '#064E3B' }}>
-          "{name}" saved to your cell.
+          "{name}" saved to Tools.
         </div>
       </div>
       <div style={{ color: '#065F46', marginBottom: 14 }}>
         It will appear as a card in the Program Wizard's tool step
         {isOem
-          ? <> and in <b>My Cell</b>.</>
-          : <> and in <b>My Cell</b> on the Synapse tab.</>}
+          ? <> and in <b>All Tools and Fixtures</b>.</>
+          : <> and in <b>All Tools and Fixtures</b> on the Synapse tab.</>}
         {(valves.length > 0 || inputs.length > 0) && (
           <div style={{ marginTop: 6, fontSize: 13, color: '#047857' }}
                data-testid="hardware-setup-saved-ports"
@@ -1605,7 +1605,7 @@ function SavedScreen({ entry, onViewInMyCell, onSetupAnother, onDone }) {
           data-testid="hardware-setup-saved-view"
           style={btnPrim}
           onClick={onViewInMyCell}>
-          View in My Cell →
+          View Tools and Fixtures →
         </button>
         <button
           data-testid="hardware-setup-saved-another"

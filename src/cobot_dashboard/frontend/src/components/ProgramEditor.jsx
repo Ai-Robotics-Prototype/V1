@@ -3809,7 +3809,7 @@ function ToolAndPayloadSection({
               <div style={{ fontSize: 12, color: '#92400E',
                             background: '#FEF3C7', padding: '6px 10px',
                             border: '1px solid #FDE68A', borderRadius: 4 }}>
-                No tools in your cell yet. Click "Set up a new tool"
+                No tools set up yet. Click "Set up a new tool"
                 to register one; this program will stay unbound until
                 you pick it here.
               </div>

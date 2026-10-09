@@ -1045,9 +1045,19 @@ test('save-confirmation screen renders on all three paths (no silent end)', () =
     assert.ok(new RegExp(`data-testid="${tid}"`).test(eoatWizSrc),
       v(`SavedScreen must expose data-testid="${tid}"`))
   }
-  // Headline carries the operator's name verbatim.
-  assert.ok(/"\{name\}" saved to your cell\./.test(eoatWizSrc),
-    v('SavedScreen headline must read \'"<name>" saved to your cell.\''))
+  // Headline carries the operator's name verbatim. 2026-10-09
+  // operator directive: "cell" vocabulary dropped from this
+  // confirmation — the SavedScreen now reads '"<name>" saved to
+  // Tools.' and the primary button reads 'View Tools and Fixtures →'.
+  assert.ok(/"\{name\}" saved to Tools\./.test(eoatWizSrc),
+    v('SavedScreen headline must read \'"<name>" saved to Tools.\''))
+  assert.ok(/View Tools and Fixtures →/.test(eoatWizSrc),
+    v('SavedScreen primary action must read "View Tools and Fixtures →"'))
+  // Negative pins: the retired "cell" copy must not resurface.
+  assert.ok(!/"\{name\}" saved to your cell\./.test(eoatWizSrc),
+    v('Legacy "saved to your cell." headline must not resurface'))
+  assert.ok(!/View in My Cell →/.test(eoatWizSrc),
+    v('Legacy "View in My Cell →" button copy must not resurface'))
 })
 
 test('view-in-my-cell navigation routes to the Synapse tab', () => {
@@ -1898,4 +1908,70 @@ test('WhyExpander component defines the data-why-expander marker', () => {
     v('WhyExpander must render data-why-expander="1" on its outer '
       + 'div — the banned-word pin uses this marker to carve the '
       + 'subtree out of the sweep.'))
+})
+
+// ── (17) EOAT / fixture confirm + section rename (2026-10-09) ──────
+//
+// Operator directive 2026-10-09: button copy names the action, not
+// a connection state; save-confirmation uses "Tools" / "Fixtures"
+// instead of "cell"; the summary section renames from "My Cell" to
+// "All Tools and Fixtures." Scope is operator-facing COPY ONLY —
+// data-testids, store keys, and backend paths (cell.json etc.)
+// stay as-is per the directive.
+
+test('EOAT confirm button reads "Add Tool" (not "All connected — Confirm")', () => {
+  assert.ok(/{busy \? 'Saving…' : 'Add Tool'}/.test(eoatWizSrc),
+    v('EOATSetupWizard guidance-confirm button must read "Add Tool" — '
+      + 'the operator sees the action, not a connection-state label'))
+  assert.ok(!/All connected — Confirm/.test(eoatWizSrc),
+    v('Legacy "All connected — Confirm" button copy must not resurface'))
+})
+
+test('fixture confirm button reads "Add Fixture" (not "Save fixture")', () => {
+  assert.ok(/{busy \? 'Saving…' : 'Add Fixture'}/.test(fixWizSrc),
+    v('ExternalFixtureWizard summary save button must read "Add Fixture" — '
+      + 'operator-facing action, not a storage verb'))
+  assert.ok(!/'Save fixture'/.test(fixWizSrc),
+    v('Legacy "Save fixture" button copy must not resurface'))
+})
+
+test('fixture saved banner reads "saved to Fixtures" (no "cell" / "list")', () => {
+  assert.ok(/saved to Fixtures\./.test(fixWizSrc),
+    v('Fixture saved banner must read \'"<name>" saved to Fixtures.\''))
+  assert.ok(!/is in your fixtures list/.test(fixWizSrc),
+    v('Legacy "is in your fixtures list" copy must not resurface'))
+})
+
+test('summary section renders "All Tools and Fixtures" (not "My Cell")', () => {
+  const src = readSrc('components/MyCellSection.jsx')
+  // Header copy pin — the h3 content.
+  assert.ok(/>\s*All Tools and Fixtures\s*</.test(src),
+    v('MyCellSection header must read "All Tools and Fixtures"'))
+  // Negative pin: the retired "My Cell" header must not resurface.
+  assert.ok(!/>\s*My Cell\s*</.test(src),
+    v('Legacy "My Cell" header must not resurface in MyCellSection'))
+  // Error banner uses the new section name too.
+  assert.ok(/All Tools and Fixtures unavailable/.test(src),
+    v('Error banner must read "All Tools and Fixtures unavailable: …"'))
+  assert.ok(!/My Cell unavailable/.test(src),
+    v('Legacy "My Cell unavailable:" copy must not resurface'))
+})
+
+test('ToolFromCellStep description drops "your cell" wording', () => {
+  const src = readSrc('components/ToolFromCellStep.jsx')
+  assert.ok(!/set up in your cell/.test(src),
+    v('ToolFromCellStep description must not use "set up in your cell" '
+      + 'operator-facing copy'))
+  assert.ok(/end-of-arm tools you've set up/.test(src),
+    v('ToolFromCellStep description must read "end-of-arm tools '
+      + 'you\'ve set up"'))
+})
+
+test('ProgramEditor empty-tools warning drops "your cell" wording', () => {
+  const src = readSrc('components/ProgramEditor.jsx')
+  assert.ok(!/No tools in your cell yet/.test(src),
+    v('ProgramEditor empty-tools warning must not say "No tools in '
+      + 'your cell yet"'))
+  assert.ok(/No tools set up yet/.test(src),
+    v('ProgramEditor empty-tools warning must read "No tools set up yet"'))
 })
