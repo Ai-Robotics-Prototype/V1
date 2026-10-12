@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import LiveRecorder from './LiveRecorder'
 import NumericField from './NumericField'
 import { useStore } from '../store/useStore'
-import { kbSafeModalContentStyle } from '../lib/keyboardInset'
+import { kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
 
 /*
  * Program from Demonstration — three-step modal mirroring the wizard's
@@ -483,10 +483,15 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
       background: 'rgba(0,0,0,0.4)',
       display: 'flex', alignItems: 'stretch', justifyContent: 'center',
       paddingTop:    'env(safe-area-inset-top, 0px)',
-      paddingBottom: 'env(safe-area-inset-bottom, 0px)',
       paddingLeft:   'env(safe-area-inset-left, 0px)',
       paddingRight:  'env(safe-area-inset-right, 0px)',
       boxSizing: 'border-box',
+      // Overlay-level keyboard-inset handling — reserves bottom space
+      // for the on-screen keyboard AND the device safe-area so the
+      // body flex child shrinks above both. Shared helper first, then
+      // the override that folds env(safe-area-inset-bottom) back in.
+      ...kbSafeOverlayStyle(),
+      paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + var(--kb-inset, 0px))',
     }}>
       <div style={{
         width: '100%', maxWidth: 980,

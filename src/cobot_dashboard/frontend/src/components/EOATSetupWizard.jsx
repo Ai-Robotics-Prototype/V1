@@ -13,7 +13,7 @@ import {
 import {
   getCell, saveCellEoat,
 } from '../lib/cellStore'
-import { useKeyboardInset, kbSafeModalContentStyle } from '../lib/keyboardInset'
+import { useKeyboardInset, kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
 import { useStore } from '../store/useStore'
 import { portDisplayName, portListDisplay } from '../lib/cellEntryDisplay'
 import {
@@ -344,6 +344,7 @@ export default function EOATSetupWizard({
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
     zIndex: 9998, display: 'flex', alignItems: 'center',
     justifyContent: 'center',
+    ...kbSafeOverlayStyle(),
   }
   const panel = {
     background: '#fff', borderRadius: 12,

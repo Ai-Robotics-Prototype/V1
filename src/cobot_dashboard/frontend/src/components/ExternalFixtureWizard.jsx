@@ -19,6 +19,7 @@ import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
 import { useSynapsePortmap } from '../lib/synapsePortmap'
 import {
   useKeyboardInset, scrollFocusedIntoView, kbSafeModalContentStyle,
+  kbSafeOverlayStyle,
 } from '../lib/keyboardInset'
 
 // External Fixture Wizard (2026-09-22 operator directive).
@@ -846,6 +847,7 @@ const _backdrop = {
   position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
   zIndex: 9998, display: 'flex', alignItems: 'center',
   justifyContent: 'center',
+  ...kbSafeOverlayStyle(),
 }
 const _panel = {
   background: '#fff', borderRadius: 12,

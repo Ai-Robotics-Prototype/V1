@@ -15,7 +15,7 @@ import { effectorReady, effectorEngage, effectorDisengage,
          clampWorkpiece, unclampWorkpiece,
          startMachineCycle, waitMachineCycle } from '../lib/effectorVocab'
 import { typeLabel } from '../lib/cellEntryDisplay'
-import { kbSafeModalContentStyle } from '../lib/keyboardInset'
+import { kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
 
 /*
  * Conversational Program Wizard
@@ -3600,6 +3600,7 @@ export default function ProgramWizard({ onClose, onSaved }) {
       position: 'fixed', inset: 0, zIndex: 100,
       background: 'rgba(0,0,0,0.4)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
+      ...kbSafeOverlayStyle(),
     }}>
       <div style={{
         width: '95%', maxWidth: 800,

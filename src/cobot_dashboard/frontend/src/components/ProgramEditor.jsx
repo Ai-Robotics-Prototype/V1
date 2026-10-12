@@ -24,6 +24,7 @@ import {
 import { displayIoForStep, rebindProgramToCell, stepsNeedingRebind }
   from '../lib/programCellRebind'
 import { getCell } from '../lib/cellStore'
+import { kbSafeOverlayStyle } from '../lib/keyboardInset'
 import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
          palletFrameStatus, firstUntaughtPalletRole, PALLET_ROLE_ORDER,
          TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove,
@@ -1336,6 +1337,7 @@ function PalletConfigEditor({ config, onSave, onClose }) {
       position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.4)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       zIndex: 1200,
+      ...kbSafeOverlayStyle(),
     }}
       onClick={onClose}>
       <div onClick={(e) => e.stopPropagation()}
@@ -2361,6 +2363,7 @@ function PositionReuseModal({ action, source, onUseSame, onTeachNew, onCancel })
         background: 'rgba(15, 23, 42, 0.55)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         padding: 24,
+        ...kbSafeOverlayStyle(),
       }}
       onClick={onCancel}
     >
@@ -2485,6 +2488,7 @@ function PositionPickerModal({
         background: 'rgba(15, 23, 42, 0.55)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         padding: 24,
+        ...kbSafeOverlayStyle(),
       }}
       onClick={onClose}
     >
@@ -7162,6 +7166,7 @@ export default function ProgramEditor() {
               position: 'fixed', inset: 0, zIndex: 2000,
               background: 'rgba(15,23,42,0.55)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
+              ...kbSafeOverlayStyle(),
             }}>
             <div onClick={(e) => e.stopPropagation()}
               style={{

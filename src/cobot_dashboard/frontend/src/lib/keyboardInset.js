@@ -159,3 +159,35 @@ export function kbSafeModalContentStyle(vhCap = 92, padBottom = 24) {
     boxSizing:     'border-box',
   }
 }
+
+
+// kbSafeOverlayStyle — the OTHER half of the keyboard-safe pair.
+// Spread on the OUTER `position: fixed; inset: 0; display: flex;
+// alignItems: center` overlay of every modal / dialog / wizard.
+//
+// 2026-10-12 operator directive (recurring tablet keyboard-cover):
+// kbSafeModalContentStyle alone was not enough. The inner panel's
+// maxHeight shrinks by --kb-inset, but flex `alignItems: center` on
+// a `position: fixed; inset: 0` overlay centers the panel in the
+// LAYOUT viewport — which is NOT shrunk by the on-screen keyboard
+// (virtualKeyboard.overlaysContent=true, visualViewport only).
+// Result: the shrunk panel still sits centered at layoutH/2, so its
+// bottom half (including the primary action buttons) ends up behind
+// the keyboard. The field + buttons are "visible" only in the panel
+// sense, not the viewport sense.
+//
+// paddingBottom: var(--kb-inset) on the OVERLAY reduces the flex
+// container's content box by the keyboard height, so `alignItems:
+// center` naturally centers the panel in the VISIBLE area above the
+// keyboard. The 0px fallback keeps desktop byte-identical.
+//
+// This is the shared-container piece: once the overlay has this
+// style, ANY input mounted inside the panel lifts above the keyboard
+// on focus (combined with useGlobalKeyboardAutoScroll's focusin
+// listener). Per-field onFocus wiring is no longer needed.
+export function kbSafeOverlayStyle() {
+  return {
+    paddingBottom: 'var(--kb-inset, 0px)',
+    boxSizing:     'border-box',
+  }
+}

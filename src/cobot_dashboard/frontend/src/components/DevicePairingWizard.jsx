@@ -18,7 +18,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   storePairing, clearPairing, probeRobotIdentity, getToken,
 } from '../lib/pairedDevice'
-import { kbSafeModalContentStyle } from '../lib/keyboardInset'
+import { kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
 
 const NEURO_COLORS = {
   bg:      '#0C0C0E',
@@ -40,6 +40,7 @@ function Screen({ children }) {
       alignItems: 'center', justifyContent: 'center',
       fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       zIndex: 9999,
+      ...kbSafeOverlayStyle(),
     }}>{children}</div>
   )
 }

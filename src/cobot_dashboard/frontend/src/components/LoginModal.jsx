@@ -13,7 +13,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { storePairing } from '../lib/pairedDevice'
-import { kbSafeModalContentStyle } from '../lib/keyboardInset'
+import { kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
 
 const C = {
   bg:      '#0C0C0E',
@@ -93,6 +93,7 @@ export default function LoginModal() {
       justifyContent: 'center', padding: 20,
       fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       color: C.text,
+      ...kbSafeOverlayStyle(),
     }}>
       <form onSubmit={submit} style={{
         background: C.panel, border: `1px solid ${C.border}`,
