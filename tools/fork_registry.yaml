@@ -1028,7 +1028,7 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 6878
+        line: 6882
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
@@ -1093,11 +1093,19 @@ capabilities:
           2026-10-09: 6872 → 6878 (comment-stripped) when the
           payload-truth block grew data-severity + title={detail}
           + the three-way palette branch for the operator-reframe.
+          2026-10-12: 6878 → 6882 (comment-stripped) when the
+          keyboard-inset round-2 landed — one import line
+          (kbSafeOverlayStyle from ../lib/keyboardInset) + three
+          `...kbSafeOverlayStyle(),` lines on four modal overlays
+          above this site (pallet config, two role=dialog surfaces,
+          pallet-cancel confirm), all forward of this disabledReason
+          site; this fourth drift matches the identical +4 shift on
+          the second entry below.
           fork_lint strips comments before counting; see
           tools/fork_lint.py _strip_comments.)
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 6920
+        line: 6924
         why: >
           disabledReason string for the single/all-step teach overlay's
           Record button title tooltip. Same rationale as the line
@@ -1145,7 +1153,11 @@ capabilities:
           → 6920 (comment-stripped — 2026-10-09 payload-truth
           block grew data-severity + title={detail} + three-way
           palette branch; this site shifted by +6, matching the
-          delta on the first entry).
+          delta on the first entry)
+          → 6924 (comment-stripped — 2026-10-12 keyboard-inset
+          round-2: one import + three overlay sites in the top half
+          of the file shifted this site by +4, matching the delta
+          on the first entry).
         owner: dashboard-frontend
 
   # 22. Page-context persistence (2026-08-05 refresh-loss P0).
