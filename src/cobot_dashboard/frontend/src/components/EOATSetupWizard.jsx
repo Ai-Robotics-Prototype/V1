@@ -609,24 +609,25 @@ export default function EOATSetupWizard({
 }
 
 function ToolChoice({ tool, onPick }) {
+  // 2026-10-13 operator directive: per-card subtitle retired — each
+  // tool card renders NAME only, matching the New Program Wizard
+  // operation cards. tool.desc stays on BUILT_IN as dormant data so
+  // a future deep-link / help surface can still consume it; it just
+  // doesn't render in the picker.
   return (
     <button
       onClick={onPick}
       data-testid="hardware-setup-tool-choice"
       data-tool-key={tool.key}
       style={{
-        textAlign: 'left', padding: '12px 14px',
+        textAlign: 'left', padding: '14px 16px',
+        minHeight: 56,
         background: '#fff', border: '1px solid #d1d5db',
         borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
       }}>
       <div style={{ fontSize: 14, fontWeight: 600, color: '#111827' }}>
         {tool.label}
       </div>
-      {tool.desc && (
-        <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
-          {tool.desc}
-        </div>
-      )}
     </button>
   )
 }

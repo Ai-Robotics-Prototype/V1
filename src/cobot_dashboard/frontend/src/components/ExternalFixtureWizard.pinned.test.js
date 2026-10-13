@@ -79,20 +79,20 @@ test('each device card desc is a short plain one-liner (≤8 words)', () => {
 })
 
 
-test('every device card renders consistently (same name+desc shape)', () => {
-  // Pin that the card body only mounts the <div>{t.label}</div> +
-  // <div>{t.desc}</div> pair — no sibling block, no per-type
-  // branching. Scannability at a glance requires every card look
-  // the same.
+test('every device card renders consistently (name only)', () => {
+  // 2026-10-13 operator directive: the picker-declutter sweep went
+  // further — card body = NAME only, matching the operation + EOAT
+  // tool pickers. `t.desc` + `t.why` stay on FIXTURE_TYPES as
+  // dormant data for a future deep-link / help surface; the card
+  // just doesn't render them anymore.
   const card = wizSrc.match(
     /function DeviceTypeStep[\s\S]{0,2500}?\n\}\n/)
   assert.ok(card, 'could not locate DeviceTypeStep')
   const body = card[0]
-  // Only two text-rendering <div>{t.…}</div> sites inside the card.
   const tFieldHits = body.match(/\{t\.(label|desc|why)\}/g) || []
   const unique = Array.from(new Set(tFieldHits))
-  assert.deepEqual(unique.sort(), ['{t.desc}', '{t.label}'],
-    `DeviceTypeStep card may only render t.label + t.desc, got `
+  assert.deepEqual(unique.sort(), ['{t.label}'],
+    `DeviceTypeStep card may only render t.label (name-only picker), got `
     + `${JSON.stringify(unique.sort())}`)
 })
 
