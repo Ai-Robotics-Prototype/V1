@@ -8,6 +8,7 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 import TeachLockBanner from './TeachLockBanner'
 import RecordConfirmModal from './RecordConfirmModal'
 import NumericField from './NumericField'
+import ArmEnableControl from './ArmEnableControl'
 import { formatInLabel, mmToIn, inToMm } from '../lib/distanceUnits'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import EOATSetupWizard from './EOATSetupWizard'
@@ -3526,7 +3527,8 @@ function TeachOverlay({
         columnGap: 10,
         position: 'relative',
       }}>
-        <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-start',
+                      alignItems: 'center', gap: 8 }}>
           {canBack && (
             <button onClick={onBack} style={{
               height: 48, padding: '0 16px',
@@ -3535,6 +3537,13 @@ function TeachOverlay({
               border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
             }}>← Back</button>
           )}
+          {/* 2026-10-13 operator directive: shared Enable control in
+              the teach overlay too. Same import-identity component
+              (fork registry: arm_enable_control); state syncs with
+              the main pendant via the shared store. The overlay keeps
+              no local STOP (release-to-stop + driver 300ms deadman +
+              TopBar global E-STOP remain the stop path). */}
+          <ArmEnableControl />
         </div>
 
         <button

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
+import ArmEnableControl from './ArmEnableControl'
 import NumericField from './NumericField'
 import DistanceSlider from './DistanceSlider'
 import { formatInLabel, mmToIn, inToMm } from '../lib/distanceUnits'
@@ -340,26 +341,11 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
         ))}
       </div>
 
-      <div style={{
-        padding: 12, background: '#f8fafc', borderRadius: 8,
-        border: '1px solid #e5e7eb', marginBottom: 16,
-        fontFamily: 'monospace', fontSize: 12,
-      }}>
-        <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
-          <div>
-            <span style={{ color: '#6b7280' }}>Joints: </span>
-            <span style={{ color: '#111', fontWeight: 700 }}>
-              [{liveJoints.map((j) => j.toFixed(1)).join(', ')}]°
-            </span>
-          </div>
-          <div>
-            <span style={{ color: '#6b7280' }}>TCP: </span>
-            <span style={{ color: '#111', fontWeight: 700 }}>
-              [{liveTcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ')}]
-            </span>
-          </div>
-        </div>
-      </div>
+      {/* 2026-10-13 operator directive: live Joints/TCP numeric readout
+          retired from every teach surface — operators don't need the
+          numbers while teaching. liveJoints + liveTcp state kept and
+          polled only as the Record Position fallback path (used when
+          /api/state is unavailable at capture time). */}
 
       <div style={{
         padding: 16, background: '#fff', borderRadius: 10,
@@ -483,6 +469,12 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
           flexShrink: 0,
           boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
         }}>⏹ STOP</button>
+        {/* 2026-10-13 operator directive: shared Enable control on the
+            teach surface so the operator can power the arm without
+            leaving the teach window. Imported identity — same store
+            action, confirm modal, and live state as the main pendant
+            (fork registry: arm_enable_control). */}
+        <ArmEnableControl />
         <button onClick={recordPosition} style={{
           flex: 1, minHeight: 56, padding: '0 16px',
           fontSize: 16, fontWeight: 800,
@@ -1158,12 +1150,12 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
             {current.label}
           </div>
           <div style={{ flex: 1 }} />
-          <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#6b7280', whiteSpace: 'nowrap', flexShrink: 0 }}>
-            Joints [{liveJoints.map((j) => j.toFixed(1)).join(', ')}]°
-          </div>
-          <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#6b7280', whiteSpace: 'nowrap', flexShrink: 0 }}>
-            TCP [{liveTcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ')}]
-          </div>
+          {/* 2026-10-13 operator directive: live Joints/TCP numeric
+              readout retired from every teach surface. liveJoints +
+              liveTcp state remain populated by the 300ms poll as the
+              Record Position fallback (recordPosition reads /api/state
+              fresh; on non-ok / exception it falls back to the
+              last-polled liveJoints). Capture path untouched. */}
         </div>
         <div style={{
           fontSize: 13, color: '#6b7280', lineHeight: 1.4,
@@ -1529,6 +1521,10 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
           flexShrink: 0,
           boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
         }}>⏹ STOP</button>
+        {/* 2026-10-13 operator directive: shared Enable control on the
+            fullscreen teach pendant too — same import-identity component
+            as the main-pendant surface; state syncs via the shared store. */}
+        <ArmEnableControl />
         <button onClick={goBack} style={{
           padding: '0 18px', minHeight: 56, fontSize: 14, fontWeight: 700,
           background: '#fff', color: '#374151',

@@ -1028,7 +1028,7 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 6897
+        line: 6901
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
@@ -1106,11 +1106,14 @@ capabilities:
           imported into ProgramEditor and the pallet-config /
           step-detail / substep inline fields rewrapped around
           mmToIn + inToMm, adding ~15 lines above this site.
+          2026-10-13: 6897 → 6901 (comment-stripped) when the shared
+          ArmEnableControl was imported + mounted inside TeachOverlay's
+          footer-Back cell, adding 4 lines above this site.
           fork_lint strips comments before counting; see
           tools/fork_lint.py _strip_comments.)
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 6939
+        line: 6943
         why: >
           disabledReason string for the single/all-step teach overlay's
           Record button title tooltip. Same rationale as the line
@@ -1167,6 +1170,10 @@ capabilities:
           directive added mm↔in imports + rewrapped field blocks
           in the pallet config + step detail + substep editors,
           shifting this site by +15, matching the delta on the
+          first entry above)
+          → 6943 (comment-stripped — 2026-10-13 shared
+          ArmEnableControl mounted inside TeachOverlay's footer-Back
+          cell shifted this site by +4, matching the delta on the
           first entry above).
         owner: dashboard-frontend
 
