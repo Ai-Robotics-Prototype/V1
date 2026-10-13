@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
 import NumericField from './NumericField'
+import DistanceSlider from './DistanceSlider'
+import { formatInLabel, mmToIn, inToMm } from '../lib/distanceUnits'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import { getToolHookup, toolHookupKey } from '../lib/toolsApi'
 import ToolFromCellStep from './ToolFromCellStep'
@@ -915,9 +917,12 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     const R2D = 180 / Math.PI
     const t = Array.isArray(liveTcp) ? liveTcp : [0, 0, 0, 0, 0, 0]
     setManualTcp({
-      x:  ((Number(t[0]) || 0) * 1000).toFixed(1),
-      y:  ((Number(t[1]) || 0) * 1000).toFixed(1),
-      z:  ((Number(t[2]) || 0) * 1000).toFixed(1),
+      // 2026-10-13 inches directive: operator types x/y/z in INCHES
+      // and we convert to meters (storage units) on save. R2D stays
+      // the same — rotation unit (deg) is unaffected.
+      x:  (((Number(t[0]) || 0) * 1000) / 25.4).toFixed(2),
+      y:  (((Number(t[1]) || 0) * 1000) / 25.4).toFixed(2),
+      z:  (((Number(t[2]) || 0) * 1000) / 25.4).toFixed(2),
       rx: ((Number(t[3]) || 0) * R2D).toFixed(1),
       ry: ((Number(t[4]) || 0) * R2D).toFixed(1),
       rz: ((Number(t[5]) || 0) * R2D).toFixed(1),
@@ -934,12 +939,14 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     const x = parse(manualTcp.x), y = parse(manualTcp.y), z = parse(manualTcp.z)
     const rx = parse(manualTcp.rx), ry = parse(manualTcp.ry), rz = parse(manualTcp.rz)
     if ([x, y, z, rx, ry, rz].some((v) => v === null)) {
-      setRecordErr('All six fields are required. Use numeric values (mm for x/y/z, degrees for rx/ry/rz).')
+      setRecordErr('All six fields are required. Use numeric values (″ for x/y/z, degrees for rx/ry/rz).')
       return
     }
     const D2R = Math.PI / 180
     // Store TCP in the same units /api/state uses: meters + radians.
-    const tcp = [x / 1000, y / 1000, z / 1000, rx * D2R, ry * D2R, rz * D2R]
+    // Operator-entered x/y/z are in INCHES → inches × 25.4 / 1000 = meters.
+    const inToMeters = (inches) => (inches * 25.4) / 1000
+    const tcp = [inToMeters(x), inToMeters(y), inToMeters(z), rx * D2R, ry * D2R, rz * D2R]
     setAnswer(current.key, {
       tcp,
       joints: (Array.isArray(liveJoints) ? liveJoints.slice(0, 6) : [0, 0, 0, 0, 0, 0]),
@@ -1233,12 +1240,12 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               Enter TCP pose manually
             </div>
             <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 16 }}>
-              Position in mm, rotation in degrees. Saved as the taught pose for {current.label}.
+              Position in inches, rotation in degrees. Saved as the taught pose for {current.label}.
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
               {['x', 'y', 'z'].map((k) => (
                 <label key={k} style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#374151', fontWeight: 600 }}>
-                  {k.toUpperCase()} (mm)
+                  {k.toUpperCase()} (″)
                   <input type="number" value={manualTcp[k]}
                     onChange={(e) => setManualTcp({ ...manualTcp, [k]: e.target.value })}
                     style={{ padding: '10px 12px', fontSize: 14, border: '1px solid #d1d5db', borderRadius: 6, fontFamily: 'monospace' }} />
@@ -1403,7 +1410,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                   background: step === s ? '#2563EB' : '#f3f4f6',
                   color:      step === s ? '#fff'    : '#374151',
                   border:     step === s ? 'none'    : '1px solid #e5e7eb',
-                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+                }}>{jogMode === 'joint' ? `${s}°` : formatInLabel(s, { digits: s < 1 ? 3 : 2 })}</button>
             ))}
             <div style={{ flex: 1, minWidth: 120, display: 'flex', alignItems: 'center', gap: 8, marginLeft: 8 }}>
               <span style={{ fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap' }}>Speed {speed}%</span>
@@ -1714,19 +1721,19 @@ function ToolAndPayloadStep({ answers, setAnswer, goNext }) {
             display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
             fontSize: 13, color: '#374151',
           }}>
-            <span>CoG (mm from flange)</span>
+            <span>CoG (″ from flange)</span>
             {['x', 'y', 'z'].map((k) => (
               <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                 <span style={{ color: '#6b7280', fontWeight: 700, textTransform: 'uppercase' }}>{k}</span>
                 <input
-                  type="number" step="1"
+                  type="number" step="0.1"
                   placeholder="0"
-                  value={cog[k] ?? ''}
+                  value={cog[k] !== undefined && cog[k] !== null ? mmToIn(cog[k], 2) : ''}
                   onChange={(e) => {
                     const v = e.target.value
                     const next = { ...cog }
                     if (v === '') delete next[k]
-                    else if (Number.isFinite(Number(v))) next[k] = Number(v)
+                    else if (Number.isFinite(Number(v))) next[k] = inToMm(Number(v))
                     setAnswer('payload_cog_mm', Object.keys(next).length ? next : null)
                   }}
                   style={{
@@ -1801,11 +1808,15 @@ const PAGES = [
         description="Choose the type of operation. The wizard will guide you through the setup."
       >
         {[
-          { value: 'pick_and_place', label: 'Pick and Place', desc: 'Pick an object and move it to another location', icon: 'P' },
-          { value: 'machine_tend', label: 'Machine Tending', desc: 'Load parts into a machine, wait, then unload', icon: 'M' },
-          { value: 'palletize', label: 'Palletize', desc: 'Stack parts onto a pallet or pick them off a pallet', icon: 'G' },
+          // 2026-10-13 operator directive: operation cards are
+          // NAME-only — the per-card subtitle + letter badges
+          // (P/M/G) are retired. The step heading + helper above
+          // ("Choose the type of operation…") carries the intent.
+          { value: 'pick_and_place', label: 'Pick and Place' },
+          { value: 'machine_tend', label: 'Machine Tending' },
+          { value: 'palletize', label: 'Palletize' },
         ].map(op => (
-          <ChoiceButton key={op.value} label={op.label} description={op.desc} icon={op.icon}
+          <ChoiceButton key={op.value} label={op.label}
             selected={answers.operation === op.value}
             onClick={() => {
               // Default `source` alongside `operation` per the
@@ -1998,17 +2009,17 @@ const PAGES = [
             </label>
           </div>
 
-          <SliderQuestion label="Spacing X (centre-to-centre)" value={sx}
-            onChange={(v) => setAnswer('pallet_spacing_x_mm', v)}
-            min={10} max={500} step={5} unit="mm"
+          <DistanceSlider label="Spacing X (centre-to-centre)" mmValue={sx}
+            onCommitMm={(v) => setAnswer('pallet_spacing_x_mm', v)}
+            minMm={10} maxMm={500} stepMm={5}
             description="Distance between columns" />
-          <SliderQuestion label="Spacing Y (centre-to-centre)" value={sy}
-            onChange={(v) => setAnswer('pallet_spacing_y_mm', v)}
-            min={10} max={500} step={5} unit="mm"
+          <DistanceSlider label="Spacing Y (centre-to-centre)" mmValue={sy}
+            onCommitMm={(v) => setAnswer('pallet_spacing_y_mm', v)}
+            minMm={10} maxMm={500} stepMm={5}
             description="Distance between rows" />
-          <SliderQuestion label="Layer height Z" value={lz}
-            onChange={(v) => setAnswer('pallet_layer_height_mm', v)}
-            min={10} max={300} step={5} unit="mm"
+          <DistanceSlider label="Layer height Z" mmValue={lz}
+            onCommitMm={(v) => setAnswer('pallet_layer_height_mm', v)}
+            minMm={10} maxMm={300} stepMm={5}
             description="Vertical offset added per layer" />
 
           <div style={{
@@ -2109,13 +2120,13 @@ const PAGES = [
         question="Place approach settings"
         description="How the robot positions above each pallet slot before placing and how high it retracts between moves."
       >
-        <SliderQuestion label="Approach height" value={answers.pallet_approach_height_mm || 100}
-          onChange={(v) => setAnswer('pallet_approach_height_mm', v)}
-          min={20} max={300} step={5} unit="mm"
+        <DistanceSlider label="Approach height" mmValue={answers.pallet_approach_height_mm || 100}
+          onCommitMm={(v) => setAnswer('pallet_approach_height_mm', v)}
+          minMm={20} maxMm={300} stepMm={5}
           description="Z offset above each slot before descent" />
-        <SliderQuestion label="Retract height" value={answers.pallet_retract_height_mm || 200}
-          onChange={(v) => setAnswer('pallet_retract_height_mm', v)}
-          min={50} max={500} step={10} unit="mm"
+        <DistanceSlider label="Retract height" mmValue={answers.pallet_retract_height_mm || 200}
+          onCommitMm={(v) => setAnswer('pallet_retract_height_mm', v)}
+          minMm={50} maxMm={500} stepMm={10}
           description="Z height the robot moves to between pick / place moves" />
         <div style={{
           padding: 12, background: '#f0f9ff', borderRadius: 8,
@@ -2137,13 +2148,13 @@ const PAGES = [
         question="Pick approach settings"
         description="How the robot positions above each pallet slot before picking and how high it retracts between moves."
       >
-        <SliderQuestion label="Approach height" value={answers.pallet_approach_height_mm || 100}
-          onChange={(v) => setAnswer('pallet_approach_height_mm', v)}
-          min={20} max={300} step={5} unit="mm"
+        <DistanceSlider label="Approach height" mmValue={answers.pallet_approach_height_mm || 100}
+          onCommitMm={(v) => setAnswer('pallet_approach_height_mm', v)}
+          minMm={20} maxMm={300} stepMm={5}
           description="Z offset above each slot before descent" />
-        <SliderQuestion label="Retract height" value={answers.pallet_retract_height_mm || 200}
-          onChange={(v) => setAnswer('pallet_retract_height_mm', v)}
-          min={50} max={500} step={10} unit="mm"
+        <DistanceSlider label="Retract height" mmValue={answers.pallet_retract_height_mm || 200}
+          onCommitMm={(v) => setAnswer('pallet_retract_height_mm', v)}
+          minMm={50} maxMm={500} stepMm={10}
           description="Z height the robot moves to between pick / place moves" />
         <div style={{
           padding: 12, background: '#f0f9ff', borderRadius: 8,
@@ -2173,15 +2184,11 @@ const PAGES = [
         question="How high above the part should the robot approach?"
         description="The robot moves to this height above the part before descending to pick it up. Higher is safer but slower."
       >
-        <SliderQuestion label="Approach height" value={answers.approach_height || 100}
-          onChange={v => setAnswer('approach_height', v)} min={20} max={300} step={10} unit="mm"
-          description="Distance above the part surface before the final descent" />
-        <div style={{
-          padding: 12, background: '#f0f9ff', borderRadius: 8,
-          border: '1px solid #bfdbfe', fontSize: 12, color: '#2563EB', marginBottom: 16,
-        }}>
-          Recommended: 100-150mm for most operations. Use 50-80mm for tight spaces.
-        </div>
+        <DistanceSlider label="Approach height" mmValue={answers.approach_height || 100}
+          onCommitMm={v => setAnswer('approach_height', v)}
+          minMm={20} maxMm={300} stepMm={10}
+          description="Distance above the part surface before the final descent"
+          recommendedCopy="Recommended: 4–6″ for most operations. Use 2–3″ for tight spaces." />
         <NextButton onClick={goNext} label="Next" />
       </QuestionCard>
     ),
@@ -2522,10 +2529,10 @@ const PAGES = [
               {rows} rows × {cols} cols × {layers} layers = {total} parts
             </div>
             <div style={{ color: '#6b7280' }}>
-              Spacing: {answers.pallet_spacing_x_mm ?? 150}mm × {answers.pallet_spacing_y_mm ?? 150}mm
+              Spacing: {formatInLabel(answers.pallet_spacing_x_mm ?? 150)} × {formatInLabel(answers.pallet_spacing_y_mm ?? 150)}
             </div>
             <div style={{ color: '#6b7280' }}>
-              Layer height: {answers.pallet_layer_height_mm ?? 100}mm
+              Layer height: {formatInLabel(answers.pallet_layer_height_mm ?? 100)}
             </div>
             <div style={{ color: '#6b7280' }}>
               {isDepal ? 'Pick' : 'Fill'} order: {isDepal ? `Top layer first, ${orderLabel}` : orderLabel}
@@ -2701,13 +2708,13 @@ const PAGES = [
               They are tuned from the Program tab's motion profile card after creation. */}
           {isPallet ? (
             <>
-              <div style={{ color: '#6b7280' }}>Approach height: {answers.pallet_approach_height_mm ?? 100}mm</div>
-              <div style={{ color: '#6b7280' }}>Retract height: {answers.pallet_retract_height_mm ?? 200}mm</div>
+              <div style={{ color: '#6b7280' }}>Approach height: {formatInLabel(answers.pallet_approach_height_mm ?? 100)}</div>
+              <div style={{ color: '#6b7280' }}>Retract height: {formatInLabel(answers.pallet_retract_height_mm ?? 200)}</div>
               <div style={{ color: '#6b7280' }}>Cycles: {total} (locked — full pallet)</div>
             </>
           ) : (
             <>
-              <div style={{ color: '#6b7280' }}>Approach height: {answers.approach_height}mm</div>
+              <div style={{ color: '#6b7280' }}>Approach height: {formatInLabel(answers.approach_height)}</div>
               <div style={{ color: '#6b7280' }}>Repeat: {answers.repeat === 'continuous' ? 'Continuously' : answers.repeat === 'count' ? answers.repeat_count + ' times' : 'Once'}</div>
             </>
           )}

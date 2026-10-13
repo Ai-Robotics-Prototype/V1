@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import LiveRecorder from './LiveRecorder'
 import NumericField from './NumericField'
 import { useStore } from '../store/useStore'
+import { formatInLabel } from '../lib/distanceUnits'
 import { kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
 
 /*
@@ -849,7 +850,7 @@ function ReviewPanel({
                 {op.place_pattern && op.place_pattern !== 'fixed'
                   ? ` · place=${op.place_pattern}${
                       op.place_pattern === 'stack' && op.place_stack_dz_mm
-                        ? ` (+${op.place_stack_dz_mm}mm)` : ''}` : ''}
+                        ? ` (${formatInLabel(op.place_stack_dz_mm, { showSign: true })})` : ''}` : ''}
               </span>
             </div>
             <Field label="Part">

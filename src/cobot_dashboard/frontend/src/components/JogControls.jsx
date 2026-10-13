@@ -5,6 +5,7 @@ import { createHoldTicker } from '../lib/holdTicker'
 import { pushJogEvent, pushJogInterval, pushJogStop,
          startJogSession, endJogSession } from '../lib/jogTelemetry'
 import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
+import { formatInLabel } from '../lib/distanceUnits'
 
 // JogControls — the shared REAL-ARM hold-to-jog panel.
 //
@@ -1271,7 +1272,7 @@ export default function JogControls({
                   // Chip sizes to content — no truncation.
                   minWidth: 'fit-content',
                   whiteSpace: 'nowrap',
-                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+                }}>{jogMode === 'joint' ? `${s}°` : formatInLabel(s, { digits: s < 1 ? 3 : 2 })}</button>
             ))}
           </div>
         </div>

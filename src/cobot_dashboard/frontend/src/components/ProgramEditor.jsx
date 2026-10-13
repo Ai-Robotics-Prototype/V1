@@ -8,6 +8,7 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 import TeachLockBanner from './TeachLockBanner'
 import RecordConfirmModal from './RecordConfirmModal'
 import NumericField from './NumericField'
+import { formatInLabel, mmToIn, inToMm } from '../lib/distanceUnits'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import EOATSetupWizard from './EOATSetupWizard'
 import ExternalFixtureWizard from './ExternalFixtureWizard'
@@ -434,17 +435,19 @@ function detailLine(step, ioLabels, synapsePortmap, program, cell, profile) {
   const bits = [step.action || step.type]
   if (step.target)      bits.push('target: ' + step.target)
   if (step.duration_s)  bits.push(step.duration_s + 's')
-  if (step.width_mm)    bits.push(step.width_mm + 'mm')
-  if (step.descend_mm)  bits.push('descend ' + step.descend_mm + 'mm')
-  // Derived offset moves: show "from <role>, z+Nmm" so the operator can
+  if (step.width_mm)    bits.push(formatInLabel(step.width_mm))
+  if (step.descend_mm)  bits.push('descend ' + formatInLabel(step.descend_mm))
+  // Derived offset moves: show "from <role>, z+N″" so the operator can
   // see at a glance that this step is computed at runtime from a taught
-  // source — no Teach button, no separate pose to record.
+  // source — no Teach button, no separate pose to record. 2026-10-13
+  // inches directive: operator-facing distances render in inches; the
+  // stored *_mm fields are untouched.
   if (isDerivedOffsetMove(step)) {
     const role = step.derived_from || 'prev'
     const z = step.offset_z_mm ?? 0
-    bits.push('from ' + role + ', z' + (z >= 0 ? '+' : '') + z + 'mm')
+    bits.push('from ' + role + ', z' + formatInLabel(z, { showSign: true }))
   } else if (step.offset_z_mm !== undefined) {
-    bits.push('z' + (step.offset_z_mm >= 0 ? '+' : '') + step.offset_z_mm + 'mm')
+    bits.push('z' + formatInLabel(step.offset_z_mm, { showSign: true }))
   }
   if (step.speed_pct)   bits.push(step.speed_pct + '%')
   if (step.io_id)       bits.push(ioName(step.io_id, step) + '=' + (step.value ? 'ON' : 'OFF'))
@@ -452,7 +455,7 @@ function detailLine(step, ioLabels, synapsePortmap, program, cell, profile) {
   if (step.io_open_confirm) bits.push('verify ' + ioName(step.io_open_confirm, step))
   if (step.io_close)        bits.push('close→' + ioName(step.io_close, step))
   if (step.io_close_confirm) bits.push('verify ' + ioName(step.io_close_confirm, step))
-  if (step.scan_height_mm)      bits.push('scan@' + step.scan_height_mm + 'mm')
+  if (step.scan_height_mm)      bits.push('scan@' + formatInLabel(step.scan_height_mm))
   if (step.scan_speed_pct)      bits.push('scan ' + step.scan_speed_pct + '%')
   if (step.settle_time_ms)      bits.push('settle ' + step.settle_time_ms + 'ms')
   if (step.capture_frames)      bits.push(step.capture_frames + ' frames')
@@ -711,9 +714,10 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet, synapsePortmap
         ? 'linear from taught angle onto contact'
         : 'axis-offset along pick tool_Z',
       field: !pickTaught ? {
-        label: 'approach', value: approach, unit: 'mm', min: 0, max: 500,
+        label: 'approach', value: mmToIn(approach, 1), unit: '″',
+        min: 0, max: mmToIn(500, 1),
         testId: 'pallet-substep-approach-mm',
-        onCommit: (v) => patch('approach_distance_mm', v),
+        onCommit: (v) => patch('approach_distance_mm', inToMm(v)),
       } : null,
     },
     { verb: 'movL', label: 'Linear down to pick contact',
@@ -731,16 +735,16 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet, synapsePortmap
                onCommit: (v) => patch('seal_wait_ms', v) } },
     { verb: 'movL', label: 'Linear up (retract) to pick approach',
       detail: `retract along pick tool_Z`,
-      field: { label: 'retract', value: retract, unit: 'mm',
-               min: 0, max: 500,
+      field: { label: 'retract', value: mmToIn(retract, 1), unit: '″',
+               min: 0, max: mmToIn(500, 1),
                testId: 'pallet-substep-retract-mm',
-               onCommit: (v) => patch('retract_distance_mm', v) } },
+               onCommit: (v) => patch('retract_distance_mm', inToMm(v)) } },
     { verb: 'movL', label: 'Lift to transit_Z above pick',
-      detail: `slot_Z(layer) + layer_h(${layerH}) + safety_margin`,
-      field: { label: 'safety_margin', value: margin, unit: 'mm',
-               min: 0, max: 500,
+      detail: `slot_Z(layer) + layer_h(${formatInLabel(layerH)}) + safety_margin`,
+      field: { label: 'safety_margin', value: mmToIn(margin, 1), unit: '″',
+               min: 0, max: mmToIn(500, 1),
                testId: 'pallet-substep-safety-margin-mm',
-               onCommit: (v) => patch('safety_margin_mm', v) } },
+               onCommit: (v) => patch('safety_margin_mm', inToMm(v)) } },
     { verb: 'movL', label: 'Traverse over slot at transit_Z',
       detail: 'X,Y of slot[r,c,layer]' },
     { verb: 'movL',
@@ -748,14 +752,15 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet, synapsePortmap
         ? 'Approach place pose (taught angle, layer-shifted)'
         : 'Approach place pose (per layer)',
       detail: placeTaught
-        ? `taught + layer × ${layerH} mm lift along plane normal`
+        ? `taught + layer × ${formatInLabel(layerH)} lift along plane normal`
         : `axis-offset along slot tool_Z; rises per layer`,
       // approach and retract are shared with the pick side; edits
       // propagate to BOTH linear-up/down on each cycle.
       field: !placeTaught ? {
-        label: 'approach', value: approach, unit: 'mm', min: 0, max: 500,
+        label: 'approach', value: mmToIn(approach, 1), unit: '″',
+        min: 0, max: mmToIn(500, 1),
         testId: 'pallet-substep-place-approach-mm',
-        onCommit: (v) => patch('approach_distance_mm', v),
+        onCommit: (v) => patch('approach_distance_mm', inToMm(v)),
       } : null,
     },
     { verb: 'movL', label: 'Linear down to slot (place)',
@@ -913,7 +918,7 @@ function PalletExpansionPreview({ step, palletCfg, onPatchPallet, synapsePortmap
         fontSize: 11, color: '#475569', lineHeight: 1.4,
       }}>
         <strong>Rule B:</strong> transit_Z(layer) = slot_Z(layer) +{' '}
-        {layerH} + {margin} mm along the frame normal. Layer{' '}
+        {formatInLabel(layerH)} + {formatInLabel(margin)} along the frame normal. Layer{' '}
         {Math.max(0, layers - 1)} approaches from above layer{' '}
         {Math.max(0, layers - 1)} — never dips to a lower layer.
       </div>
@@ -1430,17 +1435,20 @@ function PalletConfigEditor({ config, onSave, onClose }) {
               physical frame corners — corner-to-corner distance is
               geometric, not a derived pitch. Labels made explicit. */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-            <Field label="Row pitch — center-to-center between parts (mm)">
-              <NumericField integer min={0} value={spacingX}
-                onCommit={setSpacingX} style={inputStyle} aria-label="Row pitch (mm)" />
+            <Field label="Row pitch — center-to-center between parts (″)">
+              <NumericField min={0} step="0.1" value={mmToIn(spacingX, 1)}
+                onCommit={(v) => setSpacingX(inToMm(v))}
+                style={inputStyle} aria-label="Row pitch (in)" />
             </Field>
-            <Field label="Column pitch — center-to-center between parts (mm)">
-              <NumericField integer min={0} value={spacingY}
-                onCommit={setSpacingY} style={inputStyle} aria-label="Column pitch (mm)" />
+            <Field label="Column pitch — center-to-center between parts (″)">
+              <NumericField min={0} step="0.1" value={mmToIn(spacingY, 1)}
+                onCommit={(v) => setSpacingY(inToMm(v))}
+                style={inputStyle} aria-label="Column pitch (in)" />
             </Field>
-            <Field label="Layer height (mm)">
-              <NumericField integer min={0} value={layerH}
-                onCommit={setLayerH} style={inputStyle} aria-label="Layer height" />
+            <Field label="Layer height (″)">
+              <NumericField min={0} step="0.1" value={mmToIn(layerH, 1)}
+                onCommit={(v) => setLayerH(inToMm(v))}
+                style={inputStyle} aria-label="Layer height (in)" />
             </Field>
           </div>
 
@@ -1462,13 +1470,15 @@ function PalletConfigEditor({ config, onSave, onClose }) {
           </Field>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-            <Field label="Approach height (mm)">
-              <NumericField integer min={0} value={approachH}
-                onCommit={setApproachH} style={inputStyle} aria-label="Approach height" />
+            <Field label="Approach height (″)">
+              <NumericField min={0} step="0.1" value={mmToIn(approachH, 1)}
+                onCommit={(v) => setApproachH(inToMm(v))}
+                style={inputStyle} aria-label="Approach height (in)" />
             </Field>
-            <Field label="Retract height (mm)">
-              <NumericField integer min={0} value={retractH}
-                onCommit={setRetractH} style={inputStyle} aria-label="Retract height" />
+            <Field label="Retract height (″)">
+              <NumericField min={0} step="0.1" value={mmToIn(retractH, 1)}
+                onCommit={(v) => setRetractH(inToMm(v))}
+                style={inputStyle} aria-label="Retract height (in)" />
             </Field>
             <Field label="Speed (%)">
               <NumericField integer min={1} max={100} value={speed}
@@ -1487,22 +1497,25 @@ function PalletConfigEditor({ config, onSave, onClose }) {
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
                         gap: 10 }}>
-            <Field label="Approach distance (mm) — along pose axis">
-              <NumericField integer min={0} value={approachDist}
-                onCommit={setApproachDist} style={inputStyle}
-                aria-label="Approach distance mm"
+            <Field label="Approach distance (″) — along pose axis">
+              <NumericField min={0} step="0.1" value={mmToIn(approachDist, 1)}
+                onCommit={(v) => setApproachDist(inToMm(v))}
+                style={inputStyle}
+                aria-label="Approach distance in"
                 data-testid="pallet-approach-distance-mm" />
             </Field>
-            <Field label="Retract distance (mm) — along pose axis">
-              <NumericField integer min={0} value={retractDist}
-                onCommit={setRetractDist} style={inputStyle}
-                aria-label="Retract distance mm"
+            <Field label="Retract distance (″) — along pose axis">
+              <NumericField min={0} step="0.1" value={mmToIn(retractDist, 1)}
+                onCommit={(v) => setRetractDist(inToMm(v))}
+                style={inputStyle}
+                aria-label="Retract distance in"
                 data-testid="pallet-retract-distance-mm" />
             </Field>
-            <Field label="Safety margin (mm) — transit clearance">
-              <NumericField integer min={0} value={safetyMargin}
-                onCommit={setSafetyMargin} style={inputStyle}
-                aria-label="Safety margin mm"
+            <Field label="Safety margin (″) — transit clearance">
+              <NumericField min={0} step="0.1" value={mmToIn(safetyMargin, 1)}
+                onCommit={(v) => setSafetyMargin(inToMm(v))}
+                style={inputStyle}
+                aria-label="Safety margin in"
                 data-testid="pallet-safety-margin-mm" />
             </Field>
           </div>
@@ -1837,7 +1850,7 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
               <span style={{ fontSize: 10, color: '#6b7280' }}>
                 from <b>{String(draft.derived_from)}</b>
                 {(draft.offset_z_mm !== undefined && draft.offset_z_mm !== null)
-                  ? ` + Z ${draft.offset_z_mm}mm` : ''}
+                  ? ` + Z ${formatInLabel(draft.offset_z_mm, { showSign: true })}` : ''}
               </span>
             )}
             <div style={{ flex: 1 }} />
@@ -1865,7 +1878,7 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
 
           {isDerived && !isOverridden && (
             <div style={{ fontSize: 10, color: '#0369a1', marginBottom: 6 }}>
-              Computed at runtime from <b>{String(draft.derived_from)}</b> + Z {draft.offset_z_mm ?? 0}mm.
+              Computed at runtime from <b>{String(draft.derived_from)}</b> + Z {formatInLabel(draft.offset_z_mm ?? 0, { showSign: true })}.
               Edit any axis below or click "Use current pose" to override the link.
             </div>
           )}
@@ -1906,10 +1919,10 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
       )}
 
       {actionDef.fields.includes('width_mm') && (
-        <Field label="Gripper Width (mm)">
-          <NumericField integer value={draft.width_mm ?? 85}
-            onCommit={(v) => update('width_mm', v)} style={inputStyle}
-            aria-label="Gripper width" />
+        <Field label="Gripper Width (″)">
+          <NumericField step="0.1" value={mmToIn(draft.width_mm ?? 85, 1)}
+            onCommit={(v) => update('width_mm', inToMm(v))} style={inputStyle}
+            aria-label="Gripper width (in)" />
         </Field>
       )}
       {actionDef.fields.includes('speed_pct') && (
@@ -1981,28 +1994,33 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
         </Field>
       )}
       {actionDef.fields.includes('offset_z_mm') && (
-        <Field label="Z Offset (mm above)">
-          <NumericField integer value={draft.offset_z_mm ?? 150}
-            onCommit={(v) => update('offset_z_mm', v)} style={inputStyle}
-            aria-label="Z offset (mm)" />
+        <Field label="Z Offset (″ above)">
+          <NumericField step="0.1" value={mmToIn(draft.offset_z_mm ?? 150, 1)}
+            onCommit={(v) => update('offset_z_mm', inToMm(v))} style={inputStyle}
+            aria-label="Z offset (in)" />
         </Field>
       )}
       {actionDef.fields.includes('descend_mm') && (
-        <Field label="Descend (mm)">
-          <NumericField integer value={draft.descend_mm ?? 130}
-            onCommit={(v) => update('descend_mm', v)} style={inputStyle}
-            aria-label="Descend (mm)" />
+        <Field label="Descend (″)">
+          <NumericField step="0.1" value={mmToIn(draft.descend_mm ?? 130, 1)}
+            onCommit={(v) => update('descend_mm', inToMm(v))} style={inputStyle}
+            aria-label="Descend (in)" />
         </Field>
       )}
       {actionDef.fields.includes('position') && (
-        <Field label="Position X, Y, Z (m)">
+        <Field label="Position X, Y, Z (″)">
+          {/* 2026-10-13 inches directive: position is stored in METERS
+              on the step record (controller-native). The input shows
+              inches = meters * 1000 / 25.4 and converts back on commit
+              so the stored meters value stays byte-identical for the
+              same physical distance. */}
           <div style={{ display: 'flex', gap: 6 }}>
             {[0, 1, 2].map((i) => (
-              <NumericField key={i} step={0.01}
-                value={(draft.position || [0.3, -0.2, 0.4])[i]}
+              <NumericField key={i} step={0.1}
+                value={Number(mmToIn(((draft.position || [0.3, -0.2, 0.4])[i]) * 1000, 2))}
                 onCommit={(v) => {
                   const pos = [...(draft.position || [0.3, -0.2, 0.4])]
-                  pos[i] = v
+                  pos[i] = inToMm(v) / 1000
                   update('position', pos)
                 }}
                 aria-label={['Position X', 'Position Y', 'Position Z'][i]}
@@ -3308,7 +3326,7 @@ function TeachOverlay({
                   background: stepSize === s ? '#2563EB' : '#fff',
                   color:      stepSize === s ? '#fff'    : '#374151',
                   border:     stepSize === s ? 'none'    : '1px solid #d1d5db',
-                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+                }}>{jogMode === 'joint' ? `${s}°` : formatInLabel(s, { digits: s < 1 ? 3 : 2 })}</button>
             ))}
           </div>
           <div style={{ flex: 1, minWidth: 240, maxWidth: 520 }}>
@@ -3871,14 +3889,15 @@ function ToolAndPayloadSection({
                 display: 'flex', alignItems: 'center', gap: 8,
                 fontSize: 12, color: '#374151',
               }}>
-                <span style={{ minWidth: 120 }}>CoG (mm from flange)</span>
+                <span style={{ minWidth: 120 }}>CoG (″ from flange)</span>
                 {['x', 'y', 'z'].map((k) => (
                   <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                     <span style={{ color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>{k}</span>
                     <input
-                      type="number" step="1"
+                      type="number" step="0.1"
                       placeholder="0"
-                      value={payload.cog_mm?.[k] ?? ''}
+                      value={payload.cog_mm?.[k] !== undefined && payload.cog_mm?.[k] !== null
+                             ? mmToIn(payload.cog_mm[k], 2) : ''}
                       onChange={(e) => {
                         const v = e.target.value
                         const prev = payload.cog_mm || {}
@@ -3886,7 +3905,7 @@ function ToolAndPayloadSection({
                         if (v === '') { delete next[k] }
                         else {
                           const n = Number(v)
-                          if (Number.isFinite(n)) next[k] = n
+                          if (Number.isFinite(n)) next[k] = inToMm(n)
                         }
                         onPatch({ payload_cog_mm: Object.keys(next).length ? next : null })
                       }}
