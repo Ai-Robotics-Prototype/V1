@@ -139,3 +139,62 @@ test('WizardStepErrorBoundary wraps the PageBody in ProgramWizard', () => {
     /import WizardStepErrorBoundary from '\.\/WizardStepErrorBoundary'/,
     'import must exist at the top of ProgramWizard')
 })
+
+// ── 2026-10-14 tablet-only blank-screen diagnostics ──
+// The boundary itself must stay parse-safe on older engines
+// (no class fields, no optional chaining in render) AND must
+// forward caught errors into the global index.html overlay so a
+// tablet with no devtools shows SOMETHING.
+
+const boundarySrc = fs.readFileSync(
+  path.resolve(__dirname, 'WizardStepErrorBoundary.jsx'), 'utf8')
+
+test('WizardStepErrorBoundary render path has no optional chaining', () => {
+  // Everything in render() must use safe ES5 property reads so an
+  // older engine never trips on the fallback UI itself. We check the
+  // whole file because render-time code can live outside render()
+  // (e.g. in bound helpers).
+  assert.equal(/\?\./.test(boundarySrc), false,
+    'optional chaining would defeat the point — removed in favour of '
+    + '(x && x.y) reads so the boundary cannot itself fail to parse '
+    + 'on an older Safari.')
+})
+
+test('WizardStepErrorBoundary uses constructor.bind instead of class fields', () => {
+  // Pre-fix: `retry = () => this.setState(...)` was a class-field
+  // arrow. Some older engines don't accept the syntax natively; vite
+  // transpiles but defence-in-depth prefers constructor.bind so the
+  // code is byte-identical for every target.
+  assert.match(boundarySrc, /this\.retry\s*=\s*this\.retry\.bind\(this\)/,
+    'retry must be bound in the constructor, not declared as a class field')
+})
+
+test('WizardStepErrorBoundary forwards errors to window.__cobotReportError', () => {
+  assert.match(boundarySrc, /window\.__cobotReportError/,
+    'componentDidCatch must forward to the global overlay so a tablet '
+    + 'with no devtools still sees the error above the wizard.')
+})
+
+const htmlSrc = fs.readFileSync(
+  path.resolve(__dirname, '..', '..', 'index.html'), 'utf8')
+
+test('index.html installs a global error overlay before React loads', () => {
+  // The ES5-only inline script must register listeners for both
+  // uncaught sync errors and unhandled promise rejections AND expose
+  // window.__cobotReportError so React boundaries can push into the
+  // same banner.
+  assert.match(htmlSrc, /id="global-error-overlay"/,
+    'overlay container must exist in the HTML')
+  assert.match(htmlSrc, /addEventListener\(['"]error['"]/,
+    'uncaught sync errors must be reported')
+  assert.match(htmlSrc, /addEventListener\(['"]unhandledrejection['"]/,
+    'unhandled rejections must be reported')
+  assert.match(htmlSrc, /window\.__cobotReportError\s*=/,
+    'global push hook must exist for React boundaries to forward into')
+  // The overlay script must come BEFORE the module script so it can
+  // catch any error thrown during module eval.
+  const overlayIdx = htmlSrc.indexOf('__cobotReportError')
+  const moduleIdx  = htmlSrc.indexOf('type="module"')
+  assert.ok(overlayIdx > 0 && moduleIdx > overlayIdx,
+    'overlay installer must appear BEFORE the type=module script tag')
+})
