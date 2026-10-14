@@ -9,6 +9,7 @@ import PalletFrameDiagram from './PalletFrameDiagram'
 import { getToolHookup, toolHookupKey } from '../lib/toolsApi'
 import ToolFromCellStep from './ToolFromCellStep'
 import { QuestionCard } from './WizardStepCard'
+import WizardStepErrorBoundary from './WizardStepErrorBoundary'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { useSynapsePortmap, displayNameForRaw } from '../lib/synapsePortmap'
 import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
@@ -1657,14 +1658,33 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
 // payload mass under one canonical card — resolving the pre-merge
 // confusion where the mass step's "What tool or payload…" question
 // implied cards but didn't render them.
+//
+// 2026-10-14 crash-hardening (operator field report): the step
+// must render safely for ALL answers shapes — fresh program (no
+// payload keys), skipped mass ('skip'), numeric mass, NaN after a
+// bad input, and legacy cog_mm shapes that aren't a plain object.
+// Every read goes through a helper that returns a safe default
+// instead of trusting the shape. See cog = _safeCog(...) below.
+function _safeNumber(v) {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+function _safeCog(v) {
+  // Accept only plain objects; everything else (array, number,
+  // string, null, undefined) renders as the empty-cog state.
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return {}
+  return v
+}
 function ToolAndPayloadStep({ answers, setAnswer, goNext }) {
-  const kg       = answers.payload_kg
-  const kgNum    = Number(kg)
-  const massOk   = kg === 'skip' || (Number.isFinite(kgNum) && kgNum > 0)
-  const toolPicked = !!answers.cell_eoat_id
+  const safeAnswers = answers || {}
+  const kg       = safeAnswers.payload_kg
+  const kgNum    = _safeNumber(kg)
+  const massOk   = kg === 'skip' || (kgNum !== null && kgNum > 0)
+  const toolPicked = !!safeAnswers.cell_eoat_id
   const canProceed = toolPicked && massOk
   const [showCog, setShowCog] = useState(false)
-  const cog = answers.payload_cog_mm || {}
+  const cog = _safeCog(safeAnswers.payload_cog_mm)
   return (
     <QuestionCard
       question="What tool & payload will this program use?"
@@ -1693,9 +1713,13 @@ function ToolAndPayloadStep({ answers, setAnswer, goNext }) {
           <input
             type="number" step="0.1" min="0" max="30"
             placeholder="e.g. 1.2"
-            value={kg && kg !== 'skip' ? kg : ''}
-            onChange={(e) => setAnswer('payload_kg',
-              e.target.value === '' ? null : Number(e.target.value))}
+            value={kgNum !== null && kgNum > 0 ? kgNum : ''}
+            onChange={(e) => {
+              const raw = e.target.value
+              if (raw === '') { setAnswer('payload_kg', null); return }
+              const n = Number(raw)
+              setAnswer('payload_kg', Number.isFinite(n) ? n : null)
+            }}
             style={{
               display: 'block', marginTop: 6,
               padding: '8px 12px', fontSize: 16, fontWeight: 500,
@@ -1724,12 +1748,15 @@ function ToolAndPayloadStep({ answers, setAnswer, goNext }) {
                 <input
                   type="number" step="0.1"
                   placeholder="0"
-                  value={cog[k] !== undefined && cog[k] !== null ? mmToIn(cog[k], 2) : ''}
+                  value={_safeNumber(cog[k]) !== null ? mmToIn(cog[k], 2) : ''}
                   onChange={(e) => {
                     const v = e.target.value
                     const next = { ...cog }
                     if (v === '') delete next[k]
-                    else if (Number.isFinite(Number(v))) next[k] = inToMm(Number(v))
+                    else {
+                      const n = Number(v)
+                      if (Number.isFinite(n)) next[k] = inToMm(n)
+                    }
                     setAnswer('payload_cog_mm', Object.keys(next).length ? next : null)
                   }}
                   style={{
@@ -3594,8 +3621,9 @@ export default function ProgramWizard({ onClose, onSaved }) {
   // transition.
   //
   // Treating page.render as a component type (JSX element) gives each
-  // page its own fiber and hook stack. key={safeIdx} forces a fresh
-  // mount per page so even repeat visits start with a clean stack.
+  // page its own fiber and hook stack. key={safeIdx} on the surrounding
+  // WizardStepErrorBoundary forces a fresh mount per page so even
+  // repeat visits start with a clean stack AND a cleared boundary.
   const PageBody = page && typeof page.render === 'function' ? page.render : null
 
   return (
@@ -3646,18 +3674,23 @@ export default function ProgramWizard({ onClose, onSaved }) {
         {/* Content */}
         <div style={{ flex: 1, overflowY: 'auto' }}>
           {PageBody ? (
-            <PageBody
+            <WizardStepErrorBoundary
               key={safeIdx}
-              answers={answers}
-              setAnswer={setAnswer}
-              goNext={goNext}
-              goBack={goBack}
-              steps={builtSteps}
-              saving={saving}
-              onSave={handleSave}
-              reusedSteps={reusedSteps}
-              setReusedSteps={setReusedSteps}
-            />
+              stepId={page?.id}
+              onBack={history.length > 1 ? goBack : null}
+            >
+              <PageBody
+                answers={answers}
+                setAnswer={setAnswer}
+                goNext={goNext}
+                goBack={goBack}
+                steps={builtSteps}
+                saving={saving}
+                onSave={handleSave}
+                reusedSteps={reusedSteps}
+                setReusedSteps={setReusedSteps}
+              />
+            </WizardStepErrorBoundary>
           ) : (
             <div style={{ padding: 32, textAlign: 'center', color: '#6b7280' }}>
               <div style={{ fontSize: 14, marginBottom: 12 }}>
