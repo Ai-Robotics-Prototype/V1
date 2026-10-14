@@ -74,58 +74,135 @@ export function useKeyboardInset() {
 
 // scrollFocusedIntoView — call from a text field's onFocus.
 //
-// Three-shot schedule (2026-10-14 operator audit #8C, tablet
-// payload-step blank-with-keyboard class):
+// Three-shot schedule, with the LATE shots doing MANUAL centering
+// against the actual visualViewport (2026-10-14 operator audit #8D,
+// iPad tuning follow-up):
 //
-//   t=rAF (~16 ms)   — first scroll. The old single-shot behaviour.
-//                      Covers the fast-keyboard case (keyboard already
-//                      visible, operator tabbing between fields).
-//   t=320 ms         — second scroll. iOS Safari's keyboard-open
-//                      animation finishes around 250-300 ms. The
-//                      first rAF scroll centred the field in the
-//                      LAYOUT viewport (still full height); by the
-//                      time the keyboard was actually on screen the
-//                      centred position was behind it. This second
-//                      pass runs AFTER the animation so block:'center'
-//                      is now relative to the shrunk VISUAL viewport.
-//   on vv.resize     — third scroll. If --kb-inset only updates after
-//                      the resize event lands (standalone-PWA iOS
-//                      quirk), re-run the scroll with the updated
-//                      inset in effect. Listener auto-detaches after
-//                      first fire (one-shot per focus).
+//   t=rAF (~16 ms)   — scrollIntoView({block:'center'}). The old
+//                      shot. Fast path for keyboard-already-up
+//                      (field→field tabbing).
+//   t=350 ms         — MANUAL centre. iOS Safari's keyboard-open
+//                      animation finishes around 300-350 ms; its
+//                      own built-in "auto-scroll input into view"
+//                      runs during that animation and tends to land
+//                      the field near the TOP of the visible band
+//                      (operator photo on C1_kSxD9: field pinned to
+//                      the top edge instead of comfortably centred).
+//                      This shot IGNORES scrollIntoView's hint and
+//                      computes the exact scroll delta from
+//                      container + visualViewport + field rect so
+//                      the field sits in the middle of the band ABOVE
+//                      the keyboard. It wins over Safari's hint
+//                      because it ran last.
+//   on vv.resize     — re-runs the MANUAL centre once the next
+//                      visualViewport resize lands (standalone-PWA
+//                      iOS quirk: the resize is the first reliable
+//                      signal the inset actually updated). One-shot,
+//                      detaches itself + 2 s safety-net cleanup for
+//                      the hardware-keyboard case.
 //
-// Fires are guarded independently so none of them can block the
-// others. scrollIntoView may throw on ancient engines (hence the
-// try/catch); we also fall back to the no-options form.
+// Why manual > scrollIntoView({block:'center'}):
+//   block:'center' centres the field in the SCROLL CONTAINER'S
+//   visible area as the browser understands it. On iOS Safari in
+//   standalone-PWA mode the browser's idea of "visible area" doesn't
+//   subtract the on-screen keyboard, so the "centre" is the centre
+//   of the whole modal — which, after the keyboard rises, puts the
+//   field right under the modal header near the top of what the
+//   OPERATOR actually sees. Computing from
+//   visualViewport.height / offsetTop closes that gap.
 export function scrollFocusedIntoView(el) {
   if (!el || typeof el.scrollIntoView !== 'function') return
-  const _scroll = () => {
+  const _naiveScroll = () => {
     try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }) }
     catch {
       try { el.scrollIntoView() } catch { /* give up — never throw */ }
     }
   }
-  // Shot 1: next frame.
-  try { requestAnimationFrame(_scroll) } catch { _scroll() }
-  // Shot 2: post-keyboard-animation.
-  try { setTimeout(_scroll, 320) } catch { /* nop */ }
-  // Shot 3: next visualViewport resize (one-shot), for the case
-  // where the keyboard's resize event is the first reliable signal
-  // the inset actually updated.
+  const _manualCentre = () => {
+    try {
+      const container = _findScrollContainer(el)
+      const vv = (typeof window !== 'undefined') ? window.visualViewport : null
+      // Visible viewport bounds (in document-ish coords). On engines
+      // without visualViewport we fall back to window.innerHeight —
+      // which equals the layout viewport, so centring will match the
+      // naive path (no worse than before).
+      const vvTop    = vv ? (vv.offsetTop || 0) : 0
+      const vvHeight = vv ? vv.height : (window.innerHeight || 0)
+      if (!container || !vvHeight) { _naiveScroll(); return }
+      const cRect = container.getBoundingClientRect()
+      const eRect = el.getBoundingClientRect()
+      // The "visible band" is the intersection of the scroll
+      // container with the visual viewport. If the keyboard covers
+      // the lower part of the modal, visibleBottom = top-of-keyboard,
+      // not container.bottom.
+      const visibleTop    = Math.max(cRect.top, vvTop)
+      const visibleBottom = Math.min(cRect.bottom, vvTop + vvHeight)
+      const bandHeight    = Math.max(0, visibleBottom - visibleTop)
+      // 16 px breathing room above/below the field. If the band is
+      // tight (<= field + margin), park the field with 16 px top
+      // margin and let the operator scroll by hand — centring in a
+      // tiny band would clip the field itself.
+      const margin = 16
+      let desiredFieldTop
+      if (bandHeight <= eRect.height + margin * 2) {
+        desiredFieldTop = visibleTop + margin
+      } else {
+        desiredFieldTop = visibleTop + (bandHeight - eRect.height) / 2
+      }
+      // Delta between where the field is NOW and where we want it.
+      // Positive delta → scroll container DOWN (field was below).
+      const delta = eRect.top - desiredFieldTop
+      if (Math.abs(delta) < 2) return  // already centred within noise
+      // Prefer smooth scroll — iPad honours it. Fall back to abrupt
+      // assignment if the browser rejects the options bag.
+      try {
+        container.scrollBy({ top: delta, left: 0, behavior: 'smooth' })
+      } catch {
+        container.scrollTop = (container.scrollTop || 0) + delta
+      }
+    } catch {
+      _naiveScroll()
+    }
+  }
+  // Shot 1: next frame — fast path when keyboard is already up.
+  try { requestAnimationFrame(_naiveScroll) } catch { _naiveScroll() }
+  // Shot 2: post-keyboard-animation manual centre.
+  try { setTimeout(_manualCentre, 350) } catch { /* nop */ }
+  // Shot 3: next visualViewport resize (one-shot) — covers the
+  // standalone-PWA case where the resize fires AFTER our 350 ms
+  // timer. Idempotent with shot 2 (both do _manualCentre); if the
+  // keyboard was already up during shot 2 the resize may never
+  // fire and the safety-net detach cleans up.
   try {
     const vv = typeof window !== 'undefined' ? window.visualViewport : null
     if (vv && typeof vv.addEventListener === 'function') {
       const once = () => {
         vv.removeEventListener('resize', once)
-        _scroll()
+        _manualCentre()
       }
       vv.addEventListener('resize', once)
-      // Safety net: detach the listener if the keyboard never opens
-      // (e.g. hardware keyboard attached, focus happened without the
-      // on-screen keyboard surfacing).
       setTimeout(() => { try { vv.removeEventListener('resize', once) } catch {} }, 2000)
     }
   } catch { /* nop */ }
+}
+
+// Walk up from `el` and return the nearest ancestor that scrolls
+// (overflow-y of auto/scroll). Falls back to the document scrolling
+// element so a caller is never left with null.
+function _findScrollContainer(el) {
+  let cur = el && el.parentElement
+  while (cur) {
+    try {
+      const style = getComputedStyle(cur)
+      const oy = style && style.overflowY
+      if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') return cur
+    } catch { /* detached node — skip */ }
+    cur = cur.parentElement
+  }
+  if (typeof document !== 'undefined') {
+    return document.scrollingElement || document.documentElement
+  }
+  return null
 }
 
 

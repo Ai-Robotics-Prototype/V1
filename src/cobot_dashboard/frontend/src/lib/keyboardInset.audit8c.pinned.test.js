@@ -46,28 +46,68 @@ const tokens   = readStyles('tokens.css')
 // ── scrollFocusedIntoView three-shot schedule ────────────────────
 
 test('scrollFocusedIntoView fires on rAF (shot 1)', () => {
-  assert.match(kbSrc, /requestAnimationFrame\(_scroll\)/,
-    'first shot must be requestAnimationFrame(_scroll) — covers the '
-    + 'fast-keyboard case where the keyboard was already up')
+  // 2026-10-14 audit #8D: shot 1 is the FAST path (keyboard already
+  // up, field-to-field tabbing). Still uses scrollIntoView via the
+  // _naiveScroll helper. Shots 2 + 3 do the real work (manual centre).
+  assert.match(kbSrc, /requestAnimationFrame\(_naiveScroll\)/,
+    'first shot must be requestAnimationFrame(_naiveScroll)')
 })
 
-test('scrollFocusedIntoView fires again after the keyboard animation (shot 2)', () => {
-  // iOS keyboard animation lands around 250-300 ms. The second scroll
-  // must sit JUST after that so block:'center' re-runs against the
-  // now-shrunk visual viewport.
-  assert.match(kbSrc, /setTimeout\(_scroll,\s*320\)/,
-    'second shot must be setTimeout(_scroll, 320) — fires after the '
-    + 'iOS keyboard animation completes so the field is actually '
-    + 'centred in the VISIBLE (post-shrink) viewport, not the pre-'
-    + 'keyboard LAYOUT viewport')
+test('scrollFocusedIntoView does a MANUAL centre at shot 2 (post-keyboard-animation)', () => {
+  // The naive scrollIntoView({block:'center'}) landed the field at
+  // the top edge on iPad Safari (operator photo on C1_kSxD9 — field
+  // visible but pinned high) because the browser's "centre" didn't
+  // subtract the keyboard. Shot 2 now computes the exact scroll
+  // delta from visualViewport.height / offsetTop and places the
+  // field in the middle of the band ABOVE the keyboard.
+  assert.match(kbSrc, /setTimeout\(_manualCentre,\s*350\)/,
+    'second shot must be setTimeout(_manualCentre, 350) — fires after '
+    + 'the iOS keyboard animation completes so the manual compute '
+    + 'runs against the shrunk visual viewport')
+  // The manual centre MUST read visualViewport.height and offsetTop
+  // (not just rely on scrollIntoView's hint).
+  assert.match(kbSrc, /vv\s*\?\s*vv\.height/,
+    'manual centre must read vv.height to subtract the keyboard')
+  assert.match(kbSrc, /vv\s*\?\s*\(vv\.offsetTop/,
+    'manual centre must read vv.offsetTop to account for a shifted '
+    + 'visual viewport (iOS pinch-zoom + keyboard)')
 })
 
-test('scrollFocusedIntoView re-scrolls on the next visualViewport resize (shot 3)', () => {
-  // Belt-and-braces for standalone-PWA iOS where the fixed 320 ms
-  // timer sometimes beats the actual resize event. The one-shot
-  // listener fires exactly once per focus and detaches itself after
-  // 2 s so a focus that never raised the keyboard (hardware keyboard
-  // attached) doesn't leave listener debris.
+test('manual centre computes the visible band and targets the middle of it', () => {
+  // Visible band = intersection of scroll container and visual
+  // viewport. Must appear in the compute, otherwise the "centre" is
+  // the container centre (= Safari\'s old wrong answer).
+  assert.match(kbSrc, /const\s+visibleTop\s*=\s*Math\.max\(cRect\.top,\s*vvTop\)/,
+    'visibleTop must clip the container to the visual viewport top')
+  assert.match(kbSrc,
+    /const\s+visibleBottom\s*=\s*Math\.min\(cRect\.bottom,\s*vvTop\s*\+\s*vvHeight\)/,
+    'visibleBottom must clip to the top-of-keyboard, not container.bottom')
+  assert.match(kbSrc,
+    /desiredFieldTop\s*=\s*visibleTop\s*\+\s*\(bandHeight\s*-\s*eRect\.height\)\s*\/\s*2/,
+    'desiredFieldTop must centre the field inside the clipped band, '
+    + 'not the raw container')
+  // Breathing-room fallback for a tight band so we never target
+  // outside the field itself.
+  assert.match(kbSrc,
+    /bandHeight\s*<=\s*eRect\.height\s*\+\s*margin\s*\*\s*2/,
+    'tight-band fallback must park the field with margin rather than '
+    + 'crash the compute')
+})
+
+test('_findScrollContainer walks up to the first overflow-y: auto/scroll ancestor', () => {
+  assert.match(kbSrc, /function\s+_findScrollContainer\(el\)/,
+    'helper must exist as a named function so the test can grep it')
+  assert.match(kbSrc, /style\.overflowY/,
+    'helper must inspect overflow-y')
+  assert.match(kbSrc, /document\.scrollingElement\s*\|\|\s*document\.documentElement/,
+    'helper must fall back to the document scrolling root so a caller '
+    + 'is never left with null')
+})
+
+test('scrollFocusedIntoView re-scrolls (manual) on the next visualViewport resize (shot 3)', () => {
+  // Shot 3 is the resize-driven re-centre. Uses the manual compute
+  // (not the naive scroll) so a late resize still lands the field in
+  // the middle of the above-keyboard band.
   assert.match(kbSrc,
     /vv\.addEventListener\(['"]resize['"]\s*,\s*once\)/,
     'third shot must register a one-shot resize listener on '
@@ -76,6 +116,12 @@ test('scrollFocusedIntoView re-scrolls on the next visualViewport resize (shot 3
     /vv\.removeEventListener\(['"]resize['"]\s*,\s*once\)/,
     'the listener must detach itself after it fires — a leaky listener '
     + 'would re-scroll on every keyboard open on the page')
+  // The one-shot handler must call _manualCentre (not _naiveScroll)
+  // so the resize-driven re-run also lands in the centre of the band.
+  assert.match(kbSrc,
+    /const\s+once\s*=\s*\(\)\s*=>\s*\{\s*\n[\s\S]*?_manualCentre\(\)/,
+    'the resize handler must call _manualCentre so the late re-run '
+    + 'also centres in the above-keyboard band')
   // Safety-net detach so the listener is cleaned up even if the
   // keyboard never comes up (hardware keyboard case).
   assert.match(kbSrc,
