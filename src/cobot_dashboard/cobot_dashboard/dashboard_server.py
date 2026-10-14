@@ -14736,8 +14736,34 @@ if FASTAPI_AVAILABLE:
 
     _static = str(_STATIC_DIR)
     _assets  = os.path.join(_static, "assets")
+
+    # /assets/* is vite's content-hashed bundle output
+    # (index-<HASH>.{js,css}). The hash IS the version, so an asset
+    # at a given URL is immutable by construction: a new build never
+    # overwrites index-ABC123.js, it emits index-DEF456.js and the
+    # index.html references the new tag. Teach the browser that
+    # explicitly via Cache-Control:immutable so once the tablet has
+    # loaded a given hash, it stops revalidating. New hash = new URL
+    # = fresh fetch; nothing to invalidate.
+    #
+    # 2026-10-14 operator audit #8B (tablet-stale class): the asset
+    # mount previously shipped NO Cache-Control at all, so iOS Safari
+    # cached assets with its implicit heuristic (10 % of
+    # last-modified age — unpredictable). Pinning the policy here
+    # removes a browser-side variable, and prevents iOS from EVER
+    # revalidating a hashed asset against the server (which saved
+    # the stale-after-reload class on at least one tablet).
+    class _ImmutableAssets(StaticFiles):
+        async def get_response(self, path, scope):
+            resp = await super().get_response(path, scope)
+            # Only decorate successful 200/304 — a 404 through the
+            # SPA router must not advertise itself as cacheable.
+            if resp.status_code in (200, 304):
+                resp.headers["Cache-Control"] = \
+                    "public, max-age=31536000, immutable"
+            return resp
     if os.path.isdir(_assets):
-        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
+        app.mount("/assets", _ImmutableAssets(directory=_assets), name="assets")
 
     # index.html must never be cached by the browser — its content-hashed
     # asset URLs are how new bundles get picked up. A cached shell pins
@@ -14760,7 +14786,13 @@ if FASTAPI_AVAILABLE:
     async def serve_manifest():
         path = os.path.join(_static, "manifest.json")
         if os.path.isfile(path):
-            return FileResponse(path, media_type="application/manifest+json")
+            # No-cache alongside index.html — if we ever change
+            # start_url / scope / icons, an iOS "Add to Home Screen"
+            # install must pick the new manifest up on next launch
+            # rather than loading from Safari's app-cache layer.
+            return FileResponse(path,
+                                media_type="application/manifest+json",
+                                headers=_NO_CACHE)
         return JSONResponse({"detail": "manifest missing"}, status_code=404)
 
     @app.get("/parts/{filename:path}")

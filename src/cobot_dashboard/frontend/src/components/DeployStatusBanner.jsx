@@ -21,9 +21,15 @@
 // 32px so the tablet footer chrome isn't disrupted.
 
 import { useEffect, useState } from 'react'
+import { useStore } from '../store/useStore'
 
 
 const POLL_MS = 3000
+
+// Bare SHA stripper — matches store/useStore.js hello handler.
+// Keeps the compare resilient to the `-dirty` suffix vite bakes
+// into __GIT_SHA__ on local builds.
+function _bare(s) { return String(s || '').replace(/-dirty$/, '') }
 
 // Small age formatter — deploy age is the wall-clock time since
 // the last successful deploy landed. "<1m ago" / "3m ago" / "2h ago".
@@ -41,6 +47,8 @@ function fmtAgeFromIso(iso) {
 
 export default function DeployStatusBanner() {
   const [status, setStatus] = useState(null)
+  const setStaleProvenance = useStore((s) => s._setStaleProvenance)
+  const existingStale      = useStore((s) => s.staleProvenance)
 
   useEffect(() => {
     let cancelled = false
@@ -50,13 +58,44 @@ export default function DeployStatusBanner() {
         const r = await fetch('/api/deploy_status', { cache: 'no-store' })
         if (!r.ok) return
         const body = await r.json()
-        if (!cancelled) setStatus(body)
+        if (cancelled) return
+        setStatus(body)
+        // Fallback stale-provenance detection — 2026-10-14 operator
+        // audit #8B. The WS hello frame is the primary stale signal
+        // (store/useStore.js onmessage 'hello'), but if the WS has
+        // never connected on this tab (first-load race, blocked
+        // transport, auth gate) the operator can sit on an old
+        // bundle indefinitely while this banner polls happily. Mirror
+        // the hello compare here against __GIT_SHA__: if the
+        // deploy_status provenance's frontend_sha differs from the
+        // bundle's baked SHA, trip staleProvenance so StaleGuard
+        // overlays. No-op when the SHAs match or when staleness is
+        // already latched (don't overwrite a backend-layer latch
+        // with a frontend one or vice-versa).
+        try {
+          const prov = (body && body.provenance) || {}
+          const mySha = (typeof __GIT_SHA__ !== 'undefined')
+                          ? __GIT_SHA__ : 'unknown'
+          const bareSelf   = _bare(mySha)
+          const bareFrontS = _bare(prov.frontend_sha)
+          if (bareSelf !== 'unknown' && bareFrontS
+              && bareFrontS !== 'unknown'
+              && bareSelf !== bareFrontS
+              && !existingStale) {
+            setStaleProvenance({
+              layer:    'frontend',
+              expected: bareSelf,
+              actual:   bareFrontS,
+              detectedAt: Date.now(),
+            })
+          }
+        } catch { /* best-effort — never let the stale check crash the banner */ }
       } catch { /* silent — retry next tick */ }
     }
     tick()
     timer = setInterval(tick, POLL_MS)
     return () => { cancelled = true; if (timer) clearInterval(timer) }
-  }, [])
+  }, [setStaleProvenance, existingStale])
 
   if (!status) return null
   const state = status.state

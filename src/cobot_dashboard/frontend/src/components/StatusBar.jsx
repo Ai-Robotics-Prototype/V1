@@ -132,6 +132,63 @@ export default function StatusBar() {
           Guards OFF
         </div>
       )}
+      <div style={{ flex: 1 }} />
+      <VersionChip />
+    </div>
+  )
+}
+
+// VersionChip — 2026-10-14 operator audit #8B (tablet-stale class).
+// Reads two independent SHAs and renders them in the footer:
+//   * bundle    — vite's content-hashed asset filename
+//                 (/assets/index-<HASH>.js), extracted from the DOM
+//                 at render time. This is WHAT THE BROWSER ACTUALLY
+//                 LOADED — survives a stale cache lie because the
+//                 hash came off the script tag, not a baked constant.
+//   * git       — __GIT_SHA__ baked by vite at build time (first 7
+//                 chars). The pair tells the operator "which commit
+//                 did this bundle come from" without needing
+//                 devtools or /api/deploy_status.
+// Long-press / hover: shows the full SHA + build time + a one-tap
+// cache-busting reload link, so a tablet operator who cannot open
+// devtools can still answer "is this the new code?" and force a
+// refresh if the answer is no.
+function VersionChip() {
+  const bundle = getServedBundleHash() || '?'
+  const git = (typeof __GIT_SHA__ !== 'undefined' ? __GIT_SHA__ : 'unknown')
+    .replace(/-dirty$/, '')
+  const gitShort = git === 'unknown' ? '?' : git.slice(0, 7)
+  const buildTime = (typeof __BUILD_TIME__ !== 'undefined') ? __BUILD_TIME__ : '?'
+  const reload = () => {
+    try {
+      const u = new URL(window.location.href)
+      u.searchParams.set('_r', Date.now().toString(36))
+      window.location.replace(u.toString())
+    } catch { window.location.reload() }
+  }
+  return (
+    <div
+      data-testid="footer-version-chip"
+      data-bundle={bundle}
+      data-git={git}
+      title={`Bundle: ${bundle}\nGit:    ${git}\nBuilt:  ${buildTime}\n\nTap to hard-reload (cache-bust).`}
+      onClick={reload}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        marginLeft: 14, paddingLeft: 14,
+        borderLeft: '1px solid var(--border)',
+        fontSize: 10, color: 'var(--text-secondary)',
+        fontFamily: 'var(--font-mono, monospace)',
+        fontVariantNumeric: 'tabular-nums',
+        letterSpacing: '0.03em',
+        whiteSpace: 'nowrap', height: '100%',
+        cursor: 'pointer',
+        userSelect: 'none',
+      }}>
+      <span>v</span>
+      <span style={{ fontWeight: 700 }}>{gitShort}</span>
+      <span style={{ opacity: 0.5 }}>·</span>
+      <span>{bundle}</span>
     </div>
   )
 }
