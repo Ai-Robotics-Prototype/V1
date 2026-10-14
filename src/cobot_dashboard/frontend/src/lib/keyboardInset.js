@@ -297,6 +297,66 @@ export function kbSafeModalContentStyle(vhCap = 92, padBottom = 24) {
 }
 
 
+// kbSafeFlexShellStyle + kbSafeScrollChildStyle — the TWO-PART pair
+// for a MODAL BUILT AS A FLEX COLUMN (ProgramWizard, future multi-
+// page prompts).
+//
+// Why a split helper exists at all:
+//
+// `kbSafeModalContentStyle()` is designed for the common case of a
+// simple modal whose outer container IS the scroll surface — a
+// LoginModal <form>, a RecordConfirmModal <div>. One element holds
+// every input, the paddingBottom gives the last field breathing room
+// above the keyboard, and overflowY:auto scrolls the whole thing.
+// That shape works directly on the element and is why Login / EOAT
+// naming / rename / fixtures all behave on the iPad.
+//
+// A FLEX-COLUMN WIZARD breaks that shape: the shell has a HEADER
+// (title + close), a PROGRESS BAR, and a SCROLL CHILD, and
+// box-sizing:border-box makes the shell's own padding steal from
+// every flex sibling simultaneously. When the keyboard opens and
+// --kb-inset grows to ~300 px, the shell's paddingBottom grows to
+// ~324 px, and the content area left for the three flex children
+// collapses — the scroll child (last sibling) is squeezed into a
+// strip of 60-120 px tall on iPad landscape. From the operator's
+// seat that reads as "the field is barely visible": the field
+// renders, the manual-centre scroll runs, but the scrollable band
+// IS the squeezed strip. Operator audit #8E (2026-10-14 iPad
+// confirmed: other modals fine, wizard not).
+//
+// The split:
+//   * kbSafeFlexShellStyle(vhCap) → maxHeight + boxSizing. NO
+//     paddingBottom; the shell stays the full dynamic-viewport
+//     height, so header / progress / scroll child all keep their
+//     intrinsic space.
+//   * kbSafeScrollChildStyle(padBottom) → overflowY:auto +
+//     paddingBottom:calc(padBottom + inset). Applied to the
+//     scroll child (the flex:1 one) so the last field in the
+//     scrollable area gets breathing room — same semantic the
+//     simple-form variant had, now scoped to the sibling where
+//     the inputs actually live.
+//
+// Simple-form modals should keep using kbSafeModalContentStyle; this
+// pair is specifically for shells that are a flex column with more
+// than one child (header + content, or header + content + footer).
+
+export function kbSafeFlexShellStyle(vhCap = 92) {
+  const vhCapInt = Math.round(vhCap)
+  return {
+    maxHeight:   `min(calc(${vhCapInt}dvh - var(--kb-inset, 0px)), `
+                 + `calc(${vhCapInt}vh - var(--kb-inset, 0px)))`,
+    boxSizing:   'border-box',
+  }
+}
+
+export function kbSafeScrollChildStyle(padBottom = 24) {
+  return {
+    overflowY:     'auto',
+    paddingBottom: `calc(${padBottom}px + var(--kb-inset, 0px))`,
+  }
+}
+
+
 // kbSafeOverlayStyle — the OTHER half of the keyboard-safe pair.
 // Spread on the OUTER `position: fixed; inset: 0; display: flex;
 // alignItems: center` overlay of every modal / dialog / wizard.

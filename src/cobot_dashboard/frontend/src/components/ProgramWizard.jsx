@@ -19,7 +19,8 @@ import { effectorReady, effectorEngage, effectorDisengage,
          clampWorkpiece, unclampWorkpiece,
          startMachineCycle, waitMachineCycle } from '../lib/effectorVocab'
 import { typeLabel } from '../lib/cellEntryDisplay'
-import { kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
+import { kbSafeFlexShellStyle, kbSafeScrollChildStyle,
+         kbSafeOverlayStyle } from '../lib/keyboardInset'
 
 /*
  * Conversational Program Wizard
@@ -3638,7 +3639,19 @@ export default function ProgramWizard({ onClose, onSaved }) {
         background: '#fff', borderRadius: 16, overflow: 'hidden',
         boxShadow: '0 25px 60px rgba(0,0,0,0.25)',
         display: 'flex', flexDirection: 'column',
-        ...kbSafeModalContentStyle(95),
+        // Audit #8E (2026-10-14 iPad tuning): the shell is a flex
+        // COLUMN with three children (header + progress + scroll).
+        // kbSafeModalContentStyle(95)'s paddingBottom lived HERE
+        // pre-fix, and when the keyboard opened the padding grew to
+        // ~324 px INSIDE the box-sizing: border-box height, stealing
+        // from every flex sibling — the scroll child collapsed to a
+        // 60-120 px strip on landscape and the operator saw "the
+        // field is barely visible". The split helpers put maxHeight
+        // + boxSizing here (where they belong on the sizing
+        // container) and move paddingBottom down to the scroll
+        // child (where it belongs — breathing room for the last
+        // field in the scrollable list).
+        ...kbSafeFlexShellStyle(95),
       }}>
         {/* Header */}
         <div style={{
@@ -3672,7 +3685,16 @@ export default function ProgramWizard({ onClose, onSaved }) {
         </div>
 
         {/* Content */}
-        <div style={{ flex: 1, overflowY: 'auto' }}>
+        <div style={{
+          flex: 1,
+          // Audit #8E (2026-10-14): paddingBottom moved here from
+          // the shell. On the shell it stole flex-sibling space when
+          // --kb-inset grew. On the scroll child it just gives the
+          // last field in the scrollable list breathing room above
+          // the keyboard — same semantic as kbSafeModalContentStyle
+          // on a simple-form modal (LoginModal etc.).
+          ...kbSafeScrollChildStyle(24),
+        }}>
           {PageBody ? (
             <WizardStepErrorBoundary
               key={safeIdx}

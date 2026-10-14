@@ -164,12 +164,49 @@ test('ProgramWizard modal panel wears the .kb-safe-modal-shell class', () => {
     'ProgramWizard modal panel must wear className="kb-safe-modal-shell"')
   // The class + inline-style both set max-height; the inline value
   // wins when parseable, class wins when the inline value drops.
-  // Pin that the inline helper is still called on the SAME element.
+  // 2026-10-14 audit #8E (iPad fix): the inline helper changed from
+  // kbSafeModalContentStyle(95) to kbSafeFlexShellStyle(95) because
+  // the shell is a FLEX COLUMN (header + progress + scroll child)
+  // and the old helper's paddingBottom was collapsing the scroll
+  // child's flex: 1 share when --kb-inset grew. The new helper omits
+  // paddingBottom (which now lives on the scroll child via
+  // kbSafeScrollChildStyle). Pin verifies the correct helper is on
+  // the SAME element as the shell class — strip out the surrounding
+  // comment first so a mention of the OLD helper in a code comment
+  // can't false-match.
   const modalLineIdx = wizSrc.indexOf('className="kb-safe-modal-shell"')
-  const sliceAfter   = wizSrc.slice(modalLineIdx, modalLineIdx + 600)
-  assert.match(sliceAfter, /kbSafeModalContentStyle\(95\)/,
-    'the inline kbSafeModalContentStyle(95) spread must still appear '
-    + 'on the SAME modal panel element as the fallback class')
+  const sliceAfter   = wizSrc.slice(modalLineIdx, modalLineIdx + 1200)
+  // Comment-strip: drop every // line before matching so historical
+  // helper names in explanatory comments don't satisfy the pin.
+  const noComments = sliceAfter.replace(/\/\/[^\n]*\n/g, '\n')
+  assert.match(noComments, /\.\.\.\s*kbSafeFlexShellStyle\(95\)/,
+    'the inline kbSafeFlexShellStyle(95) spread must appear on the '
+    + 'SAME modal panel element as the fallback class (the new '
+    + 'split-pair helper for flex-column modals)')
+  assert.equal(/\.\.\.\s*kbSafeModalContentStyle\(/.test(noComments), false,
+    'the old kbSafeModalContentStyle spread must NOT be on the shell '
+    + 'anymore — it collapsed the flex scroll child under keyboard')
+})
+
+test('ProgramWizard content div uses kbSafeScrollChildStyle', () => {
+  // The paddingBottom used to live on the shell; it must now live
+  // on the scroll child, together with overflowY:auto. If a future
+  // refactor pulls them back onto the shell the iPad landscape
+  // regression returns.
+  assert.match(wizSrc, /\.\.\.\s*kbSafeScrollChildStyle\(/,
+    'ProgramWizard content div must spread kbSafeScrollChildStyle so '
+    + 'paddingBottom + overflowY land on the scroll child, not the '
+    + 'flex-column shell')
+  // Pin that the content div still carries flex:1 so the shell\'s
+  // header + progress still size naturally and the scroll child takes
+  // the remainder. Strip comments so a long inline note between
+  // `flex: 1` and the spread doesn\'t push them apart.
+  const scrollChildIdx = wizSrc.indexOf('kbSafeScrollChildStyle(')
+  const before = wizSrc.slice(Math.max(0, scrollChildIdx - 800), scrollChildIdx)
+  const noComments = before.replace(/\/\/[^\n]*\n/g, '\n')
+  assert.match(noComments, /flex:\s*1/,
+    'the scroll child must still carry flex: 1 so it takes the '
+    + 'leftover vertical space after header + progress bar')
 })
 
 // ── Payload step: no auto-focus (keyboard doesn't pop on step entry) ─
