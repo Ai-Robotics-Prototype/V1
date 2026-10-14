@@ -178,11 +178,27 @@ test('kbSafeModalContentStyle degrades to a 0px shift when --kb-inset is absent'
   // visualViewport shrink → inset stays 0 → calc evaluates to the
   // pre-change maxHeight). This pin blocks any edit that drops the
   // fallback and silently zeros the modal on desktop.
+  //
+  // 2026-10-14 audit #8C: maxHeight now wraps the vh calc in
+  // `min(dvh, vh)` so dvh-aware engines (iOS 15.4+ / Chrome 108+)
+  // shrink with the on-screen keyboard without depending on our JS
+  // --kb-inset tracking. Both branches of the min() carry the 0px
+  // fallback — the pin checks the semantic (var with 0px fallback
+  // + vh carrier survives) rather than the exact pre-fix form.
   const src = readSrc('lib/keyboardInset.js')
   assert.match(src,
-    /maxHeight:\s*`calc\(\$\{vhCap\}vh - var\(--kb-inset, 0px\)\)`/,
-    'kbSafeModalContentStyle must preserve the 0px fallback so '
-    + 'desktop renders byte-identically to the pre-change layout')
+    /calc\(\$\{vhCapInt?\}vh - var\(--kb-inset, 0px\)\)/,
+    'kbSafeModalContentStyle must preserve the vh branch with the '
+    + '0px fallback so engines that don\'t parse dvh still get a '
+    + 'desktop-byte-identical layout')
+  assert.match(src,
+    /calc\(\$\{vhCapInt?\}dvh - var\(--kb-inset, 0px\)\)/,
+    'kbSafeModalContentStyle must emit the dvh branch so modern '
+    + 'engines shrink with the keyboard independent of JS inset tracking')
+  assert.match(src, /min\(/,
+    'maxHeight must use min(dvh, vh) so dvh wins when supported '
+    + 'and the whole value drops on older engines (which then get the '
+    + '.kb-safe-modal-shell CSS fallback at the stylesheet level)')
 })
 
 

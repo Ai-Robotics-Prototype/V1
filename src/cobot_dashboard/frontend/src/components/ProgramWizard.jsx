@@ -3633,7 +3633,7 @@ export default function ProgramWizard({ onClose, onSaved }) {
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       ...kbSafeOverlayStyle(),
     }}>
-      <div style={{
+      <div className="kb-safe-modal-shell" style={{
         width: '95%', maxWidth: 800,
         background: '#fff', borderRadius: 16, overflow: 'hidden',
         boxShadow: '0 25px 60px rgba(0,0,0,0.25)',

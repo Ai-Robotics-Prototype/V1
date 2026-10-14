@@ -72,16 +72,60 @@ export function useKeyboardInset() {
   return inset
 }
 
-// scrollFocusedIntoView — call from a text field's onFocus. Uses
-// requestAnimationFrame so the browser has painted the keyboard
-// before we measure; block:'center' keeps the field in the middle
-// of the visible viewport regardless of layout height.
+// scrollFocusedIntoView — call from a text field's onFocus.
+//
+// Three-shot schedule (2026-10-14 operator audit #8C, tablet
+// payload-step blank-with-keyboard class):
+//
+//   t=rAF (~16 ms)   — first scroll. The old single-shot behaviour.
+//                      Covers the fast-keyboard case (keyboard already
+//                      visible, operator tabbing between fields).
+//   t=320 ms         — second scroll. iOS Safari's keyboard-open
+//                      animation finishes around 250-300 ms. The
+//                      first rAF scroll centred the field in the
+//                      LAYOUT viewport (still full height); by the
+//                      time the keyboard was actually on screen the
+//                      centred position was behind it. This second
+//                      pass runs AFTER the animation so block:'center'
+//                      is now relative to the shrunk VISUAL viewport.
+//   on vv.resize     — third scroll. If --kb-inset only updates after
+//                      the resize event lands (standalone-PWA iOS
+//                      quirk), re-run the scroll with the updated
+//                      inset in effect. Listener auto-detaches after
+//                      first fire (one-shot per focus).
+//
+// Fires are guarded independently so none of them can block the
+// others. scrollIntoView may throw on ancient engines (hence the
+// try/catch); we also fall back to the no-options form.
 export function scrollFocusedIntoView(el) {
   if (!el || typeof el.scrollIntoView !== 'function') return
-  requestAnimationFrame(() => {
+  const _scroll = () => {
     try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }) }
-    catch { el.scrollIntoView() }
-  })
+    catch {
+      try { el.scrollIntoView() } catch { /* give up — never throw */ }
+    }
+  }
+  // Shot 1: next frame.
+  try { requestAnimationFrame(_scroll) } catch { _scroll() }
+  // Shot 2: post-keyboard-animation.
+  try { setTimeout(_scroll, 320) } catch { /* nop */ }
+  // Shot 3: next visualViewport resize (one-shot), for the case
+  // where the keyboard's resize event is the first reliable signal
+  // the inset actually updated.
+  try {
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null
+    if (vv && typeof vv.addEventListener === 'function') {
+      const once = () => {
+        vv.removeEventListener('resize', once)
+        _scroll()
+      }
+      vv.addEventListener('resize', once)
+      // Safety net: detach the listener if the keyboard never opens
+      // (e.g. hardware keyboard attached, focus happened without the
+      // on-screen keyboard surfacing).
+      setTimeout(() => { try { vv.removeEventListener('resize', once) } catch {} }, 2000)
+    }
+  } catch { /* nop */ }
 }
 
 
@@ -152,8 +196,23 @@ export function useGlobalKeyboardAutoScroll() {
 // `vhCap` defaults to 92 (same as ExternalFixtureWizard pre-fix).
 // `padBottom` defaults to 24 — matches the common modal footer.
 export function kbSafeModalContentStyle(vhCap = 92, padBottom = 24) {
+  // 2026-10-14 operator audit #8C (tablet payload-step blank-with-
+  // keyboard class): dvh is the dynamic viewport height — the
+  // browser SHRINKS it when the on-screen keyboard opens,
+  // independent of our --kb-inset JS tracking. Safari iOS 15.4+
+  // and Chrome Android 108+ support it. Combining dvh with
+  // --kb-inset makes the modal reliably stay above the keyboard
+  // even if visualViewport.resize never fires (standalone-PWA iOS
+  // quirk the operator hit). `min()` picks whichever is shorter;
+  // on an engine that doesn't parse dvh the whole min() expression
+  // is dropped and the browser falls back to the preceding
+  // `maxHeight` property (added via a dvh-feature-detect CSS
+  // helper, since React inline-style can't carry a CSS fallback
+  // on the same key — see styles/tokens.css .kb-safe-modal-shell).
+  const vhCapInt = Math.round(vhCap)
   return {
-    maxHeight:     `calc(${vhCap}vh - var(--kb-inset, 0px))`,
+    maxHeight:     `min(calc(${vhCapInt}dvh - var(--kb-inset, 0px)), `
+                   + `calc(${vhCapInt}vh - var(--kb-inset, 0px)))`,
     paddingBottom: `calc(${padBottom}px + var(--kb-inset, 0px))`,
     overflowY:     'auto',
     boxSizing:     'border-box',

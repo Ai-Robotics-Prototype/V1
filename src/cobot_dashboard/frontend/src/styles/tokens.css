@@ -62,3 +62,15 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 button { font-family: inherit; cursor: pointer; }
+
+/* kb-safe-modal-shell — plain CSS fallback for kbSafeModalContentStyle
+   (lib/keyboardInset.js). The inline style sets maxHeight via
+   `min(dvh, vh)` which SOME engines (iOS Safari < 15.4) can't parse
+   and silently drop. This class gives those engines a vh-only max-
+   height so the modal still shrinks with --kb-inset even when dvh
+   is unknown. Modern engines override via the inline style's
+   higher specificity; older engines fall through to this. One class,
+   applied on every ProgramWizard-style modal panel. */
+.kb-safe-modal-shell {
+  max-height: calc(92vh - var(--kb-inset, 0px));
+}
