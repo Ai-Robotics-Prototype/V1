@@ -475,20 +475,60 @@ test('Configure tab renders ONLY the I/O Interface section', () => {
       + 'home is SafetyPage per the directive).'))
 })
 
-test('profile-choice diagrams are SVG, not ASCII monospace', () => {
-  // The ASCII-art diagrams were visually rough — the polish directive
-  // asks for app-style (SVG or styled boxes).
-  assert.ok(/function _ProfileDiagram/.test(configureSrc),
-    v('ConfigureLayout must declare a _ProfileDiagram SVG component '
-      + '— replaces the retired ASCII blocks.'))
-  assert.ok(/<svg [^>]*viewBox="0 0 220 120"/.test(configureSrc),
-    v('_ProfileDiagram must render an SVG with a stable viewBox so '
-      + 'the two profile cards align.'))
-  // Grep that no monospace box-drawing character leaks into the
-  // Configure JSX — the retired ASCII art used ┌─┐│└┘▼.
+test('I/O-interface cards carry no diagram — title + badge + description only', () => {
+  // 2026-10-15 operator directive ("Configure tab looks cluttered"):
+  // the per-card SVG diagram added no information beyond the plain
+  // description text and was retired. The two cards now render as
+  // title + ACTIVE badge + description only. Pin that the retired
+  // scaffolding is actually gone — no _ProfileDiagram declaration,
+  // no mount, no diagram-only SVG, no diagram labels.
+  assert.equal(/function _ProfileDiagram/.test(configureSrc), false,
+    v('ConfigureLayout must NOT declare _ProfileDiagram — the per-'
+      + 'card SVG diagram was retired 2026-10-15 (operator directive: '
+      + 'card = title + badge + description, no diagram clutter).'))
+  assert.equal(/<_ProfileDiagram\b/.test(configureSrc), false,
+    v('ConfigureLayout must NOT mount <_ProfileDiagram /> — the card '
+      + 'markup drops the diagram box entirely.'))
+  assert.equal(/<svg [^>]*viewBox="0 0 220 120"/.test(configureSrc), false,
+    v('The retired diagram viewBox="0 0 220 120" must not appear in '
+      + 'ConfigureLayout — the diagram SVG is gone, not merely '
+      + 'hidden.'))
+  // The retired diagrams carried literal "SYNAPSE PANEL" + "ROBOT
+  // CONTROLLER" + "Robot controller DO/DI block" + "Field devices
+  // (direct wiring)" labels. None should survive — ensure a dev did
+  // not re-add the diagram under a different wrapper name.
+  for (const label of [
+    'SYNAPSE PANEL',
+    'ROBOT CONTROLLER',
+    'Robot controller DO/DI block',
+    'Field devices (direct wiring)',
+  ]) {
+    assert.equal(configureSrc.includes(label), false,
+      v(`Diagram label "${label}" must not appear in ConfigureLayout '
+        + '— the per-card diagram was retired. Plain description text '
+        + 'already explains addressing.`))
+  }
+  // Legacy pin from the ASCII-era still holds: no box-drawing chars.
   assert.equal(/[┌┐│└┘─▼▲]/.test(configureSrc), false,
-    v('Configure tab must not contain ASCII box-drawing characters '
-      + '— the diagrams are now SVG per the polish directive.'))
+    v('Configure tab must not contain ASCII box-drawing characters.'))
+})
+
+test('I/O choice card renders title + ACTIVE badge + description', () => {
+  // Positive pin: what remains after the diagram retirement. The
+  // card body is title row (dot + name + ACTIVE badge) + description
+  // paragraph. No fourth block.
+  assert.ok(
+    /data-testid="io-profile-choice-active-badge"/.test(configureSrc),
+    v('I/O choice card must still render the ACTIVE badge '
+      + '(data-testid="io-profile-choice-active-badge").'))
+  // The choice() builder signature is three args now (id, title,
+  // description) — the retired `variant` arg was only used for the
+  // deleted diagram. If someone re-adds it, this pin forces them
+  // to justify why in a new pin.
+  assert.ok(
+    /const choice\s*=\s*\(id,\s*title,\s*description\)\s*=>/.test(configureSrc),
+    v('choice() must be a 3-arg builder (id, title, description) — '
+      + 'the diagram-era `variant` arg was retired 2026-10-15.'))
 })
 
 

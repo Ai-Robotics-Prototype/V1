@@ -770,84 +770,12 @@ function _SystemCheckSection_UNUSED_20260904() {
 // it lives in the safety-relay block + firmware, outside this control.
 // ---------------------------------------------------------------------------
 
-// Small SVG labelled-box used in each profile card. Clean, token-aware,
-// no monospace ASCII. Width stretches to the card; height is fixed.
-function _ProfileDiagram({ variant }) {
-  const strokeMuted = '#C7CBD4'
-  const strokeAccent = 'var(--accent)'
-  const fillPanel    = 'var(--bg-panel)'
-  const fillBoxAlt   = '#EEF2FF'
-  const textPrimary  = 'var(--text-primary)'
-  const textMuted    = 'var(--text-muted)'
-  const titleFill    = 'var(--text-secondary)'
-  if (variant === 'synapse') {
-    return (
-      <svg viewBox="0 0 220 120" width="100%" height="120"
-           role="img" aria-label="Synapse panel wired to the robot controller"
-           style={{ display: 'block' }}>
-        {/* Synapse panel */}
-        <rect x="8" y="8" width="204" height="48" rx="6"
-              fill={fillBoxAlt} stroke={strokeAccent} strokeWidth="1.25" />
-        <text x="18" y="24" fontSize="10" fontWeight="700"
-              fill={textPrimary}>SYNAPSE PANEL</text>
-        <text x="18" y="40" fontSize="9" fill={titleFill}>
-          Valve 01-10 · IN 01-10 · OUT 01-10 · SAFETY
-        </text>
-        <text x="18" y="52" fontSize="8" fill={textMuted}>portmap</text>
-        {/* Arrow down */}
-        <line x1="110" y1="60" x2="110" y2="80" stroke={strokeMuted}
-              strokeWidth="1.5" markerEnd="url(#arrSyn)" />
-        {/* Controller */}
-        <rect x="30" y="82" width="160" height="30" rx="6"
-              fill={fillPanel} stroke={strokeMuted} strokeWidth="1" />
-        <text x="110" y="100" fontSize="10" fontWeight="600"
-              fill={textPrimary} textAnchor="middle">
-          Robot controller DO/DI block
-        </text>
-        <defs>
-          <marker id="arrSyn" markerWidth="8" markerHeight="8"
-                  refX="4" refY="4" orient="auto">
-            <path d="M0,0 L8,4 L0,8 Z" fill={strokeMuted} />
-          </marker>
-        </defs>
-      </svg>
-    )
-  }
-  // "oem" / Basic Robot Controller I/O
-  return (
-    <svg viewBox="0 0 220 120" width="100%" height="120"
-         role="img" aria-label="Field devices wired directly to the robot controller"
-         style={{ display: 'block' }}>
-      {/* Controller — primary */}
-      <rect x="8" y="8" width="204" height="52" rx="6"
-            fill={fillBoxAlt} stroke={strokeAccent} strokeWidth="1.25" />
-      <text x="18" y="24" fontSize="10" fontWeight="700"
-            fill={textPrimary}>ROBOT CONTROLLER</text>
-      <text x="18" y="40" fontSize="9" fill={titleFill}>
-        DO0..DO15 · DI0..DI15
-      </text>
-      <text x="18" y="54" fontSize="8" fill={textMuted}>
-        safety relay ch1-4
-      </text>
-      {/* Arrow down */}
-      <line x1="110" y1="64" x2="110" y2="84" stroke={strokeMuted}
-            strokeWidth="1.5" markerEnd="url(#arrOem)" />
-      {/* Field devices */}
-      <rect x="30" y="86" width="160" height="26" rx="6"
-            fill={fillPanel} stroke={strokeMuted} strokeWidth="1" />
-      <text x="110" y="102" fontSize="10" fontWeight="600"
-            fill={textPrimary} textAnchor="middle">
-        Field devices (direct wiring)
-      </text>
-      <defs>
-        <marker id="arrOem" markerWidth="8" markerHeight="8"
-                refX="4" refY="4" orient="auto">
-          <path d="M0,0 L8,4 L0,8 Z" fill={strokeMuted} />
-        </marker>
-      </defs>
-    </svg>
-  )
-}
+// 2026-10-15 operator directive ("Configure tab looks cluttered"):
+// the per-card SVG diagram was placeholder-ish and added no information
+// the plain description text didn't already carry. Retired — the I/O-
+// interface card is now title + badge + description + the simplified
+// status line below the grid. _ProfileDiagram function + its mount
+// deleted; `variant` prop retired from choice().
 
 // Standard app-theme confirm modal — mirrors the ArmEnableControl +
 // QuickOrientButtons OrientFlangeDownControl pattern:
@@ -1030,7 +958,9 @@ function HardwareProfileSection() {
 
   // One profile-choice card. Uses design tokens throughout so it
   // reads like the rest of the dashboard (not an orphaned panel).
-  const choice = (id, title, description, variant) => {
+  // 2026-10-15: `variant` arg retired with the SVG diagram — the card
+  // now carries title + ACTIVE badge + plain description only.
+  const choice = (id, title, description) => {
     const active = (id === current)
     return (
       <button
@@ -1085,17 +1015,6 @@ function HardwareProfileSection() {
                       lineHeight: 1.5 }}>
           {description}
         </div>
-        <div
-          aria-hidden="true"
-          style={{
-            marginTop: 2,
-            padding: 8,
-            background: 'var(--bg-app)',
-            border: '1px solid var(--border)',
-            borderRadius: 'var(--radius-sm)',
-          }}>
-          <_ProfileDiagram variant={variant} />
-        </div>
       </button>
     )
   }
@@ -1138,7 +1057,6 @@ function HardwareProfileSection() {
           + 'Operators address I/O by Synapse port name '
           + '(Valve 01-10, IN 01-10, OUT 01-10, SAFETY). Default on '
           + 'all shipped cells.',
-          'synapse',
         )}
         {choice(
           PROFILE_OEM,
@@ -1147,7 +1065,6 @@ function HardwareProfileSection() {
           + 'robot controller’s built-in I/O block. Operators '
           + 'address channels by DO/DI id (DO0-15, DI0-15, safety '
           + 'relay ch1-4). The Synapse map and tab are hidden.',
-          'oem',
         )}
       </div>
       {isSynapse && (
