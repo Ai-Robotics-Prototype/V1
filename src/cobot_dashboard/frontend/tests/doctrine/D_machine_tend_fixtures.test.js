@@ -331,6 +331,118 @@ test('Count == 0 renders a self-clamp info block', () => {
 })
 
 
+// ── (5b) 2026-10-15 duplicate-prevention + capacity check ──────────
+
+test('Duplicate detection + canAdvance gating uses a Set of non-empty ids', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 10000)
+  // Derivation: hasDuplicate flips true when slotIds.filter(id→!!id)
+  // has a shorter size than the Set of the same. The pin greps for
+  // the invariant check — a refactor that drops this gate would let
+  // the field bug ("three vices all mapped to Vice 1") ship again.
+  assert.ok(
+    /const nonEmpty\s*=\s*slotIds\.filter\(\(id\)\s*=>\s*!!id\)/.test(chunk),
+    v('MachineFixturesBody must derive nonEmpty = slotIds.filter(id => '
+      + '!!id) — the base for duplicate detection.'))
+  assert.ok(
+    /const hasDuplicate\s*=\s*nonEmpty\.length !== new Set\(nonEmpty\)\.size/
+      .test(chunk),
+    v('MachineFixturesBody must derive hasDuplicate = '
+      + 'nonEmpty.length !== new Set(nonEmpty).size — the canonical '
+      + 'test for "the operator picked the same fixture twice."'))
+  assert.ok(/!hasDuplicate/.test(chunk),
+    v('canAdvance derivation must gate on !hasDuplicate so Next '
+      + 'stays disabled while two vices share one fixture.'))
+})
+
+test('Capacity check: count > fixtures.length blocks Next', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 10000)
+  assert.ok(
+    /const notEnoughFixtures\s*=\s*count\s*>\s*fixtures\.length/.test(chunk),
+    v('MachineFixturesBody must derive notEnoughFixtures = count > '
+      + 'fixtures.length — the capacity invariant.'))
+  assert.ok(/!notEnoughFixtures/.test(chunk),
+    v('canAdvance derivation must gate on !notEnoughFixtures so Next '
+      + 'stays disabled when the operator asked for more vices than '
+      + 'the cell has distinct External Fixtures.'))
+})
+
+test('Capacity banner surfaces the plain "set up more fixtures" copy', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 12000)
+  assert.ok(/data-testid="machine-vice-not-enough-fixtures"/.test(chunk),
+    v('MachineFixturesBody must render '
+      + 'data-testid="machine-vice-not-enough-fixtures" when the '
+      + 'operator asks for more vices than the cell has — the '
+      + 'operator-facing banner.'))
+  // Operator-authored phrasing per the 2026-10-15 directive:
+  //   "You have X vice(s) set up but asked for Y. Set up more in
+  //    External Fixtures, or reduce the count."
+  assert.ok(/set up but asked for \{count\}/.test(chunk),
+    v('Capacity banner must say "You have N vices set up but asked '
+      + 'for M." verbatim per the operator directive.'))
+  assert.ok(
+    /Set up more in External[\s\S]{0,20}Fixtures, or reduce the count/.test(chunk),
+    v('Capacity banner must say "Set up more in External Fixtures, '
+      + 'or reduce the count." verbatim (JSX whitespace between '
+      + 'External and Fixtures is tolerated).'))
+})
+
+test('Each vice slot disables fixtures already picked by other slots', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 12000)
+  // Primary UX: grey out already-chosen fixtures in other dropdowns.
+  // The derivation must build a Set of "taken by other slots" ids and
+  // mark the matching <option> rows as disabled.
+  assert.ok(
+    /const takenByOthers\s*=\s*new Set\([\s\S]{0,200}slotIds\.filter\(\(other, i\)\s*=>\s*i !== idx[\s\S]{0,80}&&\s*!!other\)\)/
+      .test(chunk),
+    v('Each slot must derive takenByOthers = new Set(slotIds.filter((o, '
+      + 'i) => i !== idx && !!o)) — the ids the OTHER slots already '
+      + 'claim.'))
+  assert.ok(
+    /disabled=\{takenElsewhere\}/.test(chunk),
+    v('<option> rows for fixtures claimed by other slots must set '
+      + 'disabled={takenElsewhere} — grey-out prevents the duplicate '
+      + 'from ever being picked in the UI.'))
+  // The grey-out options also carry an "already assigned" tail so
+  // the operator sees WHY the choice is unavailable.
+  assert.ok(/already assigned/.test(chunk),
+    v('Grey-out options must include an "already assigned" tail so '
+      + 'the operator knows why the option is disabled, not just '
+      + 'that it is.'))
+})
+
+test('Duplicate-slot defensive error row (for hand-edited saved programs)', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 12000)
+  // Defensive backstop: if a saved program carried a duplicate
+  // (hand-edited answers blob OR a schema that bypassed the picker),
+  // the slot must render a red error row AND canAdvance stays false.
+  assert.ok(
+    /const isDuplicate\s*=\s*!!id\s*&&\s*slotIds\.filter\(\(x\)\s*=>\s*x\s*===\s*id\)\.length\s*>\s*1/
+      .test(chunk),
+    v('Each slot must derive isDuplicate = !!id && slotIds.filter(x => '
+      + 'x === id).length > 1 — the per-slot duplicate flag.'))
+  assert.ok(/data-testid="machine-vice-slot-duplicate-error"/.test(chunk),
+    v('A duplicated slot must render '
+      + 'data-testid="machine-vice-slot-duplicate-error" so e2e tests '
+      + 'can observe the error path.'))
+  assert.ok(
+    /Can[\s\S]{0,10}t use the same fixture as another vice[\s\S]{0,80}each[\s\S]{0,30}vice is separate hardware/
+      .test(chunk),
+    v('Duplicate error copy must explain in plain operator language '
+      + 'that each vice is separate hardware — per the 2026-10-15 '
+      + 'operator directive.'))
+  // The slot container must carry data-duplicate so operator-facing
+  // tests can filter.
+  assert.ok(/data-duplicate=\{String\(isDuplicate\)\}/.test(chunk),
+    v('Each slot container must stamp data-duplicate={String(isDuplicate)} '
+      + 'so e2e tests can filter duplicate rows.'))
+})
+
+
 // ── (6) buildSteps machine_tend per-fixture emission ────────────────
 
 test('buildSteps machine_tend branches on resolveMachineFixtures', () => {

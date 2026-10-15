@@ -2033,7 +2033,22 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
 
   const noFixturesInCell = fixtures.length === 0
   const allSlotsFilled = count === 0 || slotIds.every((id) => !!id)
-  const canAdvance = allSlotsFilled && (count === 0 || !noFixturesInCell)
+  // 2026-10-15 duplicate-prevention: each vice must map to a DISTINCT
+  // External Fixture. Three physical vices cannot share one clamp
+  // signal — the generated program would fire one valve N times
+  // thinking it clamped N parts. Detect duplicates (ignore blanks)
+  // and gate advancement + per-slot error rendering on them.
+  const nonEmpty = slotIds.filter((id) => !!id)
+  const hasDuplicate = nonEmpty.length !== new Set(nonEmpty).size
+  // Capacity check: if the operator asks for more vices than there
+  // are distinct External Fixtures in the cell, we cannot possibly
+  // assign them without reuse. Surface a plain-copy message and
+  // block Next until they reduce the count or set up more fixtures.
+  const notEnoughFixtures = count > fixtures.length
+  const canAdvance = allSlotsFilled
+    && !hasDuplicate
+    && !notEnoughFixtures
+    && (count === 0 || !noFixturesInCell)
 
   const stepperBtn = (dis) => ({
     minHeight: 56, minWidth: 72,
@@ -2103,6 +2118,22 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
         </div>
       )}
 
+      {count >= 1 && !noFixturesInCell && notEnoughFixtures && (
+        <div data-testid="machine-vice-not-enough-fixtures"
+             data-count={String(count)}
+             data-available={String(fixtures.length)}
+             style={{
+               marginBottom: 12, padding: 12,
+               background: '#FEF2F2', border: '1px solid #FECACA',
+               borderRadius: 8, color: '#991B1B', fontSize: 13,
+               lineHeight: 1.5,
+             }}>
+          You have {fixtures.length} vice{fixtures.length === 1 ? '' : 's'}
+          {' '}set up but asked for {count}. Set up more in External
+          Fixtures, or reduce the count.
+        </div>
+      )}
+
       {count >= 1 && !noFixturesInCell && (
         <div data-testid="machine-fixtures-picker"
              style={{ marginTop: 4 }}>
@@ -2112,15 +2143,26 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
           {slotIds.map((id, idx) => {
             const fx = vicesFirst.find((f) => f.id === id) || null
             const hasClamp = !!(fx && (fx.valve || fx.out))
+            // Fixtures claimed by OTHER slots — not this one. The
+            // dropdown greys those out so the operator can't pick the
+            // same External Fixture twice (duplicate-prevention via
+            // grey-out — the primary UX per the 2026-10-15 operator
+            // order; the duplicate-error row below is the defensive
+            // backstop for hand-edited saved programs).
+            const takenByOthers = new Set(
+              slotIds.filter((other, i) => i !== idx && !!other))
+            const isDuplicate = !!id && slotIds.filter((x) => x === id).length > 1
             return (
               <div key={idx}
                    data-testid="machine-vice-slot"
                    data-slot-index={String(idx)}
                    data-fixture-id={id}
+                   data-duplicate={String(isDuplicate)}
                    style={{
                      display: 'flex', alignItems: 'center', gap: 12,
                      padding: 12, marginBottom: 6,
-                     background: '#fff', border: '1px solid #e5e7eb',
+                     background: isDuplicate ? '#FEF2F2' : '#fff',
+                     border: `1px solid ${isDuplicate ? '#FECACA' : '#e5e7eb'}`,
                      borderRadius: 8,
                    }}>
                 <div style={{ fontSize: 14, fontWeight: 700, color: '#111', minWidth: 72 }}>
@@ -2130,27 +2172,41 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
                         onChange={(e) => setSlot(idx, e.target.value)}
                         style={{
                           flex: 1, padding: '10px 12px', fontSize: 14,
-                          border: '1px solid #d1d5db', borderRadius: 6,
+                          border: `1px solid ${isDuplicate ? '#DC2626' : '#d1d5db'}`,
+                          borderRadius: 6,
                         }}>
                   <option value="">— pick a fixture —</option>
-                  {vicesFirst.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.name || `Vice (${f.id.slice(0, 6)})`}
-                      {f.type === 'vice' ? '' : ` · ${f.type || 'fixture'}`}
-                    </option>
-                  ))}
+                  {vicesFirst.map((f) => {
+                    const takenElsewhere = takenByOthers.has(f.id)
+                    return (
+                      <option key={f.id} value={f.id}
+                              disabled={takenElsewhere}>
+                        {f.name || `Vice (${f.id.slice(0, 6)})`}
+                        {f.type === 'vice' ? '' : ` · ${f.type || 'fixture'}`}
+                        {takenElsewhere ? ' · already assigned' : ''}
+                      </option>
+                    )
+                  })}
                 </select>
-                {id && (
+                {id && !isDuplicate && (
                   <div style={{ fontSize: 11, color: hasClamp ? '#15803D' : '#92400E' }}>
                     {hasClamp
                       ? 'clamp signal assigned'
                       : 'no clamp signal — finish its setup'}
                   </div>
                 )}
+                {isDuplicate && (
+                  <div
+                    data-testid="machine-vice-slot-duplicate-error"
+                    style={{ fontSize: 11, color: '#991B1B', fontWeight: 700 }}>
+                    Can&rsquo;t use the same fixture as another vice — each
+                    vice is separate hardware.
+                  </div>
+                )}
               </div>
             )
           })}
-          {count > 1 && (
+          {count > 1 && !hasDuplicate && !notEnoughFixtures && (
             <div style={{ marginTop: 8, fontSize: 12, color: '#2563EB' }}>
               {count} vices will be loaded before the machine starts.
               Each gets its own load position in the teach step.
