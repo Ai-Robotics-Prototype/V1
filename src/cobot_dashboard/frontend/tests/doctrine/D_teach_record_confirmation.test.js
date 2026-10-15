@@ -128,22 +128,32 @@ test('TeachSequence renders a teach-success-banner during the flash window', () 
 })
 
 test('teach-success-banner copy is "Successfully taught <name>"', () => {
-  // Match the banner body literally — the operator-specified phrasing.
+  // The banner body is "Successfully taught {successName}" — a derived
+  // name that covers teach steps AND waypoint-junction steps. For teach
+  // steps successName = teachLabelToName(current.label); for junction
+  // steps it names the via-point by its endpoints ("waypoint between
+  // Home and Pick"). The derivation lives above the render; the
+  // banner's JSX just references {successName}.
   assert.ok(
-    /Successfully taught \{teachLabelToName\(current\.label\)\}/
+    /Successfully taught \{successName\}/.test(progWizSrc),
+    v('Success banner must render "Successfully taught {successName}" '
+      + '— successName is the derived display name (teach label or '
+      + 'waypoint between endpoints).'))
+  assert.ok(
+    /const successName\s*=\s*\(isWaypointJunction && current\)\s*\?[\s\S]{0,200}teachLabelToName\(current \? current\.label : ''\)/
       .test(progWizSrc),
-    v('Success banner must render "Successfully taught <name>" where '
-      + '<name> comes from teachLabelToName(current.label) — single '
-      + 'source of truth for the position name.'))
+    v('successName derivation must be: waypoint-form for junction '
+      + 'steps, teachLabelToName(current.label) otherwise — single '
+      + 'source of truth for the operator-visible position name.'))
 })
 
 test('teach-success-banner carries the position name as a data attribute', () => {
   assert.ok(
-    /data-position-name=\{teachLabelToName\(current\.label\)\}/
-      .test(progWizSrc),
-    v('teach-success-banner must stamp data-position-name so e2e tests '
-      + 'can assert the CURRENT step\'s name (and not a stale neighbour) '
-      + 'rode the confirmation.'))
+    /data-position-name=\{successName\}/.test(progWizSrc),
+    v('teach-success-banner must stamp data-position-name={successName} '
+      + 'so e2e tests can assert the CURRENT step\'s name (and not a '
+      + 'stale neighbour) rode the confirmation — works for teach and '
+      + 'waypoint junctions alike.'))
 })
 
 

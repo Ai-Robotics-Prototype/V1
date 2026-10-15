@@ -552,6 +552,87 @@ function teachLabelToName(label) {
   return lower.slice(0, firstAlpha) + lower.charAt(firstAlpha).toUpperCase() + lower.slice(firstAlpha + 1)
 }
 
+// 2026-10-15 operator directive: waypoint-offer prompts between main
+// teach positions. A waypoint is a taught via-point the arm passes
+// THROUGH on the way between two positions, used to steer the path
+// around a fixture / column / obstacle. MANUAL routing — the software
+// does not auto-detect obstacles (honest-scope rule from 08cf555).
+//
+// Each junction is a tuple { id, afterKey, fromLabel, toLabel }:
+//   * `afterKey`   — the taught-position key this junction follows;
+//                    the offer screen appears RIGHT AFTER the operator
+//                    teaches / skips / reuses that position.
+//   * `id`         — stable string used as a key in answers.waypoints[],
+//                    and as the `waypoint_junction` audit field on
+//                    every emitted waypoint step.
+//   * from/toLabel — operator-facing names for the two endpoints
+//                    ("Home" / "Pick"), used in the offer copy.
+//
+// Junction placement rule: offers appear only between MAIN motion
+// positions, NEVER between a position and its auto-derived approach /
+// retreat (those are paired). For palletize/depalletize, the 4 pallet-
+// corner teach steps define a FRAME, not motion endpoints, so we do
+// NOT prompt between them; the two pallet junctions are at the macro
+// boundaries (home → pick, and the pallet macro ↔ the main place /
+// return).
+function waypointJunctionsForAnswers(answers) {
+  const op   = (answers && answers.operation) || 'pick_and_place'
+  const mode = answers && answers.pallet_mode
+  if (op === 'palletize' && mode === 'palletize') {
+    return [
+      { id: 'home_to_pick',  afterKey: 'taught_home',        fromLabel: 'Home',      toLabel: 'Pick'              },
+      { id: 'pick_to_place', afterKey: 'taught_pick',        fromLabel: 'Pick',      toLabel: 'Pallet place'      },
+      { id: 'place_to_home', afterKey: 'taught_pallet_part', fromLabel: 'Pallet place', toLabel: 'Home (return)'  },
+    ]
+  }
+  if (op === 'palletize' && mode === 'depalletize') {
+    return [
+      { id: 'home_to_pick',  afterKey: 'taught_home',        fromLabel: 'Home',         toLabel: 'Pallet pick'    },
+      { id: 'pick_to_place', afterKey: 'taught_pallet_part', fromLabel: 'Pallet pick',  toLabel: 'Place'          },
+      { id: 'place_to_home', afterKey: 'taught_place',       fromLabel: 'Place',        toLabel: 'Home (return)'  },
+    ]
+  }
+  if (op === 'machine_tend') {
+    return [
+      { id: 'home_to_pick',             afterKey: 'taught_home',         fromLabel: 'Home',         toLabel: 'Pick / Load'    },
+      { id: 'pick_to_machine_load',     afterKey: 'taught_pick',         fromLabel: 'Pick',         toLabel: 'Machine load'   },
+      { id: 'machine_load_to_unload',   afterKey: 'taught_machine_load', fromLabel: 'Machine load', toLabel: 'Unload'         },
+      { id: 'unload_to_home',           afterKey: 'taught_unload',       fromLabel: 'Unload',       toLabel: 'Home (return)'  },
+    ]
+  }
+  if (op === 'sort') {
+    // Sort codegen (buildSteps) currently emits one combined place
+    // step (pick → place → home); the two taught sort places map to
+    // the same codegen segment. Junctions mirror that shape so taught
+    // waypoints always land somewhere in the generated program.
+    // place_to_home anchors on taught_sort_2 (the last taught sort
+    // pose before HOME-return in the teach sequence) so the operator
+    // sees the junction right where they expect it.
+    return [
+      { id: 'home_to_pick',  afterKey: 'taught_home',   fromLabel: 'Home',         toLabel: 'Pick'          },
+      { id: 'pick_to_place', afterKey: 'taught_pick',   fromLabel: 'Pick',         toLabel: 'Sort place 1'  },
+      { id: 'place_to_home', afterKey: 'taught_sort_2', fromLabel: 'Sort place 2', toLabel: 'Home (return)' },
+    ]
+  }
+  // Default (pick_and_place and any sibling flow with pick + place).
+  return [
+    { id: 'home_to_pick',  afterKey: 'taught_home',  fromLabel: 'Home',  toLabel: 'Pick'          },
+    { id: 'pick_to_place', afterKey: 'taught_pick',  fromLabel: 'Pick',  toLabel: 'Place'         },
+    { id: 'place_to_home', afterKey: 'taught_place', fromLabel: 'Place', toLabel: 'Home (return)' },
+  ]
+}
+
+// Read the taught waypoint pose list for a junction. Returns an array
+// of waypoint pose records (each with tcp / joints / taught_at). Safe
+// against undefined storage.
+function readWaypointsForJunction(answers, junctionId) {
+  if (!answers || typeof answers !== 'object') return []
+  const wps = answers.waypoints && answers.waypoints[junctionId]
+  if (!Array.isArray(wps)) return []
+  return wps.filter((wp) => wp && !wp.skipped
+    && (Array.isArray(wp.tcp) || Array.isArray(wp.joints)))
+}
+
 // Derive the ordered list of positions for the current operation.
 function teachPositionsForAnswers(answers) {
   const op   = answers.operation
@@ -675,7 +756,39 @@ function teachPositionsForAnswers(answers) {
     label: 'HOME (return)',
     instr: 'The robot returns to this position after completing each cycle. Reuse the home you taught earlier, or teach a different return position — re-teaching here updates the start-home as well, since both reference the same logical home.',
   })
-  return positions
+
+  // 2026-10-15: interleave waypoint-offer junctions AFTER each
+  // referenced main teach step. Default `kind: 'teach'` on every
+  // existing entry; junction entries carry `kind: 'waypoint_junction'`
+  // + the junction tuple. The junction's afterKey points at the LAST
+  // occurrence of that key in the sequence BEFORE the HOME (return)
+  // tail-step, so the pallet flow's `pick_to_place` junction with
+  // afterKey=`taught_pick` lands right after the pick teach and
+  // BEFORE the pallet-corner teach steps (correct — the pallet
+  // corners define the FRAME, not a motion endpoint).
+  const junctions = waypointJunctionsForAnswers(answers)
+  const teachEntries = positions.map((p) => ({ ...p, kind: 'teach' }))
+  const result = []
+  teachEntries.forEach((entry, idx) => {
+    result.push(entry)
+    // Only emit the junction AFTER the FIRST occurrence of its
+    // afterKey (so for 'taught_home' the junction lands after the
+    // START home teach, not after the HOME (return) tail — the tail
+    // is the end-return step itself, no junction needed after it).
+    const earlierSameKey = teachEntries.slice(0, idx).some((e) => e.key === entry.key)
+    if (earlierSameKey) return
+    const j = junctions.find((x) => x.afterKey === entry.key)
+    if (!j) return
+    result.push({
+      kind: 'waypoint_junction',
+      junctionId: j.id,
+      fromLabel: j.fromLabel,
+      toLabel:   j.toLabel,
+      label: `WAYPOINT? — between ${j.fromLabel} and ${j.toLabel}`,
+      instr: `A waypoint is a point the robot passes through — use it to steer the path around a fixture or obstacle between ${j.fromLabel} and ${j.toLabel}. Manual routing: you teach the via-point; the arm does not auto-detect.`,
+    })
+  })
+  return result
 }
 
 
@@ -750,6 +863,16 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   // step index, not key, so two steps that share a key (back-nav, future
   // duplicate entries) can have independent decisions.
   const [forceTeach, setForceTeach] = useState({})
+
+  // 2026-10-15 waypoint-offer flow: teachingWaypoint[posIdx] = true
+  // when the operator picked "Add waypoint" / "Add another" on a
+  // waypoint_junction step and the jog UI should be rendered. On
+  // record, the waypoint pose is pushed into answers.waypoints[
+  // junctionId] and the UI flips back to the "add another? / continue"
+  // screen without advancing (so the operator can chain more via-
+  // points at the same junction). The "No, continue" / "Continue"
+  // buttons advance to the next sequence step.
+  const [teachingWaypoint, setTeachingWaypoint] = useState({})
 
   const clearReusedAt = (idx) => {
     if (!setReusedSteps) return
@@ -834,10 +957,19 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   // Compute per-position status (recorded / reused / skipped / pending)
   // for the progress dots and Review page card. A step marked 'reused'
   // for this session beats the underlying answer's 'recorded' state so
-  // the operator can see at a glance which steps they revisited.
+  // the operator can see at a glance which steps they revisited. For
+  // waypoint-junction entries (no `key`), status is 'recorded' when
+  // the operator has taught at least one via-point for this junction,
+  // else 'pending' — "No, continue" dismissals don't flip to skipped
+  // (an empty junction is the default outcome, not a skip).
   const statusOf = (i) => {
+    const p = positions[i]
+    if (p.kind === 'waypoint_junction') {
+      const wps = readWaypointsForJunction(answers, p.junctionId)
+      return wps.length > 0 ? 'recorded' : 'pending'
+    }
     if (reusedSteps?.[i]) return 'reused'
-    const v = answers[positions[i].key]
+    const v = answers[p.key]
     if (!v) return 'pending'
     if (v.skipped) return 'skipped'
     if (v.tcp || v.joints) return 'recorded'
@@ -846,6 +978,12 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   const statuses = positions.map((_, i) => statusOf(i))
 
   const current = positions[posIdx]
+  const isWaypointJunction = !!(current && current.kind === 'waypoint_junction')
+  const currentJunctionId = isWaypointJunction ? current.junctionId : null
+  const currentJunctionWps = isWaypointJunction
+    ? readWaypointsForJunction(answers, currentJunctionId)
+    : []
+  const isTeachingWaypoint = isWaypointJunction && !!teachingWaypoint[posIdx]
 
   // 2026-10-15 operator directive: the reuse prompt fires ONLY on the
   // end/return step (the HOME-return at the tail of the sequence, which
@@ -853,15 +991,44 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   // every other step — including edit-mode re-opens where answers carry
   // saved poses — recording and navigation are plain: no "already taught"
   // choice screen. Scope: posIdx === last AND an earlier position shares
-  // this key (the end-return is defined as that key-duplicate).
-  const existingForCurrent = current ? answers[current.key] : null
+  // this key (the end-return is defined as that key-duplicate). Waypoint
+  // junctions never have `.key`, so they can't trigger showChoiceScreen.
+  const existingForCurrent = (current && !isWaypointJunction) ? answers[current.key] : null
   const alreadyRecordedHere = !!(existingForCurrent &&
     !existingForCurrent.skipped &&
     (Array.isArray(existingForCurrent.tcp) || Array.isArray(existingForCurrent.joints)))
-  const isEndReturnStep = !!(current
+  const isEndReturnStep = !!(current && !isWaypointJunction
     && posIdx === positions.length - 1
     && positions.slice(0, posIdx).some((p) => p.key === current.key))
   const showChoiceScreen = alreadyRecordedHere && !forceTeach[posIdx] && isEndReturnStep
+
+  // Waypoint-junction UI mode: the offer / add-another prompt is a
+  // full-screen scaffold (same shell shape as showChoiceScreen). When
+  // the operator picks "Add waypoint" / "Add another", teachingWaypoint
+  // flips on and the usual jog UI renders — same jog pads, same Record
+  // button, same manual-entry fallback. No fork: Record branches on
+  // isWaypointJunction inside recordPosition / saveManualPose.
+  const showWaypointOffer = isWaypointJunction && !isTeachingWaypoint
+
+  // When teaching a waypoint, override the header title + instr so the
+  // operator sees "WAYPOINT #N — between X and Y" (and the ordinal
+  // reflects the pose they're about to add) rather than the junction's
+  // offer-shaped label. Same single `current` object drives the shell
+  // elsewhere — this is a display-only override.
+  const nextWaypointOrdinal = currentJunctionWps.length + 1
+  const headerLabel = (isWaypointJunction && isTeachingWaypoint && current)
+    ? `WAYPOINT #${nextWaypointOrdinal} — between ${current.fromLabel} and ${current.toLabel}`
+    : (current ? current.label : '')
+  const headerInstr = (isWaypointJunction && isTeachingWaypoint && current)
+    ? `Jog the robot to the via-point and press Record. The arm will pass THROUGH this pose on the way between ${current.fromLabel} and ${current.toLabel}. Manual routing: you teach the via-point; the arm does not auto-detect obstacles.`
+    : (current ? current.instr : '')
+  // Success-banner copy: for junction steps, name the waypoint by its
+  // endpoints ("Successfully taught waypoint between Home and Pick"); for
+  // plain teach steps, defer to teachLabelToName (unchanged from the
+  // 2026-10-15 record-confirmation ship).
+  const successName = (isWaypointJunction && current)
+    ? `waypoint between ${current.fromLabel} and ${current.toLabel}`
+    : teachLabelToName(current ? current.label : '')
 
   const advanceOrComplete = useCallback(() => {
     if (posIdx >= positions.length - 1) {
@@ -881,6 +1048,32 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   // Any of these paths writes into wizard state and advances. A "source"
   // note surfaces briefly so the operator knows a fallback was used.
   const [lastSource, setLastSource] = useState(null)
+
+  // Append a taught waypoint pose to answers.waypoints[junctionId].
+  // Flashes success then flips teachingWaypoint OFF for this step so
+  // the "add another? / continue" screen re-renders — the operator
+  // chains more via-points at this junction, or hits Continue to
+  // advance. Shared between recordPosition and saveManualPose below.
+  function appendWaypointPose({ tcp, joints, source }) {
+    const existing = (answers.waypoints && Array.isArray(answers.waypoints[currentJunctionId]))
+      ? answers.waypoints[currentJunctionId]
+      : []
+    const next = [...existing, {
+      tcp, joints,
+      taught_at: new Date().toISOString(),
+      skipped: false,
+      source,
+    }]
+    const nextMap = { ...(answers.waypoints || {}), [currentJunctionId]: next }
+    setAnswer('waypoints', nextMap)
+    setLastSource(source)
+    setFlash(true)
+    setTimeout(() => {
+      setFlash(false)
+      setTeachingWaypoint((p) => ({ ...p, [posIdx]: false }))
+    }, 900)
+  }
+
   async function recordPosition() {
     setRecordErr(null)
     let joints = null
@@ -914,6 +1107,10 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
       joints = liveJoints
       tcp = null
       source = 'simulated'
+    }
+    if (isWaypointJunction) {
+      appendWaypointPose({ tcp, joints, source })
+      return
     }
     setAnswer(current.key, {
       tcp, joints,
@@ -964,9 +1161,16 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     // Operator-entered x/y/z are in INCHES → inches × 25.4 / 1000 = meters.
     const inToMeters = (inches) => (inches * 25.4) / 1000
     const tcp = [inToMeters(x), inToMeters(y), inToMeters(z), rx * D2R, ry * D2R, rz * D2R]
+    const joints = (Array.isArray(liveJoints) ? liveJoints.slice(0, 6) : [0, 0, 0, 0, 0, 0])
+    if (isWaypointJunction) {
+      appendWaypointPose({ tcp, joints, source: 'manual' })
+      setManualOpen(false)
+      setRecordErr(null)
+      return
+    }
     setAnswer(current.key, {
       tcp,
-      joints: (Array.isArray(liveJoints) ? liveJoints.slice(0, 6) : [0, 0, 0, 0, 0, 0]),
+      joints,
       taught_at: new Date().toISOString(),
       skipped: false,
       source: 'manual',
@@ -989,6 +1193,12 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   }, [posIdx])
 
   function skipCurrent() {
+    // Waypoint-junction steps are optional by construction — "Skip →"
+    // on a junction is the same as "No, continue": just advance.
+    if (isWaypointJunction) {
+      advanceOrComplete()
+      return
+    }
     // Don't clobber an earlier-taught value that shares this key. The
     // pallet + pick_and_place flows re-use `taught_home` for the return-
     // home step at the tail of the sequence; if the operator taught
@@ -1015,6 +1225,9 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   function skipAllRemaining() {
     const stamp = new Date().toISOString()
     positions.slice(posIdx).forEach((p) => {
+      // Waypoint-junction steps are optional; "Skip All" leaves their
+      // storage untouched (no waypoints is already the empty default).
+      if (p.kind === 'waypoint_junction') return
       const existing = answers[p.key]
       // Don't clobber an already-recorded position.
       if (existing && !existing.skipped && (existing.tcp || existing.joints)) return
@@ -1059,6 +1272,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
 
   useEffect(() => {
     if (showChoiceScreen) return  // pad not rendered in choice mode
+    if (showWaypointOffer) return // pad not rendered in waypoint-offer mode
     const el = jogPadRef.current
     if (!el) return
     const recalc = () => {
@@ -1096,7 +1310,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     const ro = new ResizeObserver(recalc)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [jogMode, showChoiceScreen])
+  }, [jogMode, showChoiceScreen, showWaypointOffer])
 
   const modeBtn = (on) => ({
     padding: '12px 20px', minHeight: 48, fontSize: 14, fontWeight: 700,
@@ -1172,7 +1386,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
             fontSize: 19, fontWeight: 800, color: '#111', lineHeight: 1.2,
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0,
           }}>
-            {current.label}
+            {headerLabel}
           </div>
           <div style={{ flex: 1 }} />
           {/* 2026-10-13 operator directive: live Joints/TCP numeric
@@ -1187,7 +1401,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
           display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
           overflow: 'hidden',
         }}>
-          {current.instr}
+          {headerInstr}
         </div>
         {current.role && (current.role === 'pallet_c1'
                           || current.role === 'pallet_c2'
@@ -1257,7 +1471,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               Enter TCP pose manually
             </div>
             <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 16 }}>
-              Position in inches, rotation in degrees. Saved as the taught pose for {current.label}.
+              Position in inches, rotation in degrees. Saved as the taught pose for {headerLabel}.
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
               {['x', 'y', 'z'].map((k) => (
@@ -1348,6 +1562,73 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                 border: '1px solid #d1d5db', borderRadius: 12, cursor: 'pointer',
               }}>
                 ↻ Re-teach
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : showWaypointOffer ? (
+        /* 2026-10-15 WAYPOINT-OFFER SCREEN — same shell shape as the
+           reuse screen above (header/footer around, middle flex fills,
+           no scroll). Default button is "No, continue" (first-focused +
+           primary styled) so a straight pick-place flow is one tap per
+           junction. Multiple waypoints chain: after Record, the UI
+           re-enters this screen in "add another?" form.                   */
+        <div
+          data-testid="waypoint-junction-offer"
+          data-junction-id={currentJunctionId}
+          data-waypoints-count={currentJunctionWps.length}
+          style={{
+            flex: '1 1 auto', minHeight: 0,
+            display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center',
+            padding: 32, overflow: 'hidden',
+            background: '#fafafa',
+          }}>
+          <div style={{ maxWidth: 720, width: '100%' }}>
+            <div style={{
+              padding: 22, marginBottom: 18,
+              background: '#f0fdfa', border: '1px solid #99f6e4',
+              borderRadius: 12,
+            }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#0d9488', marginBottom: 8 }}>
+                {currentJunctionWps.length === 0
+                  ? `Add a waypoint between ${current.fromLabel} and ${current.toLabel}?`
+                  : `${currentJunctionWps.length} waypoint${currentJunctionWps.length === 1 ? '' : 's'} taught between ${current.fromLabel} and ${current.toLabel} — add another?`}
+              </div>
+              <div style={{ fontSize: 13, color: '#374151', lineHeight: 1.5 }}>
+                A waypoint is a point the robot passes through — use it to
+                steer the path around a fixture or obstacle between {current.fromLabel} and {current.toLabel}.
+                Manual routing: you teach the via-point; the arm does not
+                auto-detect obstacles.
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 14 }}>
+              {/* Default (primary) = "No, continue" / "Continue" — a
+                  straight path doesn't need waypoints and the operator
+                  should not be forced to click through a secondary CTA.
+                  The 2026-10-15 directive is explicit about this. */}
+              <button
+                data-testid="waypoint-junction-continue"
+                onClick={advanceOrComplete}
+                autoFocus
+                style={{
+                  flex: 1, minHeight: 64,
+                  padding: '16px 22px', fontSize: 17, fontWeight: 800,
+                  background: '#2563EB', color: '#fff',
+                  border: 'none', borderRadius: 12, cursor: 'pointer',
+                }}>
+                {currentJunctionWps.length === 0 ? 'No, continue →' : 'Continue →'}
+              </button>
+              <button
+                data-testid="waypoint-junction-add"
+                onClick={() => setTeachingWaypoint((p) => ({ ...p, [posIdx]: true }))}
+                style={{
+                  flex: 1, minHeight: 64,
+                  padding: '16px 22px', fontSize: 17, fontWeight: 700,
+                  background: '#fff', color: '#0d9488',
+                  border: '1px solid #99f6e4', borderRadius: 12, cursor: 'pointer',
+                }}>
+                {currentJunctionWps.length === 0 ? '+ Add waypoint' : '+ Add another waypoint'}
               </button>
             </div>
           </div>
@@ -1512,7 +1793,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
       {flash && current && (
         <div
           data-testid="teach-success-banner"
-          data-position-name={teachLabelToName(current.label)}
+          data-position-name={successName}
           style={{
             flex: '0 0 auto',
             margin: '0 16px 8px',
@@ -1522,7 +1803,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
             fontSize: 15, fontWeight: 700,
             textAlign: 'center',
           }}>
-          ✓ Successfully taught {teachLabelToName(current.label)}
+          ✓ Successfully taught {successName}
         </div>
       )}
 
@@ -1560,7 +1841,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
           border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
           flexShrink: 0,
         }}>← Back</button>
-        {!showChoiceScreen && (
+        {!showChoiceScreen && !showWaypointOffer && (
           <>
             <button onClick={recordPosition} style={{
               flex: 1, padding: '0 20px', minHeight: 60, fontSize: 16, fontWeight: 800,
@@ -1569,7 +1850,9 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               minWidth: 200,
               transition: 'background 200ms',
             }}>
-              {flash ? '✓ Recorded' : 'Record Position'}
+              {flash
+                ? '✓ Recorded'
+                : (isWaypointJunction ? 'Record Waypoint' : 'Record Position')}
             </button>
             <button onClick={openManualEntry} title="Type in x/y/z + orientation instead of capturing live" style={{
               padding: '0 14px', minHeight: 56, fontSize: 13, fontWeight: 700,
@@ -1582,7 +1865,9 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               background: '#fff', color: '#374151',
               border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
               flexShrink: 0,
-            }}>Skip →</button>
+            }}>
+              {isWaypointJunction ? 'Done — Continue →' : 'Skip →'}
+            </button>
           </>
         )}
       </div>
@@ -2812,6 +3097,35 @@ function readTaught(answers, key) {
   return v
 }
 
+// 2026-10-15 waypoint injection — emit N `action: 'waypoint'` steps
+// for the taught via-points at a junction. Shape matches the ProgramEditor's
+// waypoint step (programTruth TEACHABLE_ACTIONS + MOTION_SMOOTHING_ACTIONS
+// already carry 'waypoint' from 08cf555 — no editor/palette changes needed).
+// Returns [] when no waypoints are taught, so adding junctions to a program
+// without ever teaching one is a no-op and existing programs are unaffected.
+// The waypoint_junction field is an audit trail — the executor doesn't need
+// it, but tools / codegen / tests can map a step back to its originating
+// junction without re-running the wizard.
+function waypointStepsForJunction(answers, junctionId, defaultSpeed) {
+  const wps = readWaypointsForJunction(answers, junctionId)
+  const spd = Number.isFinite(defaultSpeed) ? defaultSpeed : 40
+  return wps.map((wp, idx) => {
+    const tcp    = Array.isArray(wp.tcp)    ? wp.tcp    : null
+    const joints = Array.isArray(wp.joints) ? wp.joints : null
+    return {
+      action: 'waypoint',
+      label: `Waypoint ${idx + 1} (${junctionId})`,
+      speed_pct: spd,
+      position: tcp ? tcp.slice(0, 3) : null,
+      taught: !!(tcp || joints),
+      taught_tcp:    tcp,
+      taught_joints: joints,
+      joints,
+      waypoint_junction: junctionId,
+    }
+  })
+}
+
 // 2026-09-15 field-triage fix: for pallet corner / part keys, ALSO
 // consult the geometry store (config.pallet.corner*_tcp + part_tcp).
 // The editor's palletTeachRecord writes only the geometry keys, so a
@@ -2944,6 +3258,11 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
 
   const steps = []
   steps.push({ action: 'move_home', label: 'Move to home position' })
+  // 2026-10-15: waypoints between HOME and the first pick-side motion.
+  // Injected BEFORE readySteps() + loopStart so they run ONCE at program
+  // start (not every pallet cycle). Empty when no waypoints taught, so
+  // existing pallet programs emit byte-identical to the pre-feature shape.
+  steps.push(...waypointStepsForJunction(answers, 'home_to_pick', spd))
   // Effector-ready state at program start (vacuum off / gripper open /
   // magnet off). Same shared vocabulary module the PBD composer uses.
   steps.push(...readySteps())
@@ -2989,6 +3308,10 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
       speed_pct: medium, offset_z_mm: retH,
       derived_from: 'pick',
     })
+    // 2026-10-15: waypoints between PICK side and the pallet-place macro.
+    // Inside the loop body (operator-taught via-points steer the arm around
+    // a fixture on EVERY cycle; that's the intended semantics).
+    steps.push(...waypointStepsForJunction(answers, 'pick_to_place', spd))
     // Compound pallet motion — executor computes slot, traverses,
     // descends to slot, opens gripper, lifts to retract, advances
     // cycle. Carries the gripper IO so the executor knows what to
@@ -3015,6 +3338,9 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
       width_mm: gripW, force_pct: gripF,
       speed_pct: slow,
     })
+    // 2026-10-15: waypoints between the pallet-pick macro and the place
+    // side (inside the loop body — per-cycle routing around a fixture).
+    steps.push(...waypointStepsForJunction(answers, 'pick_to_place', spd))
 
     const placePoint = readTaught(answers, 'taught_place') || {}
     const placeTcp   = Array.isArray(placePoint.tcp) ? placePoint.tcp : null
@@ -3054,6 +3380,10 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
     pallet_loop: true,
   })
 
+  // 2026-10-15: waypoints between the pallet-place / place side and HOME.
+  // Injected AFTER the loop marker so they run ONCE at program end
+  // (post-pallet-exhaustion), not every cycle.
+  steps.push(...waypointStepsForJunction(answers, 'place_to_home', spd))
   steps.push({ action: 'move_home', label: 'Return to home' })
   return steps.map((s, i) => ({ ...s, step: i + 1 }))
 }
@@ -3144,6 +3474,12 @@ function buildSteps(answers, portmap = null,
 
   steps.push({ action: 'move_home', label: 'Move to home position' })
 
+  // 2026-10-15: waypoints between HOME and the pick side. Injected
+  // AFTER the start-home move so the arm leaves home, flies through
+  // every operator-taught via-point, then does the pick approach.
+  // Empty when no waypoints taught — existing programs byte-identical.
+  steps.push(...waypointStepsForJunction(answers, 'home_to_pick', spd))
+
   // ── Standard pick / sort / machine_tend flow. Palletize takes the
   //    buildPalletizeSteps path above.
 
@@ -3190,6 +3526,18 @@ function buildSteps(answers, portmap = null,
 
   // Retreat back above the pick contact.
   steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
+
+  // 2026-10-15: waypoints between PICK and the next main position.
+  // For machine_tend the junction id is 'pick_to_machine_load'; for
+  // pick_and_place / sort it's 'pick_to_place' (sort folds its two
+  // place poses onto one codegen segment — see
+  // waypointJunctionsForAnswers for the sort rationale). Chosen per
+  // op so the semantics match the operator's wizard flow.
+  if (op === 'machine_tend') {
+    steps.push(...waypointStepsForJunction(answers, 'pick_to_machine_load', spd))
+  } else {
+    steps.push(...waypointStepsForJunction(answers, 'pick_to_place', spd))
+  }
 
   if (op === 'machine_tend') {
     // ── Machine-tending template (2026-07-30 vocabulary work) ──
@@ -3265,6 +3613,10 @@ function buildSteps(answers, portmap = null,
                  offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
     steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
                  speed_pct: medium, derived_from: 'machine_safe' })
+    // 2026-10-15: waypoints between the (completed) MACHINE LOAD cycle
+    // and the UNLOAD side — operator-taught via-points steer the arm
+    // from the machine-safe pose to approach-unload.
+    steps.push(...waypointStepsForJunction(answers, 'machine_load_to_unload', spd))
     // Unload contact — separate taught role.
     steps.push({ action: 'move_linear', label: 'Approach unload',
                  offset_z_mm: appH, speed_pct: spd, derived_from: 'unload' })
@@ -3282,6 +3634,16 @@ function buildSteps(answers, portmap = null,
   const retreatRole = (op === 'machine_tend') ? 'unload' : 'place'
   const retreatLabel = (op === 'machine_tend') ? 'Retreat from unload' : 'Retreat above place'
   steps.push({ action: 'move_linear', label: retreatLabel, offset_z_mm: appH, speed_pct: medium, derived_from: retreatRole })
+  // 2026-10-15: waypoints between the final place / unload and HOME.
+  // Junction id depends on op — unload_to_home for machine_tend, else
+  // place_to_home for pick_and_place / sort. Injected AFTER the final
+  // retreat so the arm leaves the release pose, flies through every
+  // taught via-point, then returns home.
+  if (op === 'machine_tend') {
+    steps.push(...waypointStepsForJunction(answers, 'unload_to_home', spd))
+  } else {
+    steps.push(...waypointStepsForJunction(answers, 'place_to_home', spd))
+  }
   steps.push({ action: 'move_home', label: 'Return to home' })
 
   if (answers.repeat === 'continuous') {
