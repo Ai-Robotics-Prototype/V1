@@ -20,6 +20,9 @@ import { resolveCapacity, resolveVerification, resolveConfirmSignals,
 import { waypointJunctionsForOperation, readWaypointsForJunction,
          waypointStepsForJunction, offerInstrFor }
   from '../lib/waypointJunctions'
+import { resolveMachineFixtures, clampFixtureSteps, unclampFixtureSteps,
+         missingClampSignalFixtures, missingClampSignalRefusal }
+  from '../lib/machineFixtures'
 
 // 2026-10-15 operator directive: multi-pick + verification questions
 // are gated on the SELECTED tool's capacity + verification. The PAGES
@@ -714,10 +717,30 @@ function teachPositionsForAnswers(answers) {
       key: 'taught_machine_safe', label: 'SAFE-OUTSIDE-MACHINE WAYPOINT',
       instr: 'Jog the robot to a safe pose OUTSIDE the machine door — the pose the robot retreats to between loading the part and reaching back in for the finished one, and the pose from which the machine cycle is started. This is where the robot waits for the machine to signal "cycle complete".',
     })
-    positions.push({
-      key: 'taught_machine_load', label: 'MACHINE LOAD POSITION',
-      instr: 'Jog the robot to the machine-load CONTACT — where the part is seated in the fixture. Approach and retreat are computed automatically.',
-    })
+    // 2026-10-15: per-fixture load positions. For 0 or 1 selected
+    // fixture, keep the legacy taught_machine_load key (byte-identical
+    // to the pre-directive teach + codegen path — old programs load
+    // unchanged). For 2+ fixtures emit taught_machine_load_1..N,
+    // naming each fixture in the label so the operator knows which
+    // vice they are teaching for.
+    const _selectedFixtures = resolveMachineFixtures(
+      _wizardCellRegistryRef, answers)
+    if (_selectedFixtures.length >= 2) {
+      _selectedFixtures.forEach((fx, idx) => {
+        const i = idx + 1
+        const name = fx.name || `Vice ${i}`
+        positions.push({
+          key:   `taught_machine_load_${i}`,
+          label: `MACHINE LOAD ${i} — ${name}`,
+          instr: `Jog the robot to the load contact for ${name} — the pose where the part is seated in this vice. Approach and retreat are computed automatically.`,
+        })
+      })
+    } else {
+      positions.push({
+        key: 'taught_machine_load', label: 'MACHINE LOAD POSITION',
+        instr: 'Jog the robot to the machine-load CONTACT — where the part is seated in the fixture. Approach and retreat are computed automatically.',
+      })
+    }
     positions.push({
       key: 'taught_unload', label: 'UNLOAD POSITION',
       instr: 'Jog the robot to the unload CONTACT — where the finished part is released. Approach and retreat are computed automatically.',
@@ -1933,6 +1956,139 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
 // endpoint still exists for the editor's palette-level detect step;
 // nothing else in the wizard consumed these helpers.
 
+// 2026-10-15 machine fixtures step. Reads cell.fixtures (the shared
+// External Fixture store), lets the operator declare whether the
+// machine clamps the part, and if yes which fixture(s) to use. Multi-
+// select by checkbox; order is operator-controlled by the selection
+// order (first-tapped loads first). answers.machine_fixture_ids
+// is an ordered array of fixture.id values.
+function MachineFixturesBody({ answers, setAnswer, goNext }) {
+  // Hook into the module-level cell registry mirror set by the
+  // ProgramWizard shell on mount. Keeps the engine signature
+  // unchanged (skip() + render({answers,...})) while giving this body
+  // access to the cell snapshot — same seam the multi-pick question
+  // uses to look up the selected EOAT.
+  const cell = _wizardCellRegistryRef || null
+  const fixtures = (cell && Array.isArray(cell.fixtures)) ? cell.fixtures : []
+  const vices    = fixtures.filter((f) => f && f.type === 'vice')
+  const others   = fixtures.filter((f) => f && f.type !== 'vice')
+  const hasAnyFixture = fixtures.length > 0
+
+  const uses = answers.machine_uses_fixture === true
+            || (Array.isArray(answers.machine_fixture_ids)
+                && answers.machine_fixture_ids.length > 0)
+  const selectedIds = Array.isArray(answers.machine_fixture_ids)
+    ? answers.machine_fixture_ids : []
+
+  const toggleFixture = (id) => {
+    const next = selectedIds.includes(id)
+      ? selectedIds.filter((x) => x !== id)
+      : [...selectedIds, id]
+    setAnswer('machine_fixture_ids', next)
+    setAnswer('machine_uses_fixture', next.length > 0)
+  }
+
+  const chooseYes = () => {
+    setAnswer('machine_uses_fixture', true)
+    if (!selectedIds.length && vices.length === 1) {
+      setAnswer('machine_fixture_ids', [vices[0].id])
+    }
+  }
+  const chooseNo = () => {
+    setAnswer('machine_uses_fixture', false)
+    setAnswer('machine_fixture_ids', [])
+    goNext({ machine_uses_fixture: false, machine_fixture_ids: [] })
+  }
+
+  const canAdvance = !uses || selectedIds.length > 0
+  return (
+    <QuestionCard
+      question="Does the machine hold the part with a clamp or vice?"
+      description="If the machine clamps the workpiece in a fixture, the program will tell the fixture to clamp after the robot places the part and release it after the machine cycle finishes."
+    >
+      <ChoiceButton
+        label="Yes — pick fixture(s)"
+        description="Select one or more clamping fixtures from your cell. The robot will load each one and clamp before the machine cycle starts."
+        selected={uses}
+        onClick={chooseYes}
+      />
+      <ChoiceButton
+        label="No fixture"
+        description="The machine holds the part by itself (self-clamping chuck, magnetic bed, etc.). No clamp IO will be emitted."
+        selected={!uses && answers.machine_uses_fixture === false}
+        onClick={chooseNo}
+      />
+      {uses && !hasAnyFixture && (
+        <div data-testid="machine-fixtures-empty"
+             style={{
+               marginTop: 12, padding: 12,
+               background: '#FFFBEB', border: '1px solid #FCD34D',
+               borderRadius: 8, color: '#92400E', fontSize: 13,
+             }}>
+          No fixtures in this cell yet — set one up in the External
+          Fixture wizard first, then come back here.
+        </div>
+      )}
+      {uses && hasAnyFixture && (
+        <div data-testid="machine-fixtures-picker"
+             style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
+            Which fixture(s) will the machine clamp?
+            <span style={{ color: '#6b7280', fontWeight: 400 }}>
+              {' '}(tap all that must load before the cycle starts)
+            </span>
+          </div>
+          {[...vices, ...others].map((f) => {
+            const checked = selectedIds.includes(f.id)
+            const hasClamp = !!(f.valve || f.out)
+            return (
+              <label
+                key={f.id}
+                data-testid="machine-fixture-choice"
+                data-fixture-id={f.id}
+                data-checked={String(checked)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: 12, marginBottom: 6,
+                  background: checked ? '#EFF6FF' : '#fff',
+                  border: `1px solid ${checked ? '#2563EB' : '#e5e7eb'}`,
+                  borderRadius: 8, cursor: 'pointer',
+                }}>
+                <input type="checkbox" checked={checked}
+                       onChange={() => toggleFixture(f.id)} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>
+                    {f.name || `Vice (${f.id.slice(0, 6)})`}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
+                    {f.type === 'vice' ? 'Vice' : (f.type || 'Fixture')}
+                    {hasClamp
+                      ? ` · clamp signal assigned`
+                      : ' · no clamp signal — finish its setup'}
+                  </div>
+                </div>
+              </label>
+            )
+          })}
+          {selectedIds.length > 1 && (
+            <div style={{ marginTop: 8, fontSize: 12, color: '#2563EB' }}>
+              {selectedIds.length} fixtures will be loaded before the machine starts.
+              Each gets its own load position in the teach step.
+            </div>
+          )}
+        </div>
+      )}
+      <NextButton
+        onClick={() => goNext({
+          machine_uses_fixture: uses,
+          machine_fixture_ids:  selectedIds,
+        })}
+        disabled={!canAdvance}
+        label="Next" />
+    </QuestionCard>
+  )
+}
+
 function MachineIOBody({ answers, setAnswer, goNext }) {
   const portmap = useIOPortmap()
   const synapsePortmap = useSynapsePortmap()
@@ -2733,6 +2889,31 @@ const PAGES = [
           label="Next" />
       </QuestionCard>
     ),
+  },
+
+  // 8b: Machine fixtures / vices (machine_tend only)
+  //
+  // 2026-10-15 operator field report: a machine-tending program placed
+  // the part in the fixture and released the gripper but NEVER emitted
+  // any clamp IO — the machine would have cycled on an unheld part.
+  // The wizard also never asked which fixture(s) the machine uses.
+  //
+  // This step reads cell.fixtures (the shared External Fixture store
+  // the fixture wizard writes — NO fork) and offers a plain Yes/No
+  // + multi-select. answers.machine_fixture_ids: string[] records the
+  // operator's selection. For zero fixtures the codegen stays
+  // byte-identical to the pre-directive legacy path (clampWorkpiece
+  // returns [] when no portmap role is set).
+  //
+  // Order rationale: the fixtures step lands AFTER tool_and_payload
+  // (so the operator picked their EOAT) and BEFORE machine_io (which
+  // asks about cycle-start / cycle-complete signals). The teach
+  // sequence derives per-fixture load positions from the selection,
+  // so this answer must be known by the time the teach pages compile.
+  {
+    id: 'machine_fixtures',
+    skip: (answers) => answers.operation !== 'machine_tend',
+    render: MachineFixturesBody,
   },
 
   // 9: Machine I/O (only for machine_tend)
@@ -3640,7 +3821,8 @@ function _cellVocabOpts(cellEoat, synapsePortmap) {
 }
 
 function buildSteps(answers, portmap = null,
-                    cellEoat = null, synapsePortmap = null) {
+                    cellEoat = null, synapsePortmap = null,
+                    cellRegistry = null) {
   // Pallet programs follow a totally different shape — their steps
   // come from buildPalletizeSteps so the editor and executor see the
   // move_to_pallet flow rather than the generic pick/place body.
@@ -3769,54 +3951,132 @@ function buildSteps(answers, portmap = null,
   }
 
   if (!isMultiPair && op === 'machine_tend') {
-    // ── Machine-tending template (2026-07-30 vocabulary work) ──
+    // ── Machine-tending template (2026-07-30 vocabulary work + 2026-10-15
+    //    multi-fixture rewrite). ──
     //
     // Required taught poses:
-    //   * machine_safe  — safe-outside-machine waypoint (door
-    //                     clearance pose). MUST be reached before/
-    //                     after any fixture motion so the robot
-    //                     doesn't collide with the machine door.
-    //   * machine_load  — fixture pose (part-in-fixture contact).
-    //   * unload        — final drop-off contact.
+    //   * machine_safe   — safe-outside-machine waypoint (door
+    //                      clearance pose). MUST be reached before/
+    //                      after any fixture motion so the robot
+    //                      doesn't collide with the machine door.
+    //   * machine_load   — fixture pose (part-in-fixture contact)
+    //                      for the single-fixture case; indexed
+    //                      machine_load_i for N-fixture jobs (one
+    //                      taught load position per vice).
+    //   * unload         — final drop-off contact.
     //
-    // Load side:
-    //   safe → fixture pose → disengage → clamp workpiece → (verify)
-    //          → retreat to safe → start machine cycle (pulse)
-    //          → wait for machine cycle done
+    // 2026-10-15 operator field report: the wizard never asked which
+    // vice(s) the machine uses, and the clamp emitter searched the
+    // system IO portmap for a role-labeled row (returning [] silently
+    // when none was labeled) — so machine-tending programs placed
+    // the part and released the gripper WITHOUT ever firing a clamp.
+    // The machine would have cycled on an unheld part.
     //
-    // Unload side (part is done, robot picks it back up):
-    //   safe → fixture pose → engage finished part → unclamp
-    //          → retreat to safe → unload contact → disengage
+    // Fix: resolve the operator-selected fixtures from the shared
+    // External Fixture store (cellRegistry.fixtures, bind-by-id via
+    // answers.machine_fixture_ids). For each selected fixture emit:
+    //   approach → place-in-fixture → release gripper → CLAMP (set_io
+    //   on fixture.valve || fixture.out) → CONFIRM (verify_input on
+    //   fixture.in_done, if assigned) → retreat → safe.
+    // All N fixtures load+clamp+confirm BEFORE the cycle-start
+    // handshake fires — the machine only starts once every vice is
+    // confirmed clamped (or, if a vice has no confirm sensor, after
+    // its clamp signal lands).
     //
-    // The clamp→verify→release ordering is enforced at save time by
-    // the sequence guard in dashboard_server / effectorVocab; the
-    // wizard emits them in-order here, so the guard fires only if a
-    // subsequent hand-edit reorders them.
+    // After cycle-complete, loop per fixture to UNCLAMP + grab the
+    // finished part + retreat → safe, then approach the unload
+    // position once and release every retrieved part there in the
+    // operator's declared order.
+    //
+    // Zero selected fixtures → fall back to the pre-2026-10-15 clamp
+    // vocab (effectorVocab.clampWorkpiece/unclampWorkpiece) which
+    // searches the system portmap by role string. This preserves
+    // byte-identity for programs saved before the directive AND for
+    // programs the operator deliberately marks "No fixture" (machine
+    // holds the part by itself — chuck, magnetic bed, …).
+    const fixtures = resolveMachineFixtures(cellRegistry, answers)
+    const hasFixtures = fixtures.length > 0
+    const multiFixtures = fixtures.length >= 2
 
     // Move to safe waypoint OUTSIDE the machine door.
     steps.push({ action: 'move_linear', label: 'Move to safe-outside-machine waypoint',
                  speed_pct: spd, position_role: 'machine_safe' })
-    // Approach + place in fixture.
-    steps.push({ action: 'move_linear', label: 'Approach machine fixture',
-                 offset_z_mm: appH, speed_pct: spd, derived_from: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Place in fixture — contact',
-                 speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
-    // Clamp FIRST (workpiece is still gripped so a failed clamp
-    // doesn't drop the part). Vocab may attach verify_input if the
-    // Clamp confirmed DI is assigned; guard forbids release before
-    // the verify.
-    steps.push(...clampWorkpiece(portmap))
-    // Only NOW release the robot's grip — after clamp+verify.
-    steps.push(...effectorDisengage(cfgEffector, {
-      ..._vocabOpts, withBlowOff: false,
-      labelOverride: 'Release part into fixture',
-    }))
-    // Retreat from fixture → back to safe waypoint before starting
-    // the cycle so the robot is out of the machine's workspace.
-    steps.push({ action: 'move_linear', label: 'Retreat from fixture',
-                 offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
-                 speed_pct: medium, derived_from: 'machine_safe' })
+
+    if (hasFixtures) {
+      // ── Multi-fixture load phase ──
+      // Load ALL N vices before the machine runs. Each vice gets a
+      // dedicated approach + place + release + clamp + confirm +
+      // retreat cycle so the robot can clear each one before loading
+      // the next and the machine only starts once every vice holds
+      // its workpiece.
+      fixtures.forEach((fx, idx) => {
+        const i = idx + 1
+        const loadRole = multiFixtures ? `machine_load_${i}` : 'machine_load'
+        const fxName = fx.name || `Vice ${i}`
+        steps.push({ action: 'move_linear',
+                     label: multiFixtures
+                       ? `Approach ${fxName}`
+                       : 'Approach machine fixture',
+                     offset_z_mm: appH, speed_pct: spd,
+                     derived_from: loadRole })
+        steps.push({ action: 'move_linear',
+                     label: multiFixtures
+                       ? `Place in ${fxName} — contact`
+                       : 'Place in fixture — contact',
+                     speed_pct: Math.min(spd, 20),
+                     position_role: loadRole })
+        // Release the gripper FIRST (before the vice clamps) so the
+        // robot does not pull against a closing vice jaw. Safety
+        // sequencing: gripper releases → robot clear of clamp zone →
+        // then set the clamp. (The pre-2026-10-15 flow clamped first,
+        // then released — which worked only because the clamp was a
+        // single sustained-DO that physically couldn't close on the
+        // robot. Multi-vice programs with air cylinders can close
+        // fast enough to catch the gripper, so release-first is
+        // mandatory for the new flow.)
+        steps.push(...effectorDisengage(cfgEffector, {
+          ..._vocabOpts, withBlowOff: false,
+          labelOverride: multiFixtures
+            ? `Release part into ${fxName}`
+            : 'Release part into fixture',
+        }))
+        // Fire the clamp IO + optional confirm. clampFixtureSteps
+        // emits plain operator-facing labels — "Clamp the vice (X)" /
+        // "Confirm vice clamped (X)" — and tags each step with
+        // fixture_id so hand-edits can round-trip to the originating
+        // fixture record.
+        steps.push(...clampFixtureSteps(fx))
+        // Retreat from the fixture, then back to safe so the robot
+        // is clear of the machine before the next fixture is loaded
+        // (or before cycle-start fires).
+        steps.push({ action: 'move_linear',
+                     label: multiFixtures
+                       ? `Retreat from ${fxName}`
+                       : 'Retreat from fixture',
+                     offset_z_mm: appH, speed_pct: slow,
+                     derived_from: loadRole })
+        steps.push({ action: 'move_linear',
+                     label: 'Return to safe-outside-machine',
+                     speed_pct: medium, derived_from: 'machine_safe' })
+      })
+    } else {
+      // Legacy no-fixture path: pre-2026-10-15 shape, byte-identical.
+      steps.push({ action: 'move_linear', label: 'Approach machine fixture',
+                   offset_z_mm: appH, speed_pct: spd, derived_from: 'machine_load' })
+      steps.push({ action: 'move_linear', label: 'Place in fixture — contact',
+                   speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
+      // Clamp FIRST (pre-directive ordering kept for the legacy path
+      // so old saved programs still match byte-for-byte).
+      steps.push(...clampWorkpiece(portmap))
+      steps.push(...effectorDisengage(cfgEffector, {
+        ..._vocabOpts, withBlowOff: false,
+        labelOverride: 'Release part into fixture',
+      }))
+      steps.push({ action: 'move_linear', label: 'Retreat from fixture',
+                   offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+      steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
+                   speed_pct: medium, derived_from: 'machine_safe' })
+    }
     // Start the machine cycle — PULSED DO. Vocab handles the
     // set 1 → wait pulse_ms → set 0 triplet.
     //
@@ -3857,20 +4117,69 @@ function buildSteps(answers, portmap = null,
       override_di: answers.io_cycle_done,
     }))
     // ── Unload side ────────────────────────────────────────────
-    // Return to fixture, engage grip, unclamp, retreat.
-    steps.push({ action: 'move_linear', label: 'Approach fixture (finished part)',
-                 offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Fixture — contact (finished part)',
-                 speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
-    steps.push(...effectorEngage(cfgEffector, {
-      ..._vocabOpts, labelOverride: (effectorOf(cfgEffector) === 'finger'
-        ? 'Grip finished part' : 'Pick finished part'),
-    }))
-    steps.push(...unclampWorkpiece(portmap))
-    steps.push({ action: 'move_linear', label: 'Retreat with finished part',
-                 offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
-                 speed_pct: medium, derived_from: 'machine_safe' })
+    // For N fixtures: loop per vice — approach, grip finished part,
+    // unclamp, retreat, back to safe — then approach the unload
+    // position once and release the LAST retrieved part there. The
+    // operator teaches a single unload drop zone; multi-fixture jobs
+    // that need per-fixture unload zones can be split in the editor.
+    //
+    // For the legacy no-fixture path: single approach / grip /
+    // unclamp / retreat / safe → approach unload → place.
+    if (hasFixtures) {
+      fixtures.forEach((fx, idx) => {
+        const i = idx + 1
+        const loadRole = multiFixtures ? `machine_load_${i}` : 'machine_load'
+        const fxName = fx.name || `Vice ${i}`
+        steps.push({ action: 'move_linear',
+                     label: multiFixtures
+                       ? `Approach ${fxName} (finished part)`
+                       : 'Approach fixture (finished part)',
+                     offset_z_mm: appH, speed_pct: slow,
+                     derived_from: loadRole })
+        steps.push({ action: 'move_linear',
+                     label: multiFixtures
+                       ? `${fxName} — contact (finished part)`
+                       : 'Fixture — contact (finished part)',
+                     speed_pct: Math.min(spd, 20),
+                     position_role: loadRole })
+        steps.push(...effectorEngage(cfgEffector, {
+          ..._vocabOpts, labelOverride: (effectorOf(cfgEffector) === 'finger'
+            ? `Grip finished part (${fxName})`
+            : `Pick finished part (${fxName})`),
+        }))
+        // Release the vice ONLY after the gripper has engaged the
+        // finished part. Safety sequencing: unclamp while the robot
+        // holds the part so the part can't fall if the vice spring-
+        // returns.
+        steps.push(...unclampFixtureSteps(fx))
+        steps.push({ action: 'move_linear',
+                     label: multiFixtures
+                       ? `Retreat from ${fxName} with finished part`
+                       : 'Retreat with finished part',
+                     offset_z_mm: appH, speed_pct: medium,
+                     derived_from: loadRole })
+        steps.push({ action: 'move_linear',
+                     label: 'Return to safe-outside-machine',
+                     speed_pct: medium, derived_from: 'machine_safe' })
+      })
+    } else {
+      // Legacy single-fixture / no-fixture unload. clampWorkpiece's
+      // unclamp mirror runs the role-labeled DI/DO lookup; preserves
+      // byte-identity for the pre-directive flow.
+      steps.push({ action: 'move_linear', label: 'Approach fixture (finished part)',
+                   offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+      steps.push({ action: 'move_linear', label: 'Fixture — contact (finished part)',
+                   speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
+      steps.push(...effectorEngage(cfgEffector, {
+        ..._vocabOpts, labelOverride: (effectorOf(cfgEffector) === 'finger'
+          ? 'Grip finished part' : 'Pick finished part'),
+      }))
+      steps.push(...unclampWorkpiece(portmap))
+      steps.push({ action: 'move_linear', label: 'Retreat with finished part',
+                   offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
+      steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
+                   speed_pct: medium, derived_from: 'machine_safe' })
+    }
     // 2026-10-15: waypoints between the (completed) MACHINE LOAD cycle
     // and the UNLOAD side — operator-taught via-points steer the arm
     // from the machine-safe pose to approach-unload.
@@ -3976,6 +4285,21 @@ function buildSteps(answers, portmap = null,
   applyToRole('machine_load', loadP)
   applyToRole('unload',       unloadP)
   applyToRole('machine_safe', machineSafeP)
+
+  // 2026-10-15 multi-fixture machine-tending: indexed load positions
+  // for 2+ selected vices. Each taught_machine_load_i lands on its
+  // matching position_role 'machine_load_i' step the per-fixture
+  // loop emitted above.
+  if (op === 'machine_tend') {
+    const _mFixtures = resolveMachineFixtures(cellRegistry, answers)
+    if (_mFixtures.length >= 2) {
+      _mFixtures.forEach((_fx, idx) => {
+        const i = idx + 1
+        const p = readTaught(cfg, `taught_machine_load_${i}`)
+        applyToRole(`machine_load_${i}`, p)
+      })
+    }
+  }
 
   // 2026-10-15 multi-pair pick_and_place: resolve indexed taught_pick_i /
   // taught_place_i keys against the position_role: 'pick_i' / 'place_i'
@@ -4104,9 +4428,26 @@ export default function ProgramWizard({ onClose, onSaved }) {
 
   const builtCellEoat = findCellEoat(cellRegistry, answers.cell_eoat_id)
   const builtSteps = buildSteps(
-    answers, wizardPortmap, builtCellEoat, wizardSynapsePortmap)
+    answers, wizardPortmap, builtCellEoat, wizardSynapsePortmap,
+    cellRegistry)
 
   const handleSave = async () => {
+    // 2026-10-15 machine-fixture refusal: if the operator picked
+    // fixture(s) in the Machine Fixtures step but any selected fixture
+    // lacks a clamp signal (no fixture.valve + no fixture.out), save
+    // is refused with a plain-copy toast. Prevents shipping a program
+    // that would set the part down and silently never clamp it.
+    if (answers.operation === 'machine_tend'
+        && Array.isArray(answers.machine_fixture_ids)
+        && answers.machine_fixture_ids.length) {
+      const _mFixtures = resolveMachineFixtures(cellRegistry, answers)
+      const _refusal = missingClampSignalRefusal(_mFixtures)
+      if (_refusal) {
+        try { useStore.getState().addToast?.(_refusal, 'error') } catch { /* ignore */ }
+        setSaving(false)
+        return
+      }
+    }
     setSaving(true)
     try {
       // Pallet programs need the typed pallet + pick/place TCP block at

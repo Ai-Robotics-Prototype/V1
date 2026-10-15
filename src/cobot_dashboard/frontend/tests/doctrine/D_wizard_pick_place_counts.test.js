@@ -243,7 +243,7 @@ test('Trailing effectorDisengage is suppressed for multi-pair', () => {
   // branch; the paired loop already emits per-pair disengage + retreat,
   // so the trailing emit must gate on !isMultiPair.
   const idx = progWizSrc.indexOf('function buildSteps(answers, portmap = null')
-  const chunk = progWizSrc.slice(idx, idx + 18000)
+  const chunk = progWizSrc.slice(idx, idx + 28000)
   assert.ok(
     /if \(!isMultiPair\)\s*\{\s*\n\s*steps\.push\(\.\.\.effectorDisengage\(cfgEffector, _vocabOpts\)\)/
       .test(chunk),
