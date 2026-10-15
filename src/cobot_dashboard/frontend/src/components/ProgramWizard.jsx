@@ -535,6 +535,23 @@ const inputBox = {
 
 // Style + math tokens retained from the retired custom-gripper block
 
+// 2026-10-15 operator directive: the record-confirmation names THIS
+// position in plain language ("Successfully taught Pick position"). The
+// teach-step labels are ALL-CAPS pedagogical headings; convert to a
+// first-letter-cap sentence form for the confirmation copy. No coord
+// dump anywhere — just the name.
+function teachLabelToName(label) {
+  if (!label || typeof label !== 'string') return 'position'
+  // Lowercase everything then capitalize the first letter. Preserves
+  // punctuation ("HOME (return)" → "Home (return)") and leading digits
+  // / enclosed-digit glyphs ("① PALLET CORNER — origin" → "① pallet
+  // corner — origin" where the first alpha char is left as-is).
+  const lower = label.toLowerCase()
+  const firstAlpha = lower.search(/[a-z]/)
+  if (firstAlpha < 0) return lower
+  return lower.slice(0, firstAlpha) + lower.charAt(firstAlpha).toUpperCase() + lower.slice(firstAlpha + 1)
+}
+
 // Derive the ordered list of positions for the current operation.
 function teachPositionsForAnswers(answers) {
   const op   = answers.operation
@@ -830,15 +847,21 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
 
   const current = positions[posIdx]
 
-  // The reuse prompt fires when the current step's key already holds a
-  // recorded (non-skipped, has tcp/joints) value from earlier in this
-  // session — either a prior step that shares the key, a back-nav return,
-  // or a re-entry into the teach sequence.
+  // 2026-10-15 operator directive: the reuse prompt fires ONLY on the
+  // end/return step (the HOME-return at the tail of the sequence, which
+  // reuses the same key as an earlier step — always 'taught_home'). On
+  // every other step — including edit-mode re-opens where answers carry
+  // saved poses — recording and navigation are plain: no "already taught"
+  // choice screen. Scope: posIdx === last AND an earlier position shares
+  // this key (the end-return is defined as that key-duplicate).
   const existingForCurrent = current ? answers[current.key] : null
   const alreadyRecordedHere = !!(existingForCurrent &&
     !existingForCurrent.skipped &&
     (Array.isArray(existingForCurrent.tcp) || Array.isArray(existingForCurrent.joints)))
-  const showChoiceScreen = alreadyRecordedHere && !forceTeach[posIdx]
+  const isEndReturnStep = !!(current
+    && posIdx === positions.length - 1
+    && positions.slice(0, posIdx).some((p) => p.key === current.key))
+  const showChoiceScreen = alreadyRecordedHere && !forceTeach[posIdx] && isEndReturnStep
 
   const advanceOrComplete = useCallback(() => {
     if (posIdx >= positions.length - 1) {
@@ -1287,30 +1310,11 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               background: '#f0fdf4', border: '1px solid #bbf7d0',
               borderRadius: 12,
             }}>
-              <div style={{ fontSize: 16, fontWeight: 700, color: '#16A34A', marginBottom: 10 }}>
-                ✓ This position is already taught
-              </div>
-              <div style={{ fontFamily: 'monospace', fontSize: 14, color: '#111', marginBottom: 6 }}>
-                {Array.isArray(existingForCurrent.tcp) && existingForCurrent.tcp.length >= 3 ? (
-                  <>
-                    <div>
-                      TCP: x:{Number(existingForCurrent.tcp[0]).toFixed(3)}
-                      {'  '}y:{Number(existingForCurrent.tcp[1]).toFixed(3)}
-                      {'  '}z:{Number(existingForCurrent.tcp[2]).toFixed(3)}
-                    </div>
-                    {existingForCurrent.tcp.length >= 6 && (
-                      <div>
-                        {'     '}rx:{Number(existingForCurrent.tcp[3]).toFixed(3)}
-                        {'  '}ry:{Number(existingForCurrent.tcp[4]).toFixed(3)}
-                        {'  '}rz:{Number(existingForCurrent.tcp[5]).toFixed(3)}
-                      </div>
-                    )}
-                  </>
-                ) : Array.isArray(existingForCurrent.joints) && existingForCurrent.joints.length ? (
-                  <div>
-                    Joints: [{existingForCurrent.joints.map((j) => Number(j).toFixed(1)).join(', ')}]°
-                  </div>
-                ) : null}
+              {/* 2026-10-15 operator directive: no coord/TCP/joint dump
+                  on the reuse screen (fires only on the end-return step).
+                  Plain "already taught" headline + Reuse/Re-teach choice. */}
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#16A34A', marginBottom: 6 }}>
+                ✓ The home position is already taught
               </div>
               <div style={{ fontSize: 13, color: '#6b7280' }}>
                 {(() => {
@@ -1498,6 +1502,29 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
       }}>
         <ProgressDots count={positions.length} currentIdx={posIdx} statuses={statuses} />
       </div>
+
+      {/* 2026-10-15 operator directive: plain success banner after record,
+          naming THIS position. No TCP / joint / coord dump — just the
+          name. Visible for the ~900 ms flash window, then advanceOrComplete
+          moves to the next step. Shared between live-capture (recordPosition)
+          and manual-entry (saveManualPose) paths via the single `flash`
+          state. */}
+      {flash && current && (
+        <div
+          data-testid="teach-success-banner"
+          data-position-name={teachLabelToName(current.label)}
+          style={{
+            flex: '0 0 auto',
+            margin: '0 16px 8px',
+            padding: '12px 16px',
+            background: '#f0fdf4', border: '1px solid #bbf7d0',
+            borderRadius: 10, color: '#15803d',
+            fontSize: 15, fontWeight: 700,
+            textAlign: 'center',
+          }}>
+          ✓ Successfully taught {teachLabelToName(current.label)}
+        </div>
+      )}
 
       {/* STICKY FOOTER — tablet-first: STOP + Back + Record + Skip share
           one row that stays reserved outside the scrollable content.
