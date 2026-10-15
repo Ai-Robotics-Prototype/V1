@@ -28,6 +28,32 @@ function backoffDelay(attempt) {
 // Store definition
 // ---------------------------------------------------------------------------
 
+// 2026-10-15 operator field report: deleting all programs from the
+// library left a stale program showing on Monitor. The delete path in
+// ProgramLibrary cleared currentProgram ONLY when it matched the
+// deleted id — if another tab / session deleted the loaded program OR
+// the loaded id drifted from the library id (edge cases around
+// name-based matches, renamed files, cross-tab deletes), the stale
+// program kept showing. Fix: a canonical "empty program" shape + a
+// clearCurrentProgram() action both the delete flow and the periodic
+// reconcile in hydratePrograms call. The reconcile is the stale-
+// reference guard — any time programsList is refreshed, if the loaded
+// id no longer exists in the library, Monitor clears gracefully (no
+// ghost, no error).
+const _EMPTY_PROGRAM = Object.freeze({
+  id:               null,
+  name:             'Untitled Program',
+  steps:            [],
+  unsaved:          false,
+  config:           {},
+  description:      '',
+  tags:             [],
+  cell_id:          null,
+  points:           {},
+  source:           null,
+  has_taught_poses: false,
+})
+
 const storeDefinition = (set, get) => ({
   // ---- Connection ----
   wsStatus: 'disconnected',
@@ -1887,6 +1913,19 @@ const storeDefinition = (set, get) => ({
         programsList:     programs,
         programsHydrated: true,
       })
+      // 2026-10-15 stale-reference guard: if currentProgram points at
+      // an id that no longer exists in the fresh library snapshot
+      // (deleted in another tab / session / request), reconcile to
+      // the empty state so Monitor doesn't show a ghost. Only fires
+      // when the loaded id is NON-NULL AND NOT found — a brand-new
+      // unsaved program (id=null) is untouched. This is the single
+      // reconcile seam; Library's delete flow goes through the same
+      // clearCurrentProgram() action.
+      const _loadedId = get().currentProgram?.id
+      if (_loadedId
+          && !programs.some((p) => p && p.id === _loadedId)) {
+        get().clearCurrentProgram()
+      }
     } catch {
       set({ programsHydrated: true })
     }
@@ -1901,25 +1940,15 @@ const storeDefinition = (set, get) => ({
   // Save and Load mirror it to STATE.program via setProgramSteps so the
   // task runner (which reads STATE) stays in sync with the last saved
   // version of the program.
-  currentProgram: {
-    id: null,
-    name: 'Untitled Program',
-    steps: [],
-    unsaved: false,
-    // Full program.config payload (gripper, pallet, motion_profile_name,
-    // pallet_mode, pick_tcp, place_tcp, etc.). Loaded on Library → Edit
-    // so the editor can mutate pallet configuration and send it back
-    // through PUT /api/programs/{id}.
-    config: {},
-    description: '',
-    tags: [],
-    cell_id: null,
-    // Taught-point table — {name: {joints[6 deg], tcp[6], label, taught_at}}.
-    // Populated by /api/programs/{id}/points endpoints; drives varspoint
-    // codegen when steps reference points by name.
-    points: {},
-    source: null,
-    has_taught_poses: false,
+  currentProgram: { ..._EMPTY_PROGRAM },
+  // 2026-10-15: reset the loaded-program slot to the canonical empty
+  // shape. Used by the Library delete flow (when the deleted program
+  // was the one on Monitor) AND by hydratePrograms's reconcile (when
+  // the loaded id no longer exists in the server-side list). Writes a
+  // FRESH copy of the empty shape so mutations to currentProgram do
+  // not leak into the frozen template.
+  clearCurrentProgram() {
+    set({ currentProgram: { ..._EMPTY_PROGRAM } })
   },
   setCurrentProgram(patch) {
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))

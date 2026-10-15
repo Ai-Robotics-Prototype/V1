@@ -350,6 +350,7 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   const addToast         = useStore((s) => s.addToast)
   const currentProgramId = useStore((s) => s.currentProgram?.id)
   const setCurrentProgram = useStore((s) => s.setCurrentProgram)
+  const clearCurrentProgram = useStore((s) => s.clearCurrentProgram)
   // Resident-program mirror from the server (D9 line_map wire). If
   // the deleted program equals this, the confirm dialog surfaces the
   // controller-keeps-its-copy warning; the run gate then refuses with
@@ -476,12 +477,12 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
       // Clear the currentProgram slot if it referred to the deleted
       // id — otherwise the editor tab keeps showing a ghost that
       // Save/Push would either re-create the file or 404 against.
+      // 2026-10-15: route through the shared clearCurrentProgram()
+      // action so Library delete + hydratePrograms reconcile share
+      // the same empty-program shape (de-dupes the inline literal
+      // that previously lived here, closes the drift risk).
       if (currentProgramId && currentProgramId === progId) {
-        setCurrentProgram({
-          id: null, name: 'Untitled Program', steps: [], unsaved: false,
-          config: {}, description: '', tags: [], cell_id: null,
-          points: {}, source: null, has_taught_poses: false,
-        })
+        clearCurrentProgram()
       }
       load()
     } catch (e) {
