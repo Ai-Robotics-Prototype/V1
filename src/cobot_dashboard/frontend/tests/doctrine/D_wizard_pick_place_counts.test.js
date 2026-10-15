@@ -291,17 +291,18 @@ function evalBuildStepsCore() {
   if (!m) throw new Error('buildSteps not found')
   const readTaughtM = progWizSrc.match(/function readTaught\(answers, key\)\s*\{[\s\S]*?\n\}/)
   const verifyM     = progWizSrc.match(/function verificationStepsForEoat\(cellEoat[\s\S]*?\n\}/)
-  const waypointM = progWizSrc.match(/function waypointStepsForJunction\(answers, junctionId, defaultSpeed\)\s*\{[\s\S]*?\n\}/)
-  const waypointHelperM = progWizSrc.match(/function readWaypointsForJunction\(answers, junctionId\)\s*\{[\s\S]*?\n\}/)
   const cellVocabM = progWizSrc.match(/function _cellVocabOpts\(cellEoat, synapsePortmap\)\s*\{[\s\S]*?\n\}/)
   const palletM = progWizSrc.match(/function buildPalletizeSteps\(answers, cellEoat = null, synapsePortmap = null\)\s*\{[\s\S]*?\n\}/)
-  if (!readTaughtM || !waypointM || !waypointHelperM || !cellVocabM || !palletM || !verifyM) {
+  if (!readTaughtM || !cellVocabM || !palletM || !verifyM) {
     throw new Error('could not extract helper functions')
   }
   // Stub the effector + machine_tend emitters so we only measure the
   // motion / taught-step shape. verificationStepsForEoat is sandboxed
   // with stubbed eoatVerification helpers so a cellEoat === null (the
-  // 1/1 equivalence test) resolves to [] regardless.
+  // 1/1 equivalence test) resolves to [] regardless. 2026-10-15:
+  // waypointStepsForJunction + readWaypointsForJunction live in the
+  // shared lib — stub them in the sandbox (every pin passes an
+  // answers map with no waypoints[], so [] is the invariant return).
   const body = [
     `const effectorReady     = ${_slimEffector.toString()}`,
     `const effectorEngage    = ${_slimEffector.toString()}`,
@@ -320,9 +321,9 @@ function evalBuildStepsCore() {
     `function resolveConfirmSignals() { return [] }`,
     `function resolveVerification()   { return 'none' }`,
     `const VERIFICATION_PER_PART = 'per_part'`,
+    `function readWaypointsForJunction() { return [] }`,
+    `function waypointStepsForJunction() { return [] }`,
     verifyM[0],
-    waypointHelperM[0],
-    waypointM[0],
     readTaughtM[0],
     cellVocabM[0],
     palletM[0],

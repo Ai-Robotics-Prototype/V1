@@ -49,6 +49,9 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
+import { waypointJunctionsForOperation, waypointStepsForJunction }
+  from '../../src/lib/waypointJunctions.js'
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname  = dirname(__filename)
 const FRONT_ROOT = join(__dirname, '..', '..')
@@ -62,33 +65,42 @@ function v(msg) { return `DOCTRINE WIZARD_WAYPOINT VIOLATED: ${msg}` }
 
 // ── (1) Junction definitions per operation ──────────────────────────
 
-test('waypointJunctionsForAnswers exists in ProgramWizard', () => {
+test('waypointJunctionsForOperation lives in the shared lib (not ProgramWizard)', () => {
+  // 2026-10-15 shared-ification: the per-op junction map moved out of
+  // ProgramWizard into lib/waypointJunctions.js so every wizard surface
+  // consumes the SAME source. ProgramWizard must import, not redeclare.
   assert.ok(
-    /function waypointJunctionsForAnswers\(answers\)/.test(progWizSrc),
-    v('ProgramWizard must define waypointJunctionsForAnswers(answers) '
-      + '— the per-operation junction map that drives both the teach-'
-      + 'sequence interleave AND the buildSteps inject sites.'))
+    /import\s*\{[^}]*waypointJunctionsForOperation[^}]*\}\s*from\s*['"]\.\.\/lib\/waypointJunctions['"]/
+      .test(progWizSrc),
+    v('ProgramWizard must import waypointJunctionsForOperation from '
+      + 'lib/waypointJunctions — the shared data model that drives all '
+      + 'wizards\' teach-sequence interleave + codegen injection.'))
+  // The function is callable from the import, which proves import-time
+  // resolution works too.
+  assert.ok(typeof waypointJunctionsForOperation === 'function',
+    v('waypointJunctionsForOperation must be exported from the shared lib.'))
 })
 
-test('waypointJunctionsForAnswers covers every supported operation', () => {
-  // One sanity probe per op — pattern-match that the branch emits a
-  // junction with the canonical home_to_pick starter.
-  const ops = ['pick_and_place', 'palletize', 'depalletize', 'machine_tend', 'sort']
-  for (const op of ops) {
-    assert.ok(
-      new RegExp(`id:\\s*['"]home_to_pick['"]`).test(progWizSrc),
-      v(`waypointJunctionsForAnswers must emit a home_to_pick junction `
-        + `for ${op} — the HOME → first-main-position seam is the one `
-        + `universal junction every op needs.`))
-  }
-  // machine_tend specifically carries the extra pick→load / load→unload / unload→home junctions.
+test('waypointJunctionsForOperation covers every supported operation', () => {
+  // Pick_and_place / sort / machine_tend / depalletize all keep their
+  // full junction set; palletize is the one exception (reduced to a
+  // single pick→pallet-approach offer per the 2026-10-15 directive —
+  // tested below).
+  const ppJ = waypointJunctionsForOperation({ operation: 'pick_and_place' })
+  const mtJ = waypointJunctionsForOperation({ operation: 'machine_tend' })
+  const srJ = waypointJunctionsForOperation({ operation: 'sort' })
+  const dpJ = waypointJunctionsForOperation({ operation: 'palletize', pallet_mode: 'depalletize' })
+  assert.ok(ppJ.some((j) => j.id === 'home_to_pick'),
+    v('pick_and_place must offer the home_to_pick junction.'))
   for (const id of ['pick_to_machine_load', 'machine_load_to_unload', 'unload_to_home']) {
-    assert.ok(
-      new RegExp(`id:\\s*['"]${id}['"]`).test(progWizSrc),
-      v(`waypointJunctionsForAnswers must emit a ${id} junction for `
-        + `machine_tend — the operator teaches four motion endpoints `
-        + `(home / pick / machine_load / unload) + the return home.`))
+    assert.ok(mtJ.some((j) => j.id === id),
+      v(`machine_tend must offer the ${id} junction.`))
   }
+  assert.ok(srJ.length >= 3,
+    v('sort must offer at least 3 junctions (home / pick / return).'))
+  assert.ok(dpJ.some((j) => j.id === 'home_to_pick'),
+    v('depalletize must offer the home_to_pick junction (unchanged '
+      + 'from 045432f — the single-offer reduction is palletize-only).'))
 })
 
 
@@ -100,8 +112,8 @@ test('teachPositionsForAnswers interleaves kind:waypoint_junction entries', () =
     v('teachPositionsForAnswers must emit entries with '
       + 'kind:"waypoint_junction" interleaved after main teach steps.'))
   assert.ok(
-    /const junctions\s*=\s*waypointJunctionsForAnswers\(answers\)/.test(progWizSrc),
-    v('teachPositionsForAnswers must call waypointJunctionsForAnswers '
+    /const junctions\s*=\s*waypointJunctionsForOperation\(answers\)/.test(progWizSrc),
+    v('teachPositionsForAnswers must call waypointJunctionsForOperation '
       + '(single source of truth for the junction set).'))
   assert.ok(
     /junctions\.find\(\(x\)\s*=>\s*x\.afterKey\s*===\s*entry\.key\)/.test(progWizSrc),
@@ -232,23 +244,24 @@ test('After waypoint record, flash clears teachingWaypoint — re-renders offer'
 
 // ── (6) buildSteps / buildPalletizeSteps injection ──────────────────
 
-test('waypointStepsForJunction helper exists and emits action:"waypoint"', () => {
-  assert.ok(
-    /function waypointStepsForJunction\(answers, junctionId, defaultSpeed\)/
-      .test(progWizSrc),
-    v('ProgramWizard must define waypointStepsForJunction(answers, '
-      + 'junctionId, defaultSpeed) — the single builder for program-'
-      + 'step emission from taught via-points.'))
-  assert.ok(
-    /action:\s*['"]waypoint['"]/.test(progWizSrc),
-    v('waypointStepsForJunction must emit action:"waypoint" — the SAME '
-      + 'action ProgramEditor Add Step → Motion → Waypoint produces '
-      + '(programTruth TEACHABLE_ACTIONS from 08cf555). No new step '
-      + 'type, no fork.'))
-  assert.ok(
-    /waypoint_junction:\s*junctionId/.test(progWizSrc),
-    v('Each emitted waypoint step must carry waypoint_junction: '
-      + 'junctionId as an audit trail (which junction authored it).'))
+test('waypointStepsForJunction lives in the shared lib + emits action:"waypoint"', () => {
+  assert.ok(typeof waypointStepsForJunction === 'function',
+    v('waypointStepsForJunction must be exported from the shared lib — '
+      + 'the single builder for program-step emission from taught via-'
+      + 'points. ProgramWizard imports it; no inline redeclaration.'))
+  // Smoke the shape with a representative taught pose.
+  const out = waypointStepsForJunction({
+    waypoints: { home_to_pick: [{ tcp: [0.1, 0.2, 0.3, 0, 0, 0], joints: [10,0,0,0,0,0], taught_at: 't', source: 'live' }] },
+  }, 'home_to_pick', 55)
+  assert.equal(out.length, 1, v('One taught pose → one emitted step.'))
+  assert.equal(out[0].action, 'waypoint',
+    v('Emitted step action must be "waypoint" — matches programTruth '
+      + 'TEACHABLE_ACTIONS from 08cf555. No new step type, no fork.'))
+  assert.equal(out[0].waypoint_junction, 'home_to_pick',
+    v('Each emitted step must carry waypoint_junction as an audit '
+      + 'trail (which junction authored it).'))
+  assert.equal(out[0].speed_pct, 55,
+    v('speed_pct must flow through from the defaultSpeed arg.'))
 })
 
 test('waypoint is in TEACHABLE_ACTIONS and MOTION_SMOOTHING_ACTIONS', () => {
@@ -337,21 +350,8 @@ test('buildPalletizeSteps injects waypoints at pallet seams', () => {
 
 // ── (7) Existing programs unaffected (empty-waypoints no-op) ───────
 
-function evalReadWaypointsForJunction() {
-  const m = progWizSrc.match(/function readWaypointsForJunction\(answers, junctionId\)\s*\{[\s\S]*?\n\}/)
-  if (!m) throw new Error('readWaypointsForJunction not found in ProgramWizard.jsx')
-  return new Function(`${m[0]}; return readWaypointsForJunction;`)()
-}
-function evalWaypointStepsForJunction() {
-  const m = progWizSrc.match(/function waypointStepsForJunction\(answers, junctionId, defaultSpeed\)\s*\{[\s\S]*?\n\}/)
-  if (!m) throw new Error('waypointStepsForJunction not found in ProgramWizard.jsx')
-  const readFn = evalReadWaypointsForJunction()
-  return new Function('readWaypointsForJunction',
-    `${m[0]}; return waypointStepsForJunction;`)(readFn)
-}
-
 test('waypointStepsForJunction returns [] when no waypoints are taught', () => {
-  const fn = evalWaypointStepsForJunction()
+  const fn = waypointStepsForJunction
   assert.deepEqual(fn({},                              'home_to_pick', 40), [],
     v('No answers.waypoints at all → []. Existing programs must be '
       + 'unaffected by this feature.'))
@@ -365,7 +365,7 @@ test('waypointStepsForJunction returns [] when no waypoints are taught', () => {
 })
 
 test('waypointStepsForJunction emits taught poses with action:"waypoint"', () => {
-  const fn = evalWaypointStepsForJunction()
+  const fn = waypointStepsForJunction
   const tcp = [0.1, 0.2, 0.3, 0, 0, 0]
   const joints = [10, -90, 0, -90, 0, 0]
   const out = fn({

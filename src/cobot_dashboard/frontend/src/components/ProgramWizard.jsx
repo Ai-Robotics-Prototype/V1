@@ -17,6 +17,9 @@ import { getCell, findCellEoat } from '../lib/cellStore'
 import { resolveCapacity, resolveVerification, resolveConfirmSignals,
          offersMultiPick, emitsVerificationStep,
          VERIFICATION_PER_PART } from '../lib/eoatVerification'
+import { waypointJunctionsForOperation, readWaypointsForJunction,
+         waypointStepsForJunction, offerInstrFor }
+  from '../lib/waypointJunctions'
 
 // 2026-10-15 operator directive: multi-pick + verification questions
 // are gated on the SELECTED tool's capacity + verification. The PAGES
@@ -611,85 +614,15 @@ function teachLabelToName(label) {
 }
 
 // 2026-10-15 operator directive: waypoint-offer prompts between main
-// teach positions. A waypoint is a taught via-point the arm passes
-// THROUGH on the way between two positions, used to steer the path
-// around a fixture / column / obstacle. MANUAL routing — the software
-// does not auto-detect obstacles (honest-scope rule from 08cf555).
-//
-// Each junction is a tuple { id, afterKey, fromLabel, toLabel }:
-//   * `afterKey`   — the taught-position key this junction follows;
-//                    the offer screen appears RIGHT AFTER the operator
-//                    teaches / skips / reuses that position.
-//   * `id`         — stable string used as a key in answers.waypoints[],
-//                    and as the `waypoint_junction` audit field on
-//                    every emitted waypoint step.
-//   * from/toLabel — operator-facing names for the two endpoints
-//                    ("Home" / "Pick"), used in the offer copy.
-//
-// Junction placement rule: offers appear only between MAIN motion
-// positions, NEVER between a position and its auto-derived approach /
-// retreat (those are paired). For palletize/depalletize, the 4 pallet-
-// corner teach steps define a FRAME, not motion endpoints, so we do
-// NOT prompt between them; the two pallet junctions are at the macro
-// boundaries (home → pick, and the pallet macro ↔ the main place /
-// return).
-function waypointJunctionsForAnswers(answers) {
-  const op   = (answers && answers.operation) || 'pick_and_place'
-  const mode = answers && answers.pallet_mode
-  if (op === 'palletize' && mode === 'palletize') {
-    return [
-      { id: 'home_to_pick',  afterKey: 'taught_home',        fromLabel: 'Home',      toLabel: 'Pick'              },
-      { id: 'pick_to_place', afterKey: 'taught_pick',        fromLabel: 'Pick',      toLabel: 'Pallet place'      },
-      { id: 'place_to_home', afterKey: 'taught_pallet_part', fromLabel: 'Pallet place', toLabel: 'Home (return)'  },
-    ]
-  }
-  if (op === 'palletize' && mode === 'depalletize') {
-    return [
-      { id: 'home_to_pick',  afterKey: 'taught_home',        fromLabel: 'Home',         toLabel: 'Pallet pick'    },
-      { id: 'pick_to_place', afterKey: 'taught_pallet_part', fromLabel: 'Pallet pick',  toLabel: 'Place'          },
-      { id: 'place_to_home', afterKey: 'taught_place',       fromLabel: 'Place',        toLabel: 'Home (return)'  },
-    ]
-  }
-  if (op === 'machine_tend') {
-    return [
-      { id: 'home_to_pick',             afterKey: 'taught_home',         fromLabel: 'Home',         toLabel: 'Pick / Load'    },
-      { id: 'pick_to_machine_load',     afterKey: 'taught_pick',         fromLabel: 'Pick',         toLabel: 'Machine load'   },
-      { id: 'machine_load_to_unload',   afterKey: 'taught_machine_load', fromLabel: 'Machine load', toLabel: 'Unload'         },
-      { id: 'unload_to_home',           afterKey: 'taught_unload',       fromLabel: 'Unload',       toLabel: 'Home (return)'  },
-    ]
-  }
-  if (op === 'sort') {
-    // Sort codegen (buildSteps) currently emits one combined place
-    // step (pick → place → home); the two taught sort places map to
-    // the same codegen segment. Junctions mirror that shape so taught
-    // waypoints always land somewhere in the generated program.
-    // place_to_home anchors on taught_sort_2 (the last taught sort
-    // pose before HOME-return in the teach sequence) so the operator
-    // sees the junction right where they expect it.
-    return [
-      { id: 'home_to_pick',  afterKey: 'taught_home',   fromLabel: 'Home',         toLabel: 'Pick'          },
-      { id: 'pick_to_place', afterKey: 'taught_pick',   fromLabel: 'Pick',         toLabel: 'Sort place 1'  },
-      { id: 'place_to_home', afterKey: 'taught_sort_2', fromLabel: 'Sort place 2', toLabel: 'Home (return)' },
-    ]
-  }
-  // Default (pick_and_place and any sibling flow with pick + place).
-  return [
-    { id: 'home_to_pick',  afterKey: 'taught_home',  fromLabel: 'Home',  toLabel: 'Pick'          },
-    { id: 'pick_to_place', afterKey: 'taught_pick',  fromLabel: 'Pick',  toLabel: 'Place'         },
-    { id: 'place_to_home', afterKey: 'taught_place', fromLabel: 'Place', toLabel: 'Home (return)' },
-  ]
-}
+// teach positions. The data model (junction map + storage reader +
+// codegen emitter) lives in lib/waypointJunctions.js so every surface
+// that offers waypoint teaching consumes the SAME source — a fix
+// landed in the shared module applies everywhere. ProgramWizard imports
+// waypointJunctionsForOperation, readWaypointsForJunction,
+// waypointStepsForJunction + offerInstrFor from that lib. No inline
+// fork of the junction map allowed; D_shared_waypoint_offer.test.js
+// greps for the retired function names and fails on any re-add.
 
-// Read the taught waypoint pose list for a junction. Returns an array
-// of waypoint pose records (each with tcp / joints / taught_at). Safe
-// against undefined storage.
-function readWaypointsForJunction(answers, junctionId) {
-  if (!answers || typeof answers !== 'object') return []
-  const wps = answers.waypoints && answers.waypoints[junctionId]
-  if (!Array.isArray(wps)) return []
-  return wps.filter((wp) => wp && !wp.skipped
-    && (Array.isArray(wp.tcp) || Array.isArray(wp.joints)))
-}
 
 // Derive the ordered list of positions for the current operation.
 function teachPositionsForAnswers(answers) {
@@ -863,7 +796,7 @@ function teachPositionsForAnswers(answers) {
   // afterKey=`taught_pick` lands right after the pick teach and
   // BEFORE the pallet-corner teach steps (correct — the pallet
   // corners define the FRAME, not a motion endpoint).
-  const junctions = waypointJunctionsForAnswers(answers)
+  const junctions = waypointJunctionsForOperation(answers)
   const teachEntries = positions.map((p) => ({ ...p, kind: 'teach' }))
   const result = []
   teachEntries.forEach((entry, idx) => {
@@ -882,7 +815,7 @@ function teachPositionsForAnswers(answers) {
       fromLabel: j.fromLabel,
       toLabel:   j.toLabel,
       label: `WAYPOINT? — between ${j.fromLabel} and ${j.toLabel}`,
-      instr: `A waypoint is a point the robot passes through — use it to steer the path around a fixture or obstacle between ${j.fromLabel} and ${j.toLabel}. Manual routing: you teach the via-point; the arm does not auto-detect.`,
+      instr: offerInstrFor(j),
     })
   })
   return result
@@ -3367,34 +3300,12 @@ function verificationStepsForEoat(cellEoat, { partsOnPick = 1,
   }]
 }
 
-// 2026-10-15 waypoint injection — emit N `action: 'waypoint'` steps
-// for the taught via-points at a junction. Shape matches the ProgramEditor's
-// waypoint step (programTruth TEACHABLE_ACTIONS + MOTION_SMOOTHING_ACTIONS
-// already carry 'waypoint' from 08cf555 — no editor/palette changes needed).
-// Returns [] when no waypoints are taught, so adding junctions to a program
-// without ever teaching one is a no-op and existing programs are unaffected.
-// The waypoint_junction field is an audit trail — the executor doesn't need
-// it, but tools / codegen / tests can map a step back to its originating
-// junction without re-running the wizard.
-function waypointStepsForJunction(answers, junctionId, defaultSpeed) {
-  const wps = readWaypointsForJunction(answers, junctionId)
-  const spd = Number.isFinite(defaultSpeed) ? defaultSpeed : 40
-  return wps.map((wp, idx) => {
-    const tcp    = Array.isArray(wp.tcp)    ? wp.tcp    : null
-    const joints = Array.isArray(wp.joints) ? wp.joints : null
-    return {
-      action: 'waypoint',
-      label: `Waypoint ${idx + 1} (${junctionId})`,
-      speed_pct: spd,
-      position: tcp ? tcp.slice(0, 3) : null,
-      taught: !!(tcp || joints),
-      taught_tcp:    tcp,
-      taught_joints: joints,
-      joints,
-      waypoint_junction: junctionId,
-    }
-  })
-}
+// 2026-10-15 waypoint codegen — waypointStepsForJunction + its reader
+// readWaypointsForJunction moved to lib/waypointJunctions.js. The
+// shared module backs every wizard that offers waypoint teaching;
+// ProgramWizard imports them at the top of this file. A pin suite
+// (D_shared_waypoint_offer.test.js) greps this file to assert no inline
+// fork is reintroduced.
 
 // 2026-09-15 field-triage fix: for pallet corner / part keys, ALSO
 // consult the geometry store (config.pallet.corner*_tcp + part_tcp).
@@ -3848,7 +3759,7 @@ function buildSteps(answers, portmap = null,
     // For machine_tend the junction id is 'pick_to_machine_load'; for
     // pick_and_place / sort it's 'pick_to_place' (sort folds its two
     // place poses onto one codegen segment — see
-    // waypointJunctionsForAnswers for the sort rationale). Chosen per
+    // waypointJunctionsForOperation for the sort rationale). Chosen per
     // op so the semantics match the operator's wizard flow.
     if (op === 'machine_tend') {
       steps.push(...waypointStepsForJunction(answers, 'pick_to_machine_load', spd))
