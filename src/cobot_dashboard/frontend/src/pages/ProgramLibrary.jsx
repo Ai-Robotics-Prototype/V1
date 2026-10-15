@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useStore } from '../store/useStore'
 import { loadProgramFlow } from '../lib/loadProgramFlow'
+import ConfirmModal from '../components/ConfirmModal'
 
 // ---------------------------------------------------------------------------
 // Program Library — file-explorer style grid view
@@ -332,6 +333,17 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   const [error, setError]                   = useState(null)
   const [foldersHydrated, setFoldersHydrated] = useState(false)
   const [loadingToMonitor, setLoadingToMonitor] = useState(false)
+  // 2026-10-15 operator directive: destructive confirms (delete program,
+  // delete folder) run through the app-theme ConfirmModal — same shape
+  // Enable / Orient / profile-switch use (import-identity, no fork).
+  // The pendingDelete record describes what to delete; the modal reads
+  // `kind` to render the right copy and `onConfirm` dispatches to the
+  // matching doDelete* helper. Null → modal closed.
+  //
+  // Shapes:
+  //   { kind: 'program', progId, name, isResident }
+  //   { kind: 'folder',  folderId, name }
+  const [pendingDelete, setPendingDelete] = useState(null)
 
   const setLoadedProgram = useStore((s) => s.setLoadedProgram)
   const setTab           = useStore((s) => s.setTab)
@@ -445,30 +457,19 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
     }
   }
 
-  async function deleteProgram(progId) {
-    // Look up the program's display name so the confirm dialog names
-    // it plainly — a generic "Delete this program?" is how operators
-    // vaporise taught poses by tapping the wrong row.
+  // Opens the app-theme ConfirmModal for a delete; the actual DELETE
+  // fetch happens in doDeleteProgram, called from the modal's onConfirm.
+  // Splitting is deliberate: the modal has its own render/mount cycle,
+  // and keeping the API call in a dedicated helper means ONLY the Delete
+  // button fires it (behavior-identical to the retired confirm() guard).
+  function deleteProgram(progId) {
     const row = (programs || []).find((p) => p.id === progId)
     const name = (row && row.name) || progId
-    const isResident = residentProgramId && residentProgramId === progId
-    // Resident-on-controller case: the file lives on the arm's flash
-    // until another program is pushed. Delete just clears the
-    // dashboard's row + resets the currentProgram; the controller
-    // keeps its copy. Say so plainly so the operator is not surprised
-    // when the arm still has "the old one" until another push lands.
-    const msg = isResident
-      ? (`Delete "${name}"?\n\n`
-         + `This program is currently loaded on the robot. Deleting `
-         + `removes the .json from the dashboard's disk (moved to a `
-         + `.deleted safeguard). The controller keeps its resident `
-         + `copy until you push a different program; the dashboard's `
-         + `Run button will refuse to fire against the deleted id.`)
-      : (`Delete "${name}"?\n\n`
-         + `This removes the program's .json from disk. It is moved `
-         + `to a .deleted safeguard folder (recoverable only by asking) `
-         + `and disappears from every list.`)
-    if (!confirm(msg)) return
+    const isResident = !!(residentProgramId && residentProgramId === progId)
+    setPendingDelete({ kind: 'program', progId, name, isResident })
+  }
+
+  async function doDeleteProgram(progId) {
     try {
       const res = await fetch('/api/programs/' + encodeURIComponent(progId), { method: 'DELETE' })
       if (!res.ok) throw new Error('HTTP ' + res.status)
@@ -513,8 +514,15 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
     } catch {}
   }
 
-  async function deleteFolder(folderId) {
-    if (!confirm('Delete this folder? Programs inside will be moved to the root level.')) return
+  // Folder delete — same ConfirmModal path as deleteProgram. Opens the
+  // modal with the folder's name; doDeleteFolder fires on confirm.
+  function deleteFolder(folderId) {
+    const f = (folders || []).find((x) => x.id === folderId)
+    const name = (f && f.name) || folderId
+    setPendingDelete({ kind: 'folder', folderId, name })
+  }
+
+  async function doDeleteFolder(folderId) {
     try {
       await fetch('/api/folders/' + encodeURIComponent(folderId), { method: 'DELETE' })
       if (currentFolder === folderId) setCurrentFolder(null)
@@ -767,6 +775,40 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
         onEdit={editProgram}
         onDuplicate={duplicateProgram}
         onDelete={deleteProgram}
+      />
+
+      {/* 2026-10-15 operator directive: destructive-action confirms
+          (delete program, delete folder) render the shared app-theme
+          ConfirmModal — same shell + tokens + keyboard contract as
+          Enable / Orient / profile-switch. Native window.confirm is
+          retired from this page's delete path. Plain operator copy:
+          names the item, no file-system jargon (".json", ".deleted"),
+          no implementation detail. Danger-red primary; Cancel + Escape
+          dismiss without firing the DELETE. */}
+      <ConfirmModal
+        open={!!pendingDelete}
+        danger
+        testIdPrefix={pendingDelete?.kind === 'folder'
+          ? 'folder-delete-confirm'
+          : 'program-delete-confirm'}
+        title={pendingDelete?.kind === 'folder'
+          ? 'Delete this folder?'
+          : 'Delete this program?'}
+        body={pendingDelete?.kind === 'folder'
+          ? `Delete "${pendingDelete?.name}"? Programs inside this folder will move to the root level.`
+          : (pendingDelete?.isResident
+            ? `Delete "${pendingDelete?.name}"? This program is currently loaded on the robot — the robot keeps its copy until you load a different program, but it will no longer appear in your library and Run will refuse to fire against it.`
+            : `Delete "${pendingDelete?.name}"? This program will be removed from your library. It can be recovered if needed — ask support.`)}
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          const target = pendingDelete
+          setPendingDelete(null)
+          if (!target) return
+          if (target.kind === 'folder')  doDeleteFolder(target.folderId)
+          if (target.kind === 'program') doDeleteProgram(target.progId)
+        }}
       />
     </div>
   )
