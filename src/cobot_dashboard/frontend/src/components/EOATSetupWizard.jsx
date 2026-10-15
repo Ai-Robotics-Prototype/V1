@@ -128,6 +128,14 @@ export default function EOATSetupWizard({
   // Keyed by toolKey so flipping between finger and vacuum retains
   // their own answer.
   const [standardSensors, setStandardSensors] = useState({})
+  // 2026-10-15 operator directive: how many parts can this tool hold
+  // at once (capacity) + whether it senses the grab (verification).
+  // Both are append-only on the EOAT record — pre-directive records
+  // get safe migrated defaults via lib/eoatVerification.resolveX().
+  // Keyed by toolKey so the two standard paths retain independent
+  // answers while the operator flips between them.
+  const [standardCapacities,    setStandardCapacities]    = useState({})
+  const [standardVerifications, setStandardVerifications] = useState({})
   // Standard-path operator-editable name — 2026-10-01 directive: the
   // profile name is what the program-wizard tool card displays, so
   // the operator writes it in their own words. Prefilled from
@@ -231,6 +239,43 @@ export default function EOATSetupWizard({
     return _STANDARD_NAME_DEFAULTS[key] || ''
   }, [activeTool, standardNames])
 
+  // 2026-10-15 capacity + verification per-tool overrides.
+  const activeStandardCapacity = useMemo(() => {
+    if (!activeTool) return 1
+    const key = activeTool.key
+    if (key !== 'finger' && key !== 'vacuum') return 1
+    const override = standardCapacities[key]
+    const n = Number(override)
+    if (Number.isFinite(n) && n >= 1) return Math.min(10, Math.round(n))
+    return 1
+  }, [activeTool, standardCapacities])
+
+  // Verification mode resolves to:
+  //   * 'none' — operator declared zero sensors on the standard path
+  //   * 'per_pick' — ≥1 sensor + capacity 1 (always), OR capacity > 1
+  //                  with operator-chosen per_pick
+  //   * 'per_part' — ONLY when capacity > 1 AND operator chose per_part
+  // The sensor-count question already captures the no/yes "has sensor"
+  // intent — the operator-visible question in the directive maps to:
+  //   sensor_count == 0  ↔  verification 'none'
+  //   sensor_count ≥ 1   ↔  verification 'per_pick' (or 'per_part' if
+  //                         capacity > 1 and operator chose per-part)
+  // Keeps today's one-question-for-sensors UI; adds the per-part refinement
+  // ONLY when it is relevant.
+  const activeStandardVerification = useMemo(() => {
+    if (!activeTool) return 'none'
+    const key = activeTool.key
+    if (key !== 'finger' && key !== 'vacuum') return 'none'
+    const sensors = activeStandardSensorCount ?? 0
+    if (sensors === 0) return 'none'
+    const cap = activeStandardCapacity
+    if (cap <= 1) return 'per_pick'
+    const override = standardVerifications[key]
+    if (override === 'per_part') return 'per_part'
+    return 'per_pick'
+  }, [activeTool, activeStandardSensorCount, activeStandardCapacity,
+      standardVerifications])
+
   // Duplicate-name check for the standard confirm path. The entry
   // id is deterministic ("standard:finger" / "standard:vacuum"), so
   // a rename of the SAME standard tool back to its default name is
@@ -302,6 +347,8 @@ export default function EOATSetupWizard({
             name: activeStandardName.trim(),
             port,
             sensorCount: sensors,
+            capacity:    activeStandardCapacity,
+            verification: activeStandardVerification,
           })
           const saved = await saveCellEoat(entry)
           // Refresh the cell AND switch to the saved screen — the
@@ -476,6 +523,17 @@ export default function EOATSetupWizard({
                 )}
                 {(activeTool.key === 'finger'
                     || activeTool.key === 'vacuum') && (
+                  <StandardCapacityInput
+                    toolKey={activeTool.key}
+                    value={activeStandardCapacity}
+                    disabled={readOnly}
+                    onChange={(n) => setStandardCapacities((prev) => ({
+                      ...prev, [activeTool.key]: n,
+                    }))}
+                  />
+                )}
+                {(activeTool.key === 'finger'
+                    || activeTool.key === 'vacuum') && (
                   <StandardSensorCount
                     toolKey={activeTool.key}
                     value={activeStandardSensorCount ?? 0}
@@ -483,6 +541,19 @@ export default function EOATSetupWizard({
                     disabled={readOnly}
                     onChange={(n) => setStandardSensors((prev) => ({
                       ...prev, [activeTool.key]: n,
+                    }))}
+                  />
+                )}
+                {(activeTool.key === 'finger'
+                    || activeTool.key === 'vacuum')
+                    && activeStandardCapacity > 1
+                    && (activeStandardSensorCount ?? 0) >= 1 && (
+                  <StandardVerificationMode
+                    toolKey={activeTool.key}
+                    value={activeStandardVerification}
+                    disabled={readOnly}
+                    onChange={(mode) => setStandardVerifications((prev) => ({
+                      ...prev, [activeTool.key]: mode,
                     }))}
                   />
                 )}
@@ -1693,7 +1764,8 @@ function _buildStandardPortMap(toolKey, sensorCount) {
 //     vacuum check valve. The valve class (HI/LO 3/2 N/C) stays
 //     the same; holds_via distinguishes check-valve holding from
 //     valve-class holding so the record stays physically truthful.
-function _standardCellEntry({ toolKey, name, port, sensorCount }) {
+function _standardCellEntry({ toolKey, name, port, sensorCount,
+                              capacity, verification }) {
   const nameTrim = String(name || '').trim()
     || _STANDARD_NAME_DEFAULTS[toolKey]
     || 'EOAT'
@@ -1720,6 +1792,20 @@ function _standardCellEntry({ toolKey, name, port, sensorCount }) {
       }]
     }
   }
+  // 2026-10-15 operator directive: capacity + verification + confirm_signals
+  // join the EOAT record. confirm_signals derive from the shared allocator's
+  // `inputs` output (no fork). per_part is capped by capacity; per_pick fires
+  // on the first signal only; 'none' empties the signal list.
+  const resolvedCapacity     = Math.max(1, Math.min(10, Math.round(Number(capacity)  || 1)))
+  const resolvedVerification = (verification === 'per_part' && resolvedCapacity > 1
+                               && inputs.length >= 1) ? 'per_part'
+                             : (verification === 'per_pick' && inputs.length >= 1) ? 'per_pick'
+                             : (inputs.length >= 1 ? 'per_pick' : 'none')
+  const confirm_signals = resolvedVerification === 'none'
+    ? []
+    : (resolvedVerification === 'per_part'
+       ? inputs.slice(0, resolvedCapacity)
+       : inputs.slice(0, 1))
   return {
     id:       `standard:${toolKey}`,
     name:     nameTrim,
@@ -1728,7 +1814,108 @@ function _standardCellEntry({ toolKey, name, port, sensorCount }) {
     inputs,
     outputs:  [],
     actuators,
-    sensor_count: sensorCount,
+    sensor_count:   sensorCount,
+    capacity:       resolvedCapacity,
+    verification:   resolvedVerification,
+    confirm_signals,
     tool_ref: null,
   }
+}
+
+// 2026-10-15 standard-path capacity chooser (shared stepper, 1..10).
+// Operator-facing copy — "parts" + "at once" — no vacuum/gripper
+// vocabulary (the tool-type picker already fixed that).
+function StandardCapacityInput({ toolKey, value, disabled, onChange }) {
+  const MIN = 1, MAX = 10
+  const v = Math.max(MIN, Math.min(MAX, Math.round(Number(value) || 1)))
+  const set = (n) => onChange(Math.max(MIN, Math.min(MAX, Math.round(n))))
+  const btn = (dis) => ({
+    minHeight: 36, minWidth: 44,
+    padding: '0 12px', fontSize: 16, fontWeight: 800,
+    background: dis ? '#f3f4f6' : '#eff6ff',
+    color: dis ? '#9ca3af' : '#2563EB',
+    border: `1px solid ${dis ? '#e5e7eb' : '#bfdbfe'}`,
+    borderRadius: 6, cursor: dis ? 'not-allowed' : 'pointer',
+  })
+  return (
+    <div data-testid="hardware-setup-standard-capacity"
+         data-tool-key={toolKey}
+         data-value={String(v)}
+         style={{
+           padding: '10px 12px', marginBottom: 12,
+           background: '#F9FAFB', border: '1px solid #E5E7EB',
+           borderRadius: 6, color: '#374151',
+         }}>
+      <div style={{ fontSize: 13, marginBottom: 6 }}>
+        How many parts can this tool hold at once?{' '}
+        <span style={{ color: '#6B7280' }}>(default 1)</span>
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <button type="button" aria-label="decrease"
+                data-testid="hardware-setup-standard-capacity-dec"
+                disabled={disabled || v <= MIN}
+                onClick={() => set(v - 1)} style={btn(disabled || v <= MIN)}>−</button>
+        <input type="number" inputMode="numeric" min={MIN} max={MAX} value={v}
+               disabled={disabled}
+               onChange={(e) => set(parseInt(e.target.value, 10) || MIN)}
+               style={{
+                 width: 64, textAlign: 'center',
+                 fontSize: 18, fontWeight: 700, color: '#111',
+                 padding: '6px 8px',
+                 border: '1px solid #d1d5db', borderRadius: 6,
+                 fontVariantNumeric: 'tabular-nums',
+               }} />
+        <button type="button" aria-label="increase"
+                data-testid="hardware-setup-standard-capacity-inc"
+                disabled={disabled || v >= MAX}
+                onClick={() => set(v + 1)} style={btn(disabled || v >= MAX)}>+</button>
+      </div>
+    </div>
+  )
+}
+
+// 2026-10-15 standard-path verification-mode chooser. Rendered ONLY
+// when capacity > 1 AND the sensor count is ≥ 1 (otherwise the mode
+// is deterministic — 'none' or 'per_pick' — and the operator has
+// nothing to decide). Two choices, plain copy, no DI numbers.
+function StandardVerificationMode({ toolKey, value, disabled, onChange }) {
+  const options = [
+    { value: 'per_pick', label: 'One sensor for the whole pick' },
+    { value: 'per_part', label: 'One sensor per part' },
+  ]
+  return (
+    <div data-testid="hardware-setup-standard-verification"
+         data-tool-key={toolKey}
+         data-mode={String(value)}
+         style={{
+           padding: '10px 12px', marginBottom: 12,
+           background: '#F9FAFB', border: '1px solid #E5E7EB',
+           borderRadius: 6, color: '#374151',
+         }}>
+      <div style={{ fontSize: 13, marginBottom: 6 }}>
+        One sensor for the whole pick, or one per part?
+      </div>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        {options.map((o) => (
+          <button key={o.value}
+                  type="button"
+                  data-testid="hardware-setup-standard-verification-choice"
+                  data-mode={o.value}
+                  disabled={disabled}
+                  onClick={() => onChange(o.value)}
+                  style={{
+                    padding: '6px 12px', fontSize: 13, fontWeight: 700,
+                    background: value === o.value ? '#DBEAFE' : '#fff',
+                    color:      value === o.value ? '#1E40AF' : '#374151',
+                    border: `1px solid ${value === o.value ? '#2563EB' : '#d1d5db'}`,
+                    borderRadius: 6,
+                    cursor: disabled ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit', opacity: disabled ? 0.55 : 1,
+                  }}>
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
 }

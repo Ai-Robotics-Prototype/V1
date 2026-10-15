@@ -140,21 +140,24 @@ test('Count copy is plain operator language', () => {
       + 'the right op without searching.'))
 })
 
-test('PickPlaceCountInput helper exists and is import-identical between both steps', () => {
+test('PickPlaceCountInput helper exists and is import-identical between its mount sites', () => {
   assert.ok(/function PickPlaceCountInput\(\{\s*value,\s*onChange,\s*testId\s*\}\)/.test(progWizSrc),
     v('ProgramWizard must define PickPlaceCountInput as a shared helper '
-      + '— no fork between the two count steps.'))
-  // Both count steps must mount <PickPlaceCountInput ... /> — same
-  // component import-identity, no bespoke stepper per step.
+      + '— no fork between the count steps.'))
+  // Each count step mounts <PickPlaceCountInput ... /> — same component
+  // import-identity, no bespoke stepper per step. 2026-10-15 added a
+  // third mount for the multi-pick count (gated on tool capacity > 1):
+  //   1. pick_count         → testId="pick-count-input"
+  //   2. place_count        → testId="place-count-input"
+  //   3. multi_pick_count   → testId="multi-pick-count-input"
   const mounts = (progWizSrc.match(/<PickPlaceCountInput\b/g) || []).length
-  assert.equal(mounts, 2,
-    v(`Exactly two <PickPlaceCountInput /> mount sites are expected (`
-      + `one per count step); found ${mounts}.`))
-  // Testid wiring so the two steps are operator-selectable in e2e.
-  assert.ok(/testId="pick-count-input"/.test(progWizSrc),
-    v('pick_count step must pass testId="pick-count-input" to the helper.'))
-  assert.ok(/testId="place-count-input"/.test(progWizSrc),
-    v('place_count step must pass testId="place-count-input" to the helper.'))
+  assert.equal(mounts, 3,
+    v(`Exactly three <PickPlaceCountInput /> mount sites are expected `
+      + `(pick_count + place_count + multi_pick_count); found ${mounts}.`))
+  for (const id of ['pick-count-input', 'place-count-input', 'multi-pick-count-input']) {
+    assert.ok(new RegExp(`testId="${id}"`).test(progWizSrc),
+      v(`Count step must pass testId="${id}" to the shared helper.`))
+  }
 })
 
 
@@ -225,13 +228,14 @@ test('buildSteps paired loop emits pick_i → place_i pairs', () => {
   // The paired loop body must emit position_role: 'pick_${i}' + 'place_${i}'
   // for i in 1..K, flanked by effectorEngage + waypoints + effectorDisengage.
   assert.ok(
-    /for \(let i = 1; i <= K; i\+\+\)[\s\S]{0,2000}position_role:\s*`pick_\$\{i\}`[\s\S]{0,500}effectorEngage[\s\S]{0,500}waypointStepsForJunction\(answers, 'pick_to_place'[\s\S]{0,500}position_role:\s*`place_\$\{i\}`[\s\S]{0,500}effectorDisengage/
+    /for \(let i = 1; i <= K; i\+\+\)[\s\S]{0,2000}position_role:\s*`pick_\$\{i\}`[\s\S]{0,500}effectorEngage[\s\S]{0,800}waypointStepsForJunction\(answers, 'pick_to_place'[\s\S]{0,500}position_role:\s*`place_\$\{i\}`[\s\S]{0,500}effectorDisengage/
       .test(chunk),
     v('The paired loop body must emit, in order per iteration: '
-      + 'approach pick_i / contact pick_i / engage / retreat pick_i / '
-      + 'waypoints pick_to_place / approach place_i / contact place_i '
-      + '/ disengage. Same semantics as the single-pair flow, repeated '
-      + 'K times.'))
+      + 'approach pick_i / contact pick_i / engage / verification? / '
+      + 'retreat pick_i / waypoints pick_to_place / approach place_i / '
+      + 'contact place_i / disengage. Same semantics as the single-pair '
+      + 'flow, repeated K times (the engage→waypoints span widened to '
+      + 'accommodate the 2026-10-15 verificationStepsForEoat emission).'))
 })
 
 test('Trailing effectorDisengage is suppressed for multi-pair', () => {
@@ -279,19 +283,25 @@ function evalBuildStepsCore() {
   // regex-extracted source and runs it in a sandbox against stubbed
   // vocab emitters. Only the step action / label / position_role /
   // derived_from fields are shape-checked; the stubs return [] so
-  // effector emissions don't noise the equivalence diff.
+  // effector emissions don't noise the equivalence diff. 2026-10-15:
+  // verificationStepsForEoat + the eoatVerification helpers are added
+  // to the extract so the per_pick / per_part codegen path can be
+  // sandboxed too.
   const m = progWizSrc.match(/function buildSteps\(answers, portmap[\s\S]*?\n\}\n/m)
   if (!m) throw new Error('buildSteps not found')
   const readTaughtM = progWizSrc.match(/function readTaught\(answers, key\)\s*\{[\s\S]*?\n\}/)
+  const verifyM     = progWizSrc.match(/function verificationStepsForEoat\(cellEoat[\s\S]*?\n\}/)
   const waypointM = progWizSrc.match(/function waypointStepsForJunction\(answers, junctionId, defaultSpeed\)\s*\{[\s\S]*?\n\}/)
   const waypointHelperM = progWizSrc.match(/function readWaypointsForJunction\(answers, junctionId\)\s*\{[\s\S]*?\n\}/)
   const cellVocabM = progWizSrc.match(/function _cellVocabOpts\(cellEoat, synapsePortmap\)\s*\{[\s\S]*?\n\}/)
   const palletM = progWizSrc.match(/function buildPalletizeSteps\(answers, cellEoat = null, synapsePortmap = null\)\s*\{[\s\S]*?\n\}/)
-  if (!readTaughtM || !waypointM || !waypointHelperM || !cellVocabM || !palletM) {
+  if (!readTaughtM || !waypointM || !waypointHelperM || !cellVocabM || !palletM || !verifyM) {
     throw new Error('could not extract helper functions')
   }
   // Stub the effector + machine_tend emitters so we only measure the
-  // motion / taught-step shape.
+  // motion / taught-step shape. verificationStepsForEoat is sandboxed
+  // with stubbed eoatVerification helpers so a cellEoat === null (the
+  // 1/1 equivalence test) resolves to [] regardless.
   const body = [
     `const effectorReady     = ${_slimEffector.toString()}`,
     `const effectorEngage    = ${_slimEffector.toString()}`,
@@ -301,6 +311,16 @@ function evalBuildStepsCore() {
     `const unclampWorkpiece  = ${_slimUnclamp.toString()}`,
     `const startMachineCycle = ${_slimStart.toString()}`,
     `const waitMachineCycle  = ${_slimWait.toString()}`,
+    // Stubs for the eoatVerification helpers verificationStepsForEoat
+    // consults. The 1/1 equivalence + 2/2 + unequal-count pins all pass
+    // cellEoat === null (buildSteps default), so these fall through to
+    // the no-verification path and emit [] — byte-identical for the
+    // motion-shape diff this suite measures.
+    `function emitsVerificationStep() { return false }`,
+    `function resolveConfirmSignals() { return [] }`,
+    `function resolveVerification()   { return 'none' }`,
+    `const VERIFICATION_PER_PART = 'per_part'`,
+    verifyM[0],
     waypointHelperM[0],
     waypointM[0],
     readTaughtM[0],

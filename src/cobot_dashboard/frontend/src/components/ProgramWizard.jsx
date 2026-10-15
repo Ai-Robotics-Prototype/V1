@@ -14,6 +14,24 @@ import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { useSynapsePortmap, displayNameForRaw } from '../lib/synapsePortmap'
 import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
 import { getCell, findCellEoat } from '../lib/cellStore'
+import { resolveCapacity, resolveVerification, resolveConfirmSignals,
+         offersMultiPick, emitsVerificationStep,
+         VERIFICATION_PER_PART } from '../lib/eoatVerification'
+
+// 2026-10-15 operator directive: multi-pick + verification questions
+// are gated on the SELECTED tool's capacity + verification. The PAGES
+// list's skip predicate only receives answers (cellRegistry is kept in
+// component state and not threaded through), so this module ref lets
+// skip() reach the current cell snapshot without touching the engine
+// signature. The ProgramWizard component below sets this ref on mount
+// and clears it on unmount — single-wizard-instance invariant.
+let _wizardCellRegistryRef = null
+function _wizardSelectedEoat(answers) {
+  if (!_wizardCellRegistryRef) return null
+  const id = answers && answers.cell_eoat_id
+  if (!id) return null
+  return findCellEoat(_wizardCellRegistryRef, id) || null
+}
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
          clampWorkpiece, unclampWorkpiece,
@@ -2647,6 +2665,85 @@ const PAGES = [
   // position_roles stay 'pick' / 'place'). Only when a count ≥ 2 does
   // the teach sequence switch to indexed taught_pick_i / taught_place_j
   // keys and the paired-loop codegen.
+  //
+  // 6b: Multi-pick (how many parts grabbed before placing)
+  //
+  // 2026-10-15 operator directive: this question appears ONLY when
+  // the selected tool's capacity > 1 (resolveCapacity from
+  // lib/eoatVerification). For a capacity-1 tool the question stays
+  // hidden — complexity ONLY appears when the tool makes it relevant.
+  // Default answer "One at a time" (multi_pick_count === 1) runs the
+  // simple pick → place → repeat flow byte-identical to today.
+  //
+  // Codegen (buildSteps multi-pair / single-pair) reads
+  // answers.multi_pick_count and emits that many engage-with-
+  // verification iterations before transitioning to the place leg.
+  // Capped by resolveCapacity on save — a hand-edit of a saved
+  // program that pushes multi_pick_count above capacity is clamped
+  // by the gate at buildSteps time (not silently honored).
+  {
+    id: 'multi_pick_count',
+    skip: (answers) => {
+      if (answers.operation === 'machine_tend') return true
+      if (answers.operation === 'palletize')    return true
+      if (answers.operation === 'sort')         return true
+      const eoat = _wizardSelectedEoat(answers)
+      // No tool picked yet → nothing to gate on → skip.
+      if (!eoat) return true
+      // Honor the EOAT's permanent-truth capacity. Capacity 1 means
+      // the tool can only hold one part at a time; the multi-pick
+      // question is never asked, operator never sees it.
+      return !offersMultiPick(eoat)
+    },
+    render: ({ answers, setAnswer, goNext }) => {
+      const eoat = _wizardSelectedEoat(answers)
+      const cap = resolveCapacity(eoat)
+      const current = Math.max(1, Math.min(cap, Number(answers.multi_pick_count) || 1))
+      const grabSeveral = current > 1
+      return (
+        <QuestionCard
+          question="Pick one part at a time, or grab several before placing?"
+          description={`This tool can hold up to ${cap} parts at once. Grabbing several means the robot picks multiple parts, then places them.`}
+        >
+          <ChoiceButton
+            label="One at a time"
+            description="Pick one part, place it, repeat."
+            selected={!grabSeveral}
+            onClick={() => { setAnswer('multi_pick_count', 1); goNext({ multi_pick_count: 1 }) }}
+          />
+          <ChoiceButton
+            label="Grab several"
+            description="Pick multiple parts first, then place them."
+            selected={grabSeveral}
+            onClick={() => setAnswer('multi_pick_count', Math.max(2, current))}
+          />
+          {grabSeveral && (
+            <div style={{
+              marginTop: 12, padding: 12,
+              background: '#F9FAFB', border: '1px solid #E5E7EB',
+              borderRadius: 8,
+            }}>
+              <div style={{ fontSize: 13, color: '#374151', marginBottom: 8 }}>
+                How many parts before placing? <span style={{ color: '#6b7280' }}>(max {cap})</span>
+              </div>
+              <PickPlaceCountInput
+                testId="multi-pick-count-input"
+                value={Math.max(2, Math.min(cap, current))}
+                onChange={(n) => setAnswer('multi_pick_count',
+                  Math.max(2, Math.min(cap, n)))}
+              />
+              <NextButton
+                onClick={() => goNext({
+                  multi_pick_count: Math.max(2, Math.min(cap, current)),
+                })}
+                label="Next" />
+            </div>
+          )}
+        </QuestionCard>
+      )
+    },
+  },
+
   {
     id: 'pick_count',
     skip: (answers) => answers.operation === 'machine_tend'
@@ -3202,6 +3299,61 @@ function readTaught(answers, key) {
   return v
 }
 
+// 2026-10-15 operator directive: compose the pick-side verification
+// steps a tool with 'per_pick' or 'per_part' verification requires.
+// Reads the shared allocator's confirm_signals from the cell EOAT
+// (never pulls DO/DI from the wizard answer map — the operator does
+// not type signal ids). Returns [] for 'none' verification OR when no
+// confirm signals are wired, so pre-directive tools and tools without
+// sensors emit byte-identical to today.
+//
+// Semantics:
+//   per_pick → ONE verify_input (the first confirm signal); fired
+//              after effectorEngage, blocks until the input confirms;
+//              on timeout the executor stops with reason "part not
+//              confirmed" (reason stays on the step for the Monitor
+//              + Run modal to surface in plain language).
+//   per_part → N verify_input emits (one per part held, capped by
+//              resolveCapacity + multi_pick_count). Fired at the end
+//              of each pick's engage in the multi-pick flow — the
+//              generated program checks each sensor independently.
+//              Only valid when capacity > 1; the EOAT record resolver
+//              refuses per_part on capacity ≤ 1 (safety-rails).
+function verificationStepsForEoat(cellEoat, { partsOnPick = 1,
+                                               partIndex = 1 } = {}) {
+  if (!cellEoat) return []
+  if (!emitsVerificationStep(cellEoat)) return []
+  const signals = resolveConfirmSignals(cellEoat)
+  if (!signals.length) return []
+  const mode = resolveVerification(cellEoat)
+  if (mode === VERIFICATION_PER_PART) {
+    // Return ONE verify_input for THIS part (partIndex). The caller
+    // loops per-pick, so the per-pick emission already fans out N
+    // steps across N picks when partsOnPick > 1.
+    const sigIdx = Math.max(0, Math.min(signals.length - 1, partIndex - 1))
+    return [{
+      action: 'verify_input',
+      label: `Confirm part ${partIndex} grabbed`,
+      input: signals[sigIdx],
+      on_fail: 'stop',
+      reason: 'part not confirmed',
+      verification: 'per_part',
+      part_index: partIndex,
+    }]
+  }
+  // per_pick: one wait on the first confirm signal, regardless of how
+  // many parts the pick leg will grab. Operator order: "one sensor
+  // for the whole pick" exactly.
+  return [{
+    action: 'verify_input',
+    label: 'Confirm part grabbed',
+    input: signals[0],
+    on_fail: 'stop',
+    reason: 'part not confirmed',
+    verification: 'per_pick',
+  }]
+}
+
 // 2026-10-15 waypoint injection — emit N `action: 'waypoint'` steps
 // for the taught via-points at a junction. Shape matches the ProgramEditor's
 // waypoint step (programTruth TEACHABLE_ACTIONS + MOTION_SMOOTHING_ACTIONS
@@ -3408,6 +3560,10 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
     // finger → "Grip part"; magnet → "Engage magnet"). Never emits
     // gripper-vocabulary when effector is vacuum (2026-07-30 fix).
     steps.push(...engageSteps())
+    // 2026-10-15 pallet-pick verification. Same emission shape as the
+    // generic buildSteps pick side — pass-through [] when the tool has
+    // verification='none' (byte-identical for pre-directive tools).
+    steps.push(...verificationStepsForEoat(cellEoat, { partsOnPick: 1, partIndex: 1 }))
     steps.push({
       action: 'move_linear', label: 'Retreat above pick',
       speed_pct: medium, offset_z_mm: retH,
@@ -3651,6 +3807,11 @@ function buildSteps(answers, portmap = null,
       steps.push({ action: 'move_linear', label: `Approach above pick ${i}`, offset_z_mm: appH, speed_pct: spd, derived_from: `pick_${i}` })
       steps.push({ action: 'move_linear', label: `Pick ${i} — contact`, speed_pct: slow, position_role: `pick_${i}` })
       steps.push(...effectorEngage(cfgEffector, _vocabOpts))
+      // 2026-10-15: emit verification wait-input after engage when the
+      // tool has verification. per_part fires one check per part (indexed
+      // by i); per_pick fires once. Empty for 'none' tools (byte-identical).
+      steps.push(...verificationStepsForEoat(cellEoat,
+        { partsOnPick: K, partIndex: i }))
       steps.push({ action: 'move_linear', label: `Retreat above pick ${i}`, offset_z_mm: appH, speed_pct: medium, derived_from: `pick_${i}` })
       steps.push(...waypointStepsForJunction(answers, 'pick_to_place', spd))
       steps.push({ action: 'move_linear', label: `Approach above place ${i}`, offset_z_mm: appH, speed_pct: spd, derived_from: `place_${i}` })
@@ -3663,6 +3824,9 @@ function buildSteps(answers, portmap = null,
     steps.push({ action: 'move_linear', label: 'Pick position — contact', speed_pct: slow, position_role: 'pick' })
 
     steps.push(...effectorEngage(cfgEffector, _vocabOpts))
+    // 2026-10-15 single-pair pick verification. Pass-through [] when the
+    // tool has verification='none' → 1/1 byte-identical to today.
+    steps.push(...verificationStepsForEoat(cellEoat, { partsOnPick: 1, partIndex: 1 }))
 
     // Retreat back above the pick contact.
     steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
@@ -3896,6 +4060,15 @@ export default function ProgramWizard({ onClose, onSaved }) {
              .catch(() => {})
     return () => { alive = false }
   }, [])
+  // 2026-10-15: mirror the cell snapshot into the module ref so the
+  // PAGES-list skip predicates (which only receive answers) can read
+  // the selected EOAT without threading an extra arg through the
+  // engine. Cleared on unmount so a stale snapshot from a prior
+  // wizard launch cannot leak into a fresh one.
+  useEffect(() => {
+    _wizardCellRegistryRef = cellRegistry
+    return () => { _wizardCellRegistryRef = null }
+  }, [cellRegistry])
   const [pageIdx, setPageIdx] = useState(0)
   const [answers, setAnswers] = useState({
     // Silently-defaulted: the wizard no longer asks about speed or motion
