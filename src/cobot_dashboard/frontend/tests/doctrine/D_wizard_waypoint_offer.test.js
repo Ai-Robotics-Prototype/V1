@@ -271,7 +271,7 @@ test('waypoint is in TEACHABLE_ACTIONS and MOTION_SMOOTHING_ACTIONS', () => {
 
 test('buildSteps injects waypoints at every main-position seam', () => {
   const idx = progWizSrc.indexOf('function buildSteps(answers, portmap = null')
-  const chunk = progWizSrc.slice(idx, idx + 12000)
+  const chunk = progWizSrc.slice(idx, idx + 18000)
   // home_to_pick — AFTER the start move_home, BEFORE pick approach.
   assert.ok(
     /action: 'move_home', label: 'Move to home position'[\s\S]{0,400}waypointStepsForJunction\(answers, 'home_to_pick'/

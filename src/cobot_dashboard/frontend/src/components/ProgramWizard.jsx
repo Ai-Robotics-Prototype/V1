@@ -94,6 +94,46 @@ function NextButton({ onClick, disabled, label }) {
   )
 }
 
+// 2026-10-15 pick/place count input — large +/- stepper flanking a
+// numeric read-out, clamp 1..10, tablet-friendly (56px tall buttons).
+// Shared between the "How many pick positions?" and "How many place
+// positions?" steps so the two surfaces stay import-identical.
+function PickPlaceCountInput({ value, onChange, testId }) {
+  const MIN = 1
+  const MAX = 10
+  const v = Number.isFinite(value) ? Math.max(MIN, Math.min(MAX, Math.round(value))) : 1
+  const setClamped = (n) => onChange(Math.max(MIN, Math.min(MAX, Math.round(n))))
+  const btn = (disabled) => ({
+    minHeight: 56, minWidth: 72,
+    padding: '0 20px', fontSize: 22, fontWeight: 800,
+    background: disabled ? '#f3f4f6' : '#eff6ff',
+    color: disabled ? '#9ca3af' : '#2563EB',
+    border: `1px solid ${disabled ? '#e5e7eb' : '#bfdbfe'}`,
+    borderRadius: 10, cursor: disabled ? 'not-allowed' : 'pointer',
+  })
+  return (
+    <div data-testid={testId} data-value={v}
+         style={{ display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'center', marginBottom: 8 }}>
+      <button type="button" aria-label="decrease"
+              onClick={() => setClamped(v - 1)} disabled={v <= MIN}
+              style={btn(v <= MIN)}>−</button>
+      <input
+        type="number" inputMode="numeric" min={MIN} max={MAX} value={v}
+        onChange={(e) => setClamped(parseInt(e.target.value, 10) || MIN)}
+        style={{
+          width: 96, textAlign: 'center',
+          fontSize: 28, fontWeight: 800, color: '#111',
+          padding: '12px 10px',
+          border: '2px solid #e5e7eb', borderRadius: 10,
+          fontVariantNumeric: 'tabular-nums',
+        }} />
+      <button type="button" aria-label="increase"
+              onClick={() => setClamped(v + 1)} disabled={v >= MAX}
+              style={btn(v >= MAX)}>+</button>
+    </div>
+  )
+}
+
 // ────────────────────────────────────────────────────────
 // Wizard pages
 // ────────────────────────────────────────────────────────
@@ -732,15 +772,41 @@ function teachPositionsForAnswers(answers) {
       instr: 'Jog the robot to the CONTACT for the second sort destination — where type 2 parts are released.',
     })
   } else {
-    // Default: pick_and_place and anything else with a pick + place flow.
-    positions.push({
-      key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
-    })
-    positions.push({
-      key: 'taught_place', label: 'PLACE POSITION',
-      instr: 'Jog the robot to the place CONTACT — the pose where the part is released against the target surface. The retreat above is computed automatically.',
-    })
+    // Default: pick_and_place and anything else with a pick + place
+    // flow. 2026-10-15 operator directive: the retired place_method
+    // (Fixed/Relative) step is replaced with explicit pick_count /
+    // place_count. For 1 / 1 we keep the historical taught_pick +
+    // taught_place keys (buildSteps emits byte-identical output; old
+    // programs load unchanged). For any count ≥ 2 we switch to
+    // indexed taught_pick_i / taught_place_j keys and the per-position
+    // teach entries so each position gets its own jog / record step.
+    const nPicks  = Math.max(1, Math.min(10, Number(answers.pick_count)  || 1))
+    const nPlaces = Math.max(1, Math.min(10, Number(answers.place_count) || 1))
+    if (nPicks === 1 && nPlaces === 1) {
+      positions.push({
+        key: 'taught_pick', label: 'PICK POSITION',
+        instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
+      })
+      positions.push({
+        key: 'taught_place', label: 'PLACE POSITION',
+        instr: 'Jog the robot to the place CONTACT — the pose where the part is released against the target surface. The retreat above is computed automatically.',
+      })
+    } else {
+      for (let i = 1; i <= nPicks; i++) {
+        positions.push({
+          key:   `taught_pick_${i}`,
+          label: `PICK ${i} POSITION`,
+          instr: `Jog the robot to the pick ${i} CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.`,
+        })
+      }
+      for (let j = 1; j <= nPlaces; j++) {
+        positions.push({
+          key:   `taught_place_${j}`,
+          label: `PLACE ${j} POSITION`,
+          instr: `Jog the robot to the place ${j} CONTACT — the pose where the part is released against the target surface. The retreat above is computed automatically.`,
+        })
+      }
+    }
   }
   // Every operation's generated program ends with a move_home ("Return
   // to home" — buildSteps / buildPalletizeSteps both emit it). Append a
@@ -2557,32 +2623,71 @@ const PAGES = [
     render: ToolAndPayloadStep,
   },
 
-  // 7: Where to place? (for pick_and_place)
-  //    Skipped for machine_tend (own load/unload teach) and palletize
-  //    (the pallet pages own the place flow).
+  // 7: How many pick positions? (pick_and_place only)
+  //
+  // 2026-10-15 operator directive: the retired "Where should the
+  // robot place the part? / Fixed Position / Relative Offset" step
+  // (previously at this slot) is gone. "Relative offset" was
+  // redundant with Palletize's grid flow and — on an audit grep —
+  // was never read by codegen anywhere (place_method was write-only
+  // in answers; buildSteps / buildPalletizeSteps always honored the
+  // taught place pose). Replaced here with explicit per-position
+  // counts: the operator declares N pick positions and M place
+  // positions, and the teach sequence + buildSteps emit one
+  // approach / contact / engage / retreat triple per taught pose.
+  //
+  // Skipped for machine_tend (its own load / unload teach) and
+  // palletize (the pallet pages own the place flow — grid stays
+  // in Palletize per the directive). For sort, the two taught sort
+  // places have their own PLACE_1 / PLACE_2 keys from an earlier
+  // ship; sort also skips this count step so those stay untouched.
+  //
+  // Default 1 / 1 reproduces today's single-pick → single-place
+  // output byte-for-byte (teach keys stay taught_pick / taught_place,
+  // position_roles stay 'pick' / 'place'). Only when a count ≥ 2 does
+  // the teach sequence switch to indexed taught_pick_i / taught_place_j
+  // keys and the paired-loop codegen.
   {
-    id: 'place_method',
-    skip: (answers) => answers.operation === 'machine_tend' || answers.operation === 'palletize',
+    id: 'pick_count',
+    skip: (answers) => answers.operation === 'machine_tend'
+                     || answers.operation === 'palletize'
+                     || answers.operation === 'sort',
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
-        question="Where should the robot place the part?"
-        description="Choose how the place location is determined."
+        question="How many pick positions?"
+        description="The robot will pick a part from each position in turn. For a grid of parts, use the Palletize operation instead."
       >
-        {[
-          { value: 'fixed', label: 'Fixed Position', desc: 'Always place at the same taught position.' },
-          { value: 'relative', label: 'Relative Offset', desc: 'Place at a fixed offset from the pick position.' },
-          ...(answers.operation === 'palletize' ? [
-            { value: 'pallet', label: 'Pallet Grid', desc: 'Arrange parts in rows and columns on a pallet.' },
-          ] : []),
-          ...(answers.operation === 'sort' ? [
-            { value: 'by_type', label: 'Sort by Part Type', desc: 'Different location for each part type.' },
-          ] : []),
-        ].map(p => (
-          <ChoiceButton key={p.value} label={p.label} description={p.desc}
-            selected={answers.place_method === p.value}
-            onClick={() => { setAnswer('place_method', p.value); goNext({ place_method: p.value }) }}
-          />
-        ))}
+        <PickPlaceCountInput
+          testId="pick-count-input"
+          value={answers.pick_count ?? 1}
+          onChange={(n) => setAnswer('pick_count', n)}
+        />
+        <NextButton
+          onClick={() => goNext({ pick_count: answers.pick_count ?? 1 })}
+          label="Next" />
+      </QuestionCard>
+    ),
+  },
+
+  // 7b: How many place positions? (pick_and_place only — same skip)
+  {
+    id: 'place_count',
+    skip: (answers) => answers.operation === 'machine_tend'
+                     || answers.operation === 'palletize'
+                     || answers.operation === 'sort',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="How many place positions?"
+        description="For equal pick + place counts the robot pairs them: pick 1 → place 1, pick 2 → place 2, and so on. Unequal counts use the smaller of the two; extras are listed as unused on the Review page."
+      >
+        <PickPlaceCountInput
+          testId="place-count-input"
+          value={answers.place_count ?? 1}
+          onChange={(n) => setAnswer('place_count', n)}
+        />
+        <NextButton
+          onClick={() => goNext({ place_count: answers.place_count ?? 1 })}
+          label="Next" />
       </QuestionCard>
     ),
   },
@@ -3519,27 +3624,63 @@ function buildSteps(answers, portmap = null,
   //   place contact (TAUGHT) → disengage → retreat (derived, +appH).
   // Only the contact steps carry position_role + taught data; every
   // approach/retreat step is derived_from that role.
-  steps.push({ action: 'move_linear', label: 'Approach above pick', offset_z_mm: appH, speed_pct: spd, derived_from: 'pick' })
-  steps.push({ action: 'move_linear', label: 'Pick position — contact', speed_pct: slow, position_role: 'pick' })
+  //
+  // 2026-10-15 operator directive: pick_and_place now carries explicit
+  // pick_count + place_count (replaces the retired Fixed/Relative place
+  // method). For nPicks==1 && nPlaces==1 the sequence is byte-identical
+  // to the pre-directive emit (position_role 'pick' / 'place', taught
+  // keys taught_pick / taught_place). For any count ≥ 2 the loop emits
+  // one approach / contact / engage / retreat / waypoints / approach-
+  // place / contact / disengage / retreat block per paired index — K =
+  // min(nPicks, nPlaces) pairs. Extras get flagged on the Review page
+  // (buildSteps doesn't emit the unused taught poses; they stay in
+  // answers for future round-trip but never fire motion).
+  const nPicks  = Math.max(1, Math.min(10, Number(answers.pick_count)  || 1))
+  const nPlaces = Math.max(1, Math.min(10, Number(answers.place_count) || 1))
+  const isMultiPair = (op === 'pick_and_place') && (nPicks !== 1 || nPlaces !== 1)
+  const K = Math.min(nPicks, nPlaces)
 
-  steps.push(...effectorEngage(cfgEffector, _vocabOpts))
-
-  // Retreat back above the pick contact.
-  steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
-
-  // 2026-10-15: waypoints between PICK and the next main position.
-  // For machine_tend the junction id is 'pick_to_machine_load'; for
-  // pick_and_place / sort it's 'pick_to_place' (sort folds its two
-  // place poses onto one codegen segment — see
-  // waypointJunctionsForAnswers for the sort rationale). Chosen per
-  // op so the semantics match the operator's wizard flow.
-  if (op === 'machine_tend') {
-    steps.push(...waypointStepsForJunction(answers, 'pick_to_machine_load', spd))
+  if (isMultiPair) {
+    // Paired loop. Each pair owns its own engage + disengage + waypoints
+    // (the operator-taught via-points steer around fixtures BETWEEN
+    // every pair, same semantics as the per-cycle intent). The trailing
+    // single-pair disengage + retreat BELOW is suppressed for multi-pair
+    // via `isMultiPair` so each pair's own disengage + retreat is the
+    // only emission.
+    for (let i = 1; i <= K; i++) {
+      steps.push({ action: 'move_linear', label: `Approach above pick ${i}`, offset_z_mm: appH, speed_pct: spd, derived_from: `pick_${i}` })
+      steps.push({ action: 'move_linear', label: `Pick ${i} — contact`, speed_pct: slow, position_role: `pick_${i}` })
+      steps.push(...effectorEngage(cfgEffector, _vocabOpts))
+      steps.push({ action: 'move_linear', label: `Retreat above pick ${i}`, offset_z_mm: appH, speed_pct: medium, derived_from: `pick_${i}` })
+      steps.push(...waypointStepsForJunction(answers, 'pick_to_place', spd))
+      steps.push({ action: 'move_linear', label: `Approach above place ${i}`, offset_z_mm: appH, speed_pct: spd, derived_from: `place_${i}` })
+      steps.push({ action: 'move_linear', label: `Place ${i} — contact`, speed_pct: slow, position_role: `place_${i}` })
+      steps.push(...effectorDisengage(cfgEffector, _vocabOpts))
+      steps.push({ action: 'move_linear', label: `Retreat above place ${i}`, offset_z_mm: appH, speed_pct: medium, derived_from: `place_${i}` })
+    }
   } else {
-    steps.push(...waypointStepsForJunction(answers, 'pick_to_place', spd))
+    steps.push({ action: 'move_linear', label: 'Approach above pick', offset_z_mm: appH, speed_pct: spd, derived_from: 'pick' })
+    steps.push({ action: 'move_linear', label: 'Pick position — contact', speed_pct: slow, position_role: 'pick' })
+
+    steps.push(...effectorEngage(cfgEffector, _vocabOpts))
+
+    // Retreat back above the pick contact.
+    steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
+
+    // 2026-10-15: waypoints between PICK and the next main position.
+    // For machine_tend the junction id is 'pick_to_machine_load'; for
+    // pick_and_place / sort it's 'pick_to_place' (sort folds its two
+    // place poses onto one codegen segment — see
+    // waypointJunctionsForAnswers for the sort rationale). Chosen per
+    // op so the semantics match the operator's wizard flow.
+    if (op === 'machine_tend') {
+      steps.push(...waypointStepsForJunction(answers, 'pick_to_machine_load', spd))
+    } else {
+      steps.push(...waypointStepsForJunction(answers, 'pick_to_place', spd))
+    }
   }
 
-  if (op === 'machine_tend') {
+  if (!isMultiPair && op === 'machine_tend') {
     // ── Machine-tending template (2026-07-30 vocabulary work) ──
     //
     // Required taught poses:
@@ -3622,23 +3763,32 @@ function buildSteps(answers, portmap = null,
                  offset_z_mm: appH, speed_pct: spd, derived_from: 'unload' })
     steps.push({ action: 'move_linear', label: 'Unload position — contact',
                  speed_pct: slow, position_role: 'unload' })
-  } else {
-    // Default place flow (pick_and_place / sort).
+  } else if (!isMultiPair) {
+    // Default place flow (pick_and_place / sort). Multi-pair pick_and_place
+    // already emitted its per-pair approach-place + contact + disengage +
+    // retreat inside the loop above; this branch is single-pair only.
     steps.push({ action: 'move_linear', label: 'Approach above place', offset_z_mm: appH, speed_pct: spd, derived_from: 'place' })
     steps.push({ action: 'move_linear', label: 'Place position — contact', speed_pct: slow, position_role: 'place' })
   }
 
-  steps.push(...effectorDisengage(cfgEffector, _vocabOpts))
+  // Trailing disengage + final retreat belong to the single-pair /
+  // machine_tend path. Multi-pair's per-pair disengage + retreat are
+  // already inside the loop, so suppress the duplicate here.
+  if (!isMultiPair) {
+    steps.push(...effectorDisengage(cfgEffector, _vocabOpts))
 
-  // Retreat back above the final release contact (place or unload).
-  const retreatRole = (op === 'machine_tend') ? 'unload' : 'place'
-  const retreatLabel = (op === 'machine_tend') ? 'Retreat from unload' : 'Retreat above place'
-  steps.push({ action: 'move_linear', label: retreatLabel, offset_z_mm: appH, speed_pct: medium, derived_from: retreatRole })
+    // Retreat back above the final release contact (place or unload).
+    const retreatRole = (op === 'machine_tend') ? 'unload' : 'place'
+    const retreatLabel = (op === 'machine_tend') ? 'Retreat from unload' : 'Retreat above place'
+    steps.push({ action: 'move_linear', label: retreatLabel, offset_z_mm: appH, speed_pct: medium, derived_from: retreatRole })
+  }
   // 2026-10-15: waypoints between the final place / unload and HOME.
   // Junction id depends on op — unload_to_home for machine_tend, else
   // place_to_home for pick_and_place / sort. Injected AFTER the final
   // retreat so the arm leaves the release pose, flies through every
-  // taught via-point, then returns home.
+  // taught via-point, then returns home. Multi-pair takes the
+  // place_to_home junction too (the last pair's retreat left the arm
+  // at retreat-above-place_K, same seam shape as single-pair).
   if (op === 'machine_tend') {
     steps.push(...waypointStepsForJunction(answers, 'unload_to_home', spd))
   } else {
@@ -3701,6 +3851,24 @@ function buildSteps(answers, portmap = null,
   applyToRole('place',        placeP)
   applyToRole('machine_load', loadP)
   applyToRole('unload',       unloadP)
+
+  // 2026-10-15 multi-pair pick_and_place: resolve indexed taught_pick_i /
+  // taught_place_i keys against the position_role: 'pick_i' / 'place_i'
+  // steps the paired loop emitted. Looping to max(nPicks, nPlaces) so
+  // every taught pose that CAN land does — the loop body only ran K
+  // pairs (K = min), so taught poses with index > K have no matching
+  // step and quietly fall through (they are the "unused" surfacing the
+  // Review page will warn about in a follow-up ship; the taught data
+  // is preserved in answers for a round-trip).
+  if (isMultiPair) {
+    const maxN = Math.max(nPicks, nPlaces)
+    for (let i = 1; i <= maxN; i++) {
+      const pickI  = readTaught(cfg, `taught_pick_${i}`)
+      const placeI = readTaught(cfg, `taught_place_${i}`)
+      applyToRole(`pick_${i}`,  pickI)
+      applyToRole(`place_${i}`, placeI)
+    }
+  }
 
   return numbered
 }
