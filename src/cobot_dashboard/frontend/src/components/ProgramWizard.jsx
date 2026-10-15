@@ -768,6 +768,19 @@ function teachPositionsForAnswers(answers) {
       key: 'taught_pick', label: 'PICK / LOAD POSITION',
       instr: 'Jog the robot to the pick CONTACT — where the gripper/vacuum touches the part. Approach and retreat are computed from your approach-height setting.',
     })
+    // 2026-10-15 operator field report: the generated machine_tend
+    // program references position_role 'machine_safe' (the safe-outside-
+    // machine waypoint — the pose the robot retreats to between fixture
+    // entries + the pose the cycle-start handshake fires from) but the
+    // wizard teach sequence NEVER offered to teach it. Operators were
+    // left with step 10 "Move to safe-outside-machine waypoint" flagged
+    // red/Teach after wizard save, having to go back into the editor
+    // to teach it manually. Added here so the wizard teach flow is
+    // self-contained: every generated position_role has a teach step.
+    positions.push({
+      key: 'taught_machine_safe', label: 'SAFE-OUTSIDE-MACHINE WAYPOINT',
+      instr: 'Jog the robot to a safe pose OUTSIDE the machine door — the pose the robot retreats to between loading the part and reaching back in for the finished one, and the pose from which the machine cycle is started. This is where the robot waits for the machine to signal "cycle complete".',
+    })
     positions.push({
       key: 'taught_machine_load', label: 'MACHINE LOAD POSITION',
       instr: 'Jog the robot to the machine-load CONTACT — where the part is seated in the fixture. Approach and retreat are computed automatically.',
@@ -3895,13 +3908,42 @@ function buildSteps(answers, portmap = null,
                  speed_pct: medium, derived_from: 'machine_safe' })
     // Start the machine cycle — PULSED DO. Vocab handles the
     // set 1 → wait pulse_ms → set 0 triplet.
+    //
+    // 2026-10-15 operator field report: the wizard's "Which I/O signals
+    // control the machine?" page writes answers.io_cycle_start +
+    // answers.io_cycle_done directly to the program's answers blob,
+    // NOT to the shared system IO portmap. The vocab emitter used to
+    // search ONLY the portmap for a role-labeled Cycle Start / Cycle
+    // Done row — so an operator who picked "DO4" + "DI3" in the
+    // wizard but had no portmap row labeled "Cycle start" / "Cycle
+    // done" silently got NO handshake in the generated program (the
+    // robot loaded the fixture, retreated, reached back in for the
+    // finished part without ever telling the machine to run). The
+    // emitter now accepts override_do / override_di → we pass the
+    // wizard's answers through verbatim. Safety-critical — the
+    // machine must be told to run AFTER the robot has retreated to
+    // safe and the robot must wait for 'cycle done' BEFORE
+    // re-approaching the fixture.
+    //
+    // Timeout key fix: the wizard writes answers.cycle_timeout (not
+    // cycle_timeout_s — the slider's "s" is the unit label, not a
+    // key suffix). Read it first, fall back to the historical
+    // cycle_timeout_s key for any program that saved under that
+    // shape, else default 60s.
+    const _cycleTimeoutS = Number(answers.cycle_timeout)
+      || Number(answers.cycle_timeout_s)
+      || 60
     steps.push(...startMachineCycle(portmap, {
       pulse_ms: answers.machine_pulse_ms || 500,
+      override_do: answers.io_cycle_start,
     }))
     // Wait for machine cycle done — blocking verify_input on the
-    // Cycle done DI with a configurable outer timeout.
+    // Cycle done DI with a configurable outer timeout. Emitter stamps
+    // reason:'machine did not signal complete' so the executor
+    // surfaces the plain operator-facing stop reason on timeout.
     steps.push(...waitMachineCycle(portmap, {
-      timeout_ms: (answers.cycle_timeout_s || 60) * 1000,
+      timeout_ms: _cycleTimeoutS * 1000,
+      override_di: answers.io_cycle_done,
     }))
     // ── Unload side ────────────────────────────────────────────
     // Return to fixture, engage grip, unclamp, retreat.
@@ -3998,6 +4040,13 @@ function buildSteps(answers, portmap = null,
   const placeP  = readTaught(cfg, 'taught_place')
   const loadP   = readTaught(cfg, 'taught_machine_load')
   const unloadP = readTaught(cfg, 'taught_unload')
+  // 2026-10-15: safe-outside-machine waypoint joins the taught-pose
+  // set. The teach sequence now offers it; applyToRole targets the
+  // position_role 'machine_safe' step the machine_tend template
+  // emits (currently the first step after the pick retreat, re-used
+  // on every return-to-safe between fixture entries + after cycle
+  // completion).
+  const machineSafeP = readTaught(cfg, 'taught_machine_safe')
 
   const applyToRole = (role, point) => {
     if (!point) return
@@ -4015,6 +4064,7 @@ function buildSteps(answers, portmap = null,
   applyToRole('place',        placeP)
   applyToRole('machine_load', loadP)
   applyToRole('unload',       unloadP)
+  applyToRole('machine_safe', machineSafeP)
 
   // 2026-10-15 multi-pair pick_and_place: resolve indexed taught_pick_i /
   // taught_place_i keys against the position_role: 'pick_i' / 'place_i'

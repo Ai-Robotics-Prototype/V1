@@ -496,8 +496,27 @@ export function unclampWorkpiece(portmap, opts = {}) {
 // The wait bracket is why we can't do this as a single set_io: many
 // machine PLCs latch on the RISING edge only, and hold-high
 // indefinitely would keep starting a new cycle each scan.
+//
+// 2026-10-15 operator field report: the machine-tending wizard page
+// collects the Cycle Start DO + Cycle Complete DI as `answers.io_cycle_start`
+// / `answers.io_cycle_done`, but those answers never flowed through to this
+// emitter — the emitter searched the system IO portmap for a port assignment
+// containing "Cycle start" / "Cycle done" (role-based lookup). If the
+// operator picked DO4 in the wizard but didn't ALSO label a portmap row
+// "Cycle start", machinePortFor returned null → emitter returned [] →
+// the generated program silently omitted the whole machine handshake
+// (robot loaded the fixture, retreated, reached back in for the finished
+// part WITHOUT ever telling the machine to run). Safety-critical.
+//
+// Fix: add `override_do` / `override_di` options. The wizard passes the
+// operator's explicit DO/DI id as the override; the portmap lookup is
+// kept as a fallback for any caller that still has role-based assignments.
+// Accepts both bare integers ("4") and prefixed ids ("DO4").
 export function startMachineCycle(portmap, opts = {}) {
-  const doPort = machinePortFor(portmap, MACHINE_ROLES.CYCLE_START_ALTS, 'DO')
+  const explicit = _coerceIoId(opts.override_do, 'DO')
+  const doPort = explicit != null
+    ? explicit
+    : machinePortFor(portmap, MACHINE_ROLES.CYCLE_START_ALTS, 'DO')
   if (doPort == null) return []
   const requested = opts.pulse_ms != null ? opts.pulse_ms : DEFAULT_CYCLE_PULSE_MS
   const pulse_ms = Math.max(50, requested)
@@ -519,8 +538,19 @@ export function startMachineCycle(portmap, opts = {}) {
 // WAIT-FOR-DONE — blocking verify_input on the Cycle done DI.
 // timeout_ms is the outer bound; on_fail=abort so a stuck machine
 // stops the program instead of hanging forever.
+//
+// 2026-10-15: same override contract as startMachineCycle — `opts.override_di`
+// lets the wizard pass the operator's explicit DI id when the system
+// portmap doesn't carry a Cycle done role assignment. Adds a plain-copy
+// `reason` field so the executor's stop surfaces "machine did not signal
+// complete" in the Run modal / Monitor pill instead of a generic
+// verify-input-failed message (operator order: "never silently proceed
+// to reach in").
 export function waitMachineCycle(portmap, opts = {}) {
-  const diPort = machinePortFor(portmap, MACHINE_ROLES.CYCLE_DONE_ALTS, 'DI')
+  const explicit = _coerceIoId(opts.override_di, 'DI')
+  const diPort = explicit != null
+    ? explicit
+    : machinePortFor(portmap, MACHINE_ROLES.CYCLE_DONE_ALTS, 'DI')
   if (diPort == null) return []
   return [{
     action:     'verify_input',
@@ -529,8 +559,30 @@ export function waitMachineCycle(portmap, opts = {}) {
     timeout_ms: opts.timeout_ms != null
       ? opts.timeout_ms : DEFAULT_CYCLE_WAIT_TIMEOUT_MS,
     on_fail:    'abort',
+    reason:     'machine did not signal complete',
     io_role:    'cycle_done',
   }]
+}
+
+// Shared parser for the override_do / override_di args. Accepts a bare
+// integer ("4" or 4), a prefixed id matching the expected kind
+// ("DO4" for a DO override), returns the integer port number. Any
+// mismatched kind (e.g. "DI7" passed as override_do) or malformed
+// string returns null so the caller falls back to the portmap lookup
+// without silently mis-emitting on the wrong wire.
+function _coerceIoId(v, kind) {
+  if (v == null) return null
+  if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+    return Math.floor(v)
+  }
+  const s = String(v || '').trim().toUpperCase()
+  if (!s) return null
+  // Bare integer "4" / "12".
+  if (/^\d+$/.test(s)) return parseInt(s, 10)
+  // Prefixed id — must match the expected kind.
+  const m = /^([A-Z]+)(\d+)$/.exec(s)
+  if (m && m[1] === kind) return parseInt(m[2], 10)
+  return null
 }
 
 
