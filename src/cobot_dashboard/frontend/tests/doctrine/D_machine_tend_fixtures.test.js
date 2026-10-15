@@ -243,14 +243,91 @@ test('MachineFixturesBody reads cell.fixtures via the shared cell ref', () => {
 
 test('MachineFixturesBody writes answers.machine_fixture_ids as an array', () => {
   const idx = progWizSrc.indexOf('function MachineFixturesBody(')
-  const chunk = progWizSrc.slice(idx, idx + 4000)
+  const chunk = progWizSrc.slice(idx, idx + 8000)
   assert.ok(/setAnswer\(['"]machine_fixture_ids['"],/.test(chunk),
     v('MachineFixturesBody must call setAnswer("machine_fixture_ids", '
       + '…) with the operator\'s selection — the ordered id list '
       + 'resolveMachineFixtures consumes at codegen time.'))
-  assert.ok(/data-testid="machine-fixture-choice"/.test(chunk),
-    v('Each fixture row must stamp data-testid="machine-fixture-'
-      + 'choice" with a data-fixture-id for operator-facing tests.'))
+  assert.ok(/data-testid="machine-vice-slot"/.test(chunk),
+    v('Each vice slot row must stamp data-testid="machine-vice-slot" '
+      + 'with data-slot-index + data-fixture-id for operator-facing '
+      + 'e2e. (The pre-addendum "machine-fixture-choice" checkbox '
+      + 'rows were retired with the yes/no gate 2026-10-15.)'))
+})
+
+
+// ── (5a) 2026-10-15 addendum: how-many-vices count replaces the yes/no gate ──
+
+test('MachineFixturesBody asks "How many vices" with a count stepper', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 8000)
+  // The headline question must be the direct count copy — plain,
+  // operator-written, no yes/no gate.
+  assert.ok(/How many vices hold the part in the machine\?/.test(chunk),
+    v('MachineFixturesBody must ask "How many vices hold the part in '
+      + 'the machine?" verbatim per the 2026-10-15 addendum.'))
+  assert.ok(/data-testid="machine-vice-count"/.test(chunk),
+    v('MachineFixturesBody must render data-testid="machine-vice-count" '
+      + '— the stepper wrapper that carries the current count value '
+      + 'as a data-attr for operator-facing e2e.'))
+  for (const tid of ['machine-vice-count-dec',
+                     'machine-vice-count-input',
+                     'machine-vice-count-inc']) {
+    assert.ok(new RegExp(`data-testid="${tid}"`).test(chunk),
+      v(`Count stepper must render data-testid="${tid}".`))
+  }
+})
+
+test('MachineFixturesBody persists answers.machine_vice_count', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 8000)
+  assert.ok(/setAnswer\(['"]machine_vice_count['"],/.test(chunk),
+    v('MachineFixturesBody must call setAnswer("machine_vice_count", '
+      + '…) so the count persists on the saved program and codegen can '
+      + 'read it back for the per-vice loop.'))
+  // Default: machine tending almost always uses one vice. The directive
+  // calls out "default 1". Grep that the component defaults to 1 when
+  // answers.machine_vice_count is undefined.
+  assert.ok(/const DEFAULT\s*=\s*1\b/.test(chunk),
+    v('Default count must be 1 — machine tending almost always uses '
+      + 'one vice; the stepper defaults to it so a tap-through '
+      + 'workflow lands on a working program.'))
+  // Bounds 0..6 per the directive's "sane max e.g. 6".
+  assert.ok(/const MIN\s*=\s*0\b/.test(chunk) && /const MAX\s*=\s*6\b/.test(chunk),
+    v('Count must clamp to [0, 6] — 0 is the self-clamping escape '
+      + 'hatch, 6 is the sane upper bound from the directive.'))
+})
+
+test('Yes/No clamp-gate copy has been RETIRED from MachineFixturesBody', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const end = progWizSrc.indexOf('\n}\n', idx)
+  const chunk = progWizSrc.slice(idx, end > idx ? end : idx + 8000)
+  // The pre-addendum copy ("Does the machine hold the part with a
+  // clamp or vice?" / "Yes — pick fixture(s)" / "No fixture") must
+  // not appear. The addendum is explicit: the yes/no gate goes away.
+  assert.equal(/Does the machine hold the part with a clamp or vice\?/.test(chunk),
+    false,
+    v('The retired yes/no gate copy "Does the machine hold the part '
+      + 'with a clamp or vice?" must NOT appear in MachineFixturesBody '
+      + '— the 2026-10-15 addendum replaced it with a direct count.'))
+  assert.equal(/Yes — pick fixture\(s\)/.test(chunk), false,
+    v('The retired "Yes — pick fixture(s)" ChoiceButton copy must NOT '
+      + 'appear — no yes/no gate.'))
+  assert.equal(/>No fixture</.test(chunk), false,
+    v('The retired "No fixture" ChoiceButton copy must NOT appear.'))
+})
+
+test('Count == 0 renders a self-clamp info block', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 8000)
+  assert.ok(/data-testid="machine-vice-selfclamp"/.test(chunk),
+    v('When count == 0 the body must render '
+      + 'data-testid="machine-vice-selfclamp" — the plain self-clamping '
+      + 'callout that replaces the retired "No fixture" ChoiceButton.'))
+  assert.ok(/The program[\s\S]{0,60}will not emit any clamp I\/O/.test(chunk),
+    v('Count-0 copy must plainly state the program will not emit '
+      + 'any clamp I/O (same effect as the retired "No fixture" '
+      + 'branch, now reached via count=0 instead of a yes/no gate).'))
 })
 
 

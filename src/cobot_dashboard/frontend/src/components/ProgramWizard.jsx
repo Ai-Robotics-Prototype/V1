@@ -1957,11 +1957,27 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
 // nothing else in the wizard consumed these helpers.
 
 // 2026-10-15 machine fixtures step. Reads cell.fixtures (the shared
-// External Fixture store), lets the operator declare whether the
-// machine clamps the part, and if yes which fixture(s) to use. Multi-
-// select by checkbox; order is operator-controlled by the selection
-// order (first-tapped loads first). answers.machine_fixture_ids
-// is an ordered array of fixture.id values.
+// External Fixture store).
+//
+// Operator directive (addendum): the earlier Yes/No "Does the machine
+// hold the part with a clamp or vice?" gate was unnecessary — machine
+// tending uses a vice (or several), air-controlled, always. Replaced
+// with a direct count question: "How many vices hold the part in the
+// machine?" Count = 0 covers the self-clamping / no-vice case (chuck,
+// magnetic bed, etc.) without a separate yes/no screen. For count ≥ 1
+// the operator picks WHICH External Fixture each vice slot binds to.
+//
+// Clamp sequencing (release-first, confirm-after, cycle-after-all-
+// clamped, unclamp-after-grip) + multi-vice load-all-before-cycle
+// is UNCHANGED from the prior ship — this body only touches the
+// question / selection UI. The persisted shape stays:
+//     answers.machine_vice_count  : number (0..6, default 1)
+//     answers.machine_fixture_ids : string[] (empty when count=0;
+//                                             length === count when ≥1;
+//                                             order = per-vice slot
+//                                             assignment)
+// resolveMachineFixtures(cellRegistry, answers) continues to read
+// machine_fixture_ids and drive buildSteps' per-vice emission.
 function MachineFixturesBody({ answers, setAnswer, goNext }) {
   // Hook into the module-level cell registry mirror set by the
   // ProgramWizard shell on mount. Keeps the engine signature
@@ -1970,58 +1986,115 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
   // uses to look up the selected EOAT.
   const cell = _wizardCellRegistryRef || null
   const fixtures = (cell && Array.isArray(cell.fixtures)) ? cell.fixtures : []
-  const vices    = fixtures.filter((f) => f && f.type === 'vice')
-  const others   = fixtures.filter((f) => f && f.type !== 'vice')
-  const hasAnyFixture = fixtures.length > 0
+  const vicesFirst = [
+    ...fixtures.filter((f) => f && f.type === 'vice'),
+    ...fixtures.filter((f) => f && f.type !== 'vice'),
+  ]
 
-  const uses = answers.machine_uses_fixture === true
-            || (Array.isArray(answers.machine_fixture_ids)
-                && answers.machine_fixture_ids.length > 0)
-  const selectedIds = Array.isArray(answers.machine_fixture_ids)
-    ? answers.machine_fixture_ids : []
+  // Count: 0..6. Default 1 (machine tending almost always uses one
+  // vice; 0 is the self-clamping escape hatch). Clamp defensively on
+  // every read so a hand-edited saved program with a wild number
+  // can't bust the UI.
+  const MIN = 0
+  const MAX = 6
+  const DEFAULT = 1
+  const rawCount = Number.isFinite(Number(answers.machine_vice_count))
+    ? Number(answers.machine_vice_count)
+    : DEFAULT
+  const count = Math.max(MIN, Math.min(MAX, Math.round(rawCount)))
 
-  const toggleFixture = (id) => {
-    const next = selectedIds.includes(id)
-      ? selectedIds.filter((x) => x !== id)
-      : [...selectedIds, id]
-    setAnswer('machine_fixture_ids', next)
-    setAnswer('machine_uses_fixture', next.length > 0)
-  }
+  const idsRaw = Array.isArray(answers.machine_fixture_ids)
+    ? answers.machine_fixture_ids
+    : []
+  // Size the selection to the current count. Preserve prior picks for
+  // the slots that still exist; fill the rest with empty strings.
+  const slotIds = []
+  for (let i = 0; i < count; i++) slotIds.push(idsRaw[i] || '')
 
-  const chooseYes = () => {
-    setAnswer('machine_uses_fixture', true)
-    if (!selectedIds.length && vices.length === 1) {
-      setAnswer('machine_fixture_ids', [vices[0].id])
+  function setCount(nextRaw) {
+    const n = Math.max(MIN, Math.min(MAX, Math.round(Number(nextRaw) || 0)))
+    setAnswer('machine_vice_count', n)
+    if (n === 0) {
+      setAnswer('machine_fixture_ids', [])
+      return
     }
-  }
-  const chooseNo = () => {
-    setAnswer('machine_uses_fixture', false)
-    setAnswer('machine_fixture_ids', [])
-    goNext({ machine_uses_fixture: false, machine_fixture_ids: [] })
+    // Resize the id array to match the new count. Keep prior picks for
+    // retained slots; blank the rest.
+    const next = []
+    for (let i = 0; i < n; i++) next.push(idsRaw[i] || '')
+    setAnswer('machine_fixture_ids', next)
   }
 
-  const canAdvance = !uses || selectedIds.length > 0
+  function setSlot(idx, fxId) {
+    const next = [...slotIds]
+    next[idx] = fxId
+    setAnswer('machine_fixture_ids', next)
+  }
+
+  const noFixturesInCell = fixtures.length === 0
+  const allSlotsFilled = count === 0 || slotIds.every((id) => !!id)
+  const canAdvance = allSlotsFilled && (count === 0 || !noFixturesInCell)
+
+  const stepperBtn = (dis) => ({
+    minHeight: 56, minWidth: 72,
+    padding: '0 20px', fontSize: 22, fontWeight: 800,
+    background: dis ? '#f3f4f6' : '#eff6ff',
+    color: dis ? '#9ca3af' : '#2563EB',
+    border: `1px solid ${dis ? '#e5e7eb' : '#bfdbfe'}`,
+    borderRadius: 10, cursor: dis ? 'not-allowed' : 'pointer',
+  })
+
   return (
     <QuestionCard
-      question="Does the machine hold the part with a clamp or vice?"
-      description="If the machine clamps the workpiece in a fixture, the program will tell the fixture to clamp after the robot places the part and release it after the machine cycle finishes."
+      question="How many vices hold the part in the machine?"
+      description="Vices are air-controlled; the program will clamp each one after loading, wait for the machine cycle to finish, then unclamp before removing the finished part. 0 = the machine holds the part by itself (self-clamping chuck, magnetic bed, etc.)."
     >
-      <ChoiceButton
-        label="Yes — pick fixture(s)"
-        description="Select one or more clamping fixtures from your cell. The robot will load each one and clamp before the machine cycle starts."
-        selected={uses}
-        onClick={chooseYes}
-      />
-      <ChoiceButton
-        label="No fixture"
-        description="The machine holds the part by itself (self-clamping chuck, magnetic bed, etc.). No clamp IO will be emitted."
-        selected={!uses && answers.machine_uses_fixture === false}
-        onClick={chooseNo}
-      />
-      {uses && !hasAnyFixture && (
+      <div data-testid="machine-vice-count"
+           data-value={String(count)}
+           style={{
+             display: 'flex', alignItems: 'center', gap: 12,
+             justifyContent: 'center', marginBottom: 12,
+           }}>
+        <button type="button" aria-label="decrease"
+                data-testid="machine-vice-count-dec"
+                disabled={count <= MIN}
+                onClick={() => setCount(count - 1)}
+                style={stepperBtn(count <= MIN)}>−</button>
+        <input
+          type="number" inputMode="numeric" min={MIN} max={MAX} value={count}
+          data-testid="machine-vice-count-input"
+          onChange={(e) => setCount(parseInt(e.target.value, 10))}
+          style={{
+            width: 96, textAlign: 'center',
+            fontSize: 28, fontWeight: 800, color: '#111',
+            padding: '12px 10px',
+            border: '2px solid #e5e7eb', borderRadius: 10,
+            fontVariantNumeric: 'tabular-nums',
+          }} />
+        <button type="button" aria-label="increase"
+                data-testid="machine-vice-count-inc"
+                disabled={count >= MAX}
+                onClick={() => setCount(count + 1)}
+                style={stepperBtn(count >= MAX)}>+</button>
+      </div>
+
+      {count === 0 && (
+        <div data-testid="machine-vice-selfclamp"
+             style={{
+               padding: 12,
+               background: '#F0FDF4', border: '1px solid #BBF7D0',
+               borderRadius: 8, color: '#15803D', fontSize: 13,
+               lineHeight: 1.5,
+             }}>
+          No vices — the machine holds the part itself. The program
+          will not emit any clamp I/O.
+        </div>
+      )}
+
+      {count >= 1 && noFixturesInCell && (
         <div data-testid="machine-fixtures-empty"
              style={{
-               marginTop: 12, padding: 12,
+               padding: 12,
                background: '#FFFBEB', border: '1px solid #FCD34D',
                borderRadius: 8, color: '#92400E', fontSize: 13,
              }}>
@@ -2029,59 +2102,69 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
           Fixture wizard first, then come back here.
         </div>
       )}
-      {uses && hasAnyFixture && (
+
+      {count >= 1 && !noFixturesInCell && (
         <div data-testid="machine-fixtures-picker"
-             style={{ marginTop: 12 }}>
+             style={{ marginTop: 4 }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
-            Which fixture(s) will the machine clamp?
-            <span style={{ color: '#6b7280', fontWeight: 400 }}>
-              {' '}(tap all that must load before the cycle starts)
-            </span>
+            Which vice is each one?
           </div>
-          {[...vices, ...others].map((f) => {
-            const checked = selectedIds.includes(f.id)
-            const hasClamp = !!(f.valve || f.out)
+          {slotIds.map((id, idx) => {
+            const fx = vicesFirst.find((f) => f.id === id) || null
+            const hasClamp = !!(fx && (fx.valve || fx.out))
             return (
-              <label
-                key={f.id}
-                data-testid="machine-fixture-choice"
-                data-fixture-id={f.id}
-                data-checked={String(checked)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 12,
-                  padding: 12, marginBottom: 6,
-                  background: checked ? '#EFF6FF' : '#fff',
-                  border: `1px solid ${checked ? '#2563EB' : '#e5e7eb'}`,
-                  borderRadius: 8, cursor: 'pointer',
-                }}>
-                <input type="checkbox" checked={checked}
-                       onChange={() => toggleFixture(f.id)} />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>
-                    {f.name || `Vice (${f.id.slice(0, 6)})`}
-                  </div>
-                  <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
-                    {f.type === 'vice' ? 'Vice' : (f.type || 'Fixture')}
-                    {hasClamp
-                      ? ` · clamp signal assigned`
-                      : ' · no clamp signal — finish its setup'}
-                  </div>
+              <div key={idx}
+                   data-testid="machine-vice-slot"
+                   data-slot-index={String(idx)}
+                   data-fixture-id={id}
+                   style={{
+                     display: 'flex', alignItems: 'center', gap: 12,
+                     padding: 12, marginBottom: 6,
+                     background: '#fff', border: '1px solid #e5e7eb',
+                     borderRadius: 8,
+                   }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: '#111', minWidth: 72 }}>
+                  Vice {idx + 1}
                 </div>
-              </label>
+                <select value={id}
+                        onChange={(e) => setSlot(idx, e.target.value)}
+                        style={{
+                          flex: 1, padding: '10px 12px', fontSize: 14,
+                          border: '1px solid #d1d5db', borderRadius: 6,
+                        }}>
+                  <option value="">— pick a fixture —</option>
+                  {vicesFirst.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name || `Vice (${f.id.slice(0, 6)})`}
+                      {f.type === 'vice' ? '' : ` · ${f.type || 'fixture'}`}
+                    </option>
+                  ))}
+                </select>
+                {id && (
+                  <div style={{ fontSize: 11, color: hasClamp ? '#15803D' : '#92400E' }}>
+                    {hasClamp
+                      ? 'clamp signal assigned'
+                      : 'no clamp signal — finish its setup'}
+                  </div>
+                )}
+              </div>
             )
           })}
-          {selectedIds.length > 1 && (
+          {count > 1 && (
             <div style={{ marginTop: 8, fontSize: 12, color: '#2563EB' }}>
-              {selectedIds.length} fixtures will be loaded before the machine starts.
+              {count} vices will be loaded before the machine starts.
               Each gets its own load position in the teach step.
             </div>
           )}
         </div>
       )}
+
       <NextButton
         onClick={() => goNext({
-          machine_uses_fixture: uses,
-          machine_fixture_ids:  selectedIds,
+          machine_vice_count:   count,
+          machine_fixture_ids:  count === 0 ? [] : slotIds,
+          // Legacy flag — kept for backward-read of saved programs.
+          machine_uses_fixture: count > 0,
         })}
         disabled={!canAdvance}
         label="Next" />
