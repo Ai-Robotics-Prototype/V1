@@ -127,6 +127,11 @@ export const FIXTURE_TYPES = Object.freeze({
     key: 'vice', label: 'Vice / Clamp',
     desc: 'Grips a workpiece.',
     icon: 'vice',
+    // 2026-10-16 operator order: vice/clamp is always pneumatic in
+    // our installs — the "How does this device work?" power question
+    // is skipped for this type and power_mode is auto-set to 'air'
+    // from `defaults.power_mode`. See isPowerFixed() below.
+    power_fixed: true,
     defaults: {
       power_mode: 'air',
       air_actuation: 'double',
@@ -251,6 +256,8 @@ export const FIXTURE_TYPES = Object.freeze({
     key: 'blow_off', label: 'Air Blast / Blow-off',
     desc: 'Pulses air to clear chips.',
     icon: 'blow_off',
+    // Blow-off is pneumatic by name — skip the power question.
+    power_fixed: true,
     defaults: {
       power_mode: 'air',
       air_actuation: 'blow_off',
@@ -282,6 +289,8 @@ export const FIXTURE_TYPES = Object.freeze({
     key: 'door', label: 'Door / Slide',
     desc: 'Opens and closes a guard.',
     icon: 'door',
+    // Door / slide is always pneumatic — skip the power question.
+    power_fixed: true,
     defaults: {
       power_mode: 'air',
       air_actuation: 'double',
@@ -351,6 +360,19 @@ export function completionCopyFor(type) {
   const def = FIXTURE_TYPES[type]
   if (def && def.completion) return def.completion
   return _GENERIC_COMPLETION
+}
+
+// 2026-10-16 operator order: for always-pneumatic device types (vice,
+// door, blow_off) the "How does this device work?" power step is
+// pointless — the answer is always "robot controls its air." The
+// wizard skips step 1 for these types and uses the type's
+// defaults.power_mode ('air') verbatim. Types where the power mode
+// genuinely varies (feeder / indexer / custom "other") still ask.
+// Data-driven: the per-type `power_fixed: true` flag is the single
+// source of truth; the UI reads it via this helper.
+export function isPowerFixed(type) {
+  const def = FIXTURE_TYPES[type]
+  return !!(def && def.power_fixed === true)
 }
 
 export const FIXTURE_TYPE_KEYS = Object.freeze(

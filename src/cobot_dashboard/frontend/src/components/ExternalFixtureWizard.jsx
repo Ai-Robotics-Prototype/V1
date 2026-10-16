@@ -4,6 +4,7 @@ import WhyExpander from './WhyExpander'
 import {
   FIXTURE_TYPES, FIXTURE_TYPE_KEYS,
   compileFixtureRecord, fixturePortMap, completionCopyFor,
+  isPowerFixed,
 } from '../lib/fixturesData'
 import {
   listFixtures, saveFixture, removeFixture,
@@ -104,6 +105,12 @@ export default function ExternalFixtureWizard({ onClose, initialId = null }) {
     powerMode === 'manual'
     || (powerMode === 'air' && isAirBlowOff)
   )
+  // 2026-10-16 operator order: for always-pneumatic types (vice, door,
+  // blow_off) skip the step-1 power question — the answer is always
+  // "robot controls its air" and the type's defaults.power_mode='air'
+  // is already applied when the operator picks the type (see TypePicker's
+  // onPick handler below). Data-driven via isPowerFixed(type).
+  const skipsPower = isPowerFixed(answers.type)
 
   // canAdvance: which fields must be answered to leave the current step.
   const canAdvance = (
@@ -115,8 +122,18 @@ export default function ExternalFixtureWizard({ onClose, initialId = null }) {
   )
 
   // Skip step 2 entirely for manual + air-blow-off (they have no
-  // actuation question to answer).
+  // actuation question to answer). Skip step 1 (power question) for
+  // always-pneumatic types — the operator never sees the "how does
+  // this device work?" screen for a vice / door / blow-off.
   function nextStep() {
+    if (step === 0 && skipsPower) {
+      // Operator picked a type whose power is fixed-air. Skip the
+      // power question and land on actuation (step 2). If the type
+      // also skips actuation (blow-off), nextStep below jumps to 3.
+      const target = skipsActuation ? 3 : 2
+      setStep(target)
+      return
+    }
     if (step === 1 && skipsActuation) {
       setStep(3)
       return
@@ -125,7 +142,18 @@ export default function ExternalFixtureWizard({ onClose, initialId = null }) {
   }
   function prevStep() {
     if (step === 3 && skipsActuation) {
-      setStep(1)
+      // Back from completion → actuation (if present) → power (if present).
+      if (skipsPower) {
+        setStep(skipsActuation ? 0 : 1)
+      } else {
+        setStep(1)
+      }
+      return
+    }
+    if (step === 2 && skipsPower) {
+      // Back from actuation → type picker (we never showed the power
+      // step for this type).
+      setStep(0)
       return
     }
     setStep(Math.max(0, step - 1))
