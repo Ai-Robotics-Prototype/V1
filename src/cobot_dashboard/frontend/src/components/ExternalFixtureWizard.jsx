@@ -3,7 +3,7 @@ import { GuidanceBlock } from './EOATSetupWizard'
 import WhyExpander from './WhyExpander'
 import {
   FIXTURE_TYPES, FIXTURE_TYPE_KEYS,
-  compileFixtureRecord, fixturePortMap,
+  compileFixtureRecord, fixturePortMap, completionCopyFor,
 } from '../lib/fixturesData'
 import {
   listFixtures, saveFixture, removeFixture,
@@ -650,25 +650,32 @@ function OwnControllerStep({ answers, onWantsDoneChange }) {
 }
 
 function CompletionStep({ answers, onCompletion, onWaitS }) {
+  // 2026-10-16 operator field report: generic "How will the robot know
+  // it's finished?" copy did not fit a door (operators think of a door
+  // as reaching open/closed, not finishing). Fix: pull the completion
+  // copy from the device-type config via completionCopyFor(answers.type),
+  // which is purely data — no per-type if/else chain here. Blow-off,
+  // for example, only exposes the 'wait' option and labels it "Pulse
+  // length"; door asks "How will the robot know the door is open or
+  // closed?" with position-sensor copy.
+  const copy = completionCopyFor(answers.type)
   const kind = answers.completion
+  const options = (copy.options || ['sensor', 'wait', 'operator'])
+    .map((key) => {
+      const entry = copy[key]
+      if (!entry) return null
+      return { key, label: entry.label, desc: entry.desc }
+    })
+    .filter(Boolean)
+  const waitEntry = copy.wait || {}
   return (
     <div data-testid="fixture-step-completion"
+         data-device-type={String(answers.type || 'other')}
          style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div style={{ fontSize: 13, color: '#374151' }}>
-        How will the robot know it's finished?
+        {copy.question}
       </div>
-      {[
-        { key: 'sensor', label: 'A sensor tells it',
-          desc: 'A sensor on the device sends a signal when it is '
-            + 'done. The robot waits for the signal before moving on.' },
-        { key: 'wait', label: 'It always takes about the same time',
-          desc: 'The robot waits a set number of seconds. Pick this '
-            + 'only when the device has no signal — a timer cannot '
-            + 'tell if the device actually finished.' },
-        { key: 'operator', label: 'A person will press continue',
-          desc: 'The program pauses and asks the operator to confirm '
-            + 'before moving on.' },
-      ].map((c) => {
+      {options.map((c) => {
         const on = kind === c.key
         return (
           <button key={c.key}
@@ -695,7 +702,7 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
         <div data-testid="fixture-wait-field"
              style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <label style={{ fontSize: 13, color: '#374151' }}>
-            Wait time (seconds):
+            {waitEntry.waitLabel || 'Wait time'} ({waitEntry.waitHint || 'seconds'}):
           </label>
           <input
             type="number" step="0.1" min="0"
@@ -708,17 +715,18 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
               border: '1px solid #d1d5db', borderRadius: 6,
               fontFamily: 'inherit',
             }} />
-          <span style={{ fontSize: 12, color: '#6B7280' }}>seconds</span>
+          <span style={{ fontSize: 12, color: '#6B7280' }}>
+            {waitEntry.waitHint || 'seconds'}
+          </span>
         </div>
       )}
-      {kind === 'sensor' && (
+      {kind === 'sensor' && copy.sensorNote && (
         <div style={{
           padding: '8px 12px', background: '#FFFBEB',
           border: '1px solid #FDE68A', borderRadius: 6,
           fontSize: 12, color: '#92400E', lineHeight: 1.5,
         }}>
-          A sensor is safest — the robot never guesses whether the
-          device finished.
+          {copy.sensorNote}
         </div>
       )}
     </div>

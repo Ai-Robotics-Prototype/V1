@@ -69,6 +69,59 @@ export { slotAcceptsType }
 //                       same type ("Vice 1", "Vice 2", ...).
 //   * why             — one-line WHY paragraph shown under the card.
 
+// 2026-10-16 operator field report: the completion step's generic
+// "How will the robot know it's finished?" copy did not fit a DOOR
+// actuator (operators think of a door as open/closed, not "finished").
+// Fix: each FIXTURE_TYPES entry carries a `completion` sub-object that
+// drives CompletionStep's wording. The sub-object is purely data —
+// CompletionStep renders from it without any per-type if/else chain.
+//
+// Shape:
+//   completion: {
+//     question:   string,          // operator-facing headline
+//     options:    [string],        // subset of ['sensor','wait','operator']
+//                                   // in display order; blow-off = ['wait']
+//     sensor?:    { label, desc },
+//     wait?:      { label, desc,
+//                   waitLabel, waitHint },
+//     operator?:  { label, desc },
+//     sensorNote?: string,         // optional callout under the sensor
+//                                   // choice (safest/wiring hint).
+//   }
+//
+// Any type without a `completion` entry falls back to _GENERIC_COMPLETION
+// so a future type that forgets to opt in still renders a working step
+// (never a crash); the pin suite asserts every shipped type carries its
+// own copy.
+const _GENERIC_COMPLETION = Object.freeze({
+  question: "How will the robot know it's finished?",
+  options:  ['sensor', 'wait', 'operator'],
+  sensor: {
+    label: 'A sensor tells it',
+    desc:
+      'A sensor on the device sends a signal when it is done. The '
+      + 'robot waits for the signal before moving on.',
+  },
+  wait: {
+    label: 'It always takes about the same time',
+    desc:
+      'The robot waits a set number of seconds. Pick this only when '
+      + 'the device has no signal — a timer cannot tell if the device '
+      + 'actually finished.',
+    waitLabel: 'Wait time',
+    waitHint:  'seconds',
+  },
+  operator: {
+    label: 'A person will press continue',
+    desc:
+      'The program pauses and asks the operator to confirm before '
+      + 'moving on.',
+  },
+  sensorNote:
+    'A sensor is safest — the robot never guesses whether the '
+    + 'device finished.',
+})
+
 export const FIXTURE_TYPES = Object.freeze({
   vice: {
     key: 'vice', label: 'Vice / Clamp',
@@ -84,6 +137,34 @@ export const FIXTURE_TYPES = Object.freeze({
       'A clamp with two states — open and closed. By default it '
       + 'keeps holding the part if the robot stops, so nothing '
       + 'drops mid-cycle. You can change this on the next step.',
+    completion: {
+      question: 'How will the robot know the part is clamped?',
+      options:  ['sensor', 'wait', 'operator'],
+      sensor: {
+        label: 'A clamp sensor tells it',
+        desc:
+          'A sensor on the vice signals when the jaws are closed on '
+          + 'the part. The robot waits for the signal before moving on.',
+      },
+      wait: {
+        label: 'It always takes about the same time',
+        desc:
+          'The robot waits a set number of seconds for the clamp to '
+          + 'close. Pick this only when the vice has no clamp sensor — '
+          + 'a timer cannot tell if the part is actually clamped.',
+        waitLabel: 'Clamp time',
+        waitHint:  'seconds',
+      },
+      operator: {
+        label: 'A person will press continue',
+        desc:
+          'The program pauses and asks the operator to confirm the '
+          + 'part is clamped before moving on.',
+      },
+      sensorNote:
+        'A clamp sensor is safest — the robot never guesses whether '
+        + 'the part is actually held.',
+    },
   },
   indexer: {
     key: 'indexer', label: 'Rotary Table / Indexer',
@@ -97,6 +178,33 @@ export const FIXTURE_TYPES = Object.freeze({
     why:
       'Rotary indexers almost always have their own controls — the '
       + "robot tells it to go and waits for it to finish.",
+    completion: {
+      question: 'How will the robot know the table is in position?',
+      options:  ['sensor', 'wait', 'operator'],
+      sensor: {
+        label: 'An in-position sensor tells it',
+        desc:
+          'A sensor on the indexer signals when it reaches the next '
+          + 'station. The robot waits for the signal before moving on.',
+      },
+      wait: {
+        label: 'It always takes about the same time',
+        desc:
+          'The robot waits a set number of seconds for the index to '
+          + 'complete. Pick this only when the indexer has no sensor.',
+        waitLabel: 'Index time',
+        waitHint:  'seconds',
+      },
+      operator: {
+        label: 'A person will press continue',
+        desc:
+          'The program pauses and asks the operator to confirm the '
+          + 'table is in position before moving on.',
+      },
+      sensorNote:
+        'An in-position sensor is safest — the robot never guesses '
+        + 'whether the table actually reached the next station.',
+    },
   },
   feeder: {
     key: 'feeder', label: 'Part Feeder / Conveyor',
@@ -110,6 +218,34 @@ export const FIXTURE_TYPES = Object.freeze({
     why:
       'Bowl feeders and conveyors have their own controls. The '
       + 'robot sends a start signal and waits for the next part.',
+    completion: {
+      question: 'How will the robot know the next part is at the pickup?',
+      options:  ['sensor', 'wait', 'operator'],
+      sensor: {
+        label: 'A part-present sensor tells it',
+        desc:
+          'A sensor at the pickup signals when a part arrives. The '
+          + 'robot waits for the signal before picking.',
+      },
+      wait: {
+        label: 'It always takes about the same time',
+        desc:
+          'The robot waits a set number of seconds for the next part '
+          + 'to arrive. Pick this only when the feeder has no sensor '
+          + '— a timer cannot tell if a part is actually there.',
+        waitLabel: 'Feed time',
+        waitHint:  'seconds',
+      },
+      operator: {
+        label: 'A person will press continue',
+        desc:
+          'The program pauses and asks the operator to confirm a '
+          + 'part is at the pickup before moving on.',
+      },
+      sensorNote:
+        'A part-present sensor is safest — the robot never guesses '
+        + 'whether a part is actually at the pickup.',
+    },
   },
   blow_off: {
     key: 'blow_off', label: 'Air Blast / Blow-off',
@@ -124,6 +260,23 @@ export const FIXTURE_TYPES = Object.freeze({
     why:
       'Blow-offs sit off by default and pulse when the program '
       + 'says so — nothing to hold here.',
+    // Blow-offs are self-contained pulses — no "finished" question
+    // applies. The only operator-facing knob is HOW LONG the pulse
+    // lasts, so we offer only the wait option and label it "pulse
+    // length" (not "finished / wait time").
+    completion: {
+      question: 'How long should the air pulse?',
+      options:  ['wait'],
+      wait: {
+        label: 'Pulse length',
+        desc:
+          'Set the number of seconds the air pulses when the program '
+          + 'fires it. Short pulses (0.1 – 0.5 s) are typical for '
+          + 'chip clearing.',
+        waitLabel: 'Pulse length',
+        waitHint:  'seconds',
+      },
+    },
   },
   door: {
     key: 'door', label: 'Door / Slide',
@@ -141,6 +294,39 @@ export const FIXTURE_TYPES = Object.freeze({
       + 'never drops a part. If this is a safety guard that must '
       + 'open for a person to walk through, pick "let go" on the '
       + 'next step.',
+    completion: {
+      // 2026-10-16 operator field report: the generic "finished"
+      // wording made no sense for a door — operators think of a
+      // door as reaching open or closed, not finishing. Reframed.
+      question: 'How will the robot know the door is open or closed?',
+      options:  ['sensor', 'wait', 'operator'],
+      sensor: {
+        label: 'A door position sensor tells it',
+        desc:
+          'A sensor on the door signals when it reaches the open or '
+          + 'closed position. The robot waits for the signal before '
+          + 'moving on.',
+      },
+      wait: {
+        label: 'It takes about the same time to open and close',
+        desc:
+          'The robot waits a set number of seconds for the door to '
+          + 'open or close. Pick this only when the door has no '
+          + 'position sensor — a timer cannot tell if the door '
+          + 'actually reached its end stop.',
+        waitLabel: 'How long to open or close?',
+        waitHint:  'seconds',
+      },
+      operator: {
+        label: 'A person will confirm',
+        desc:
+          'The program pauses and asks the operator to confirm the '
+          + 'door is in the right position before moving on.',
+      },
+      sensorNote:
+        'A position sensor is safest — the robot never guesses whether '
+        + 'the door actually reached open or closed.',
+    },
   },
   other: {
     key: 'other', label: 'Something else',
@@ -154,8 +340,18 @@ export const FIXTURE_TYPES = Object.freeze({
     why:
       'Not sure what this is — the wizard will ask the same '
       + 'questions and build the record from your answers.',
+    completion: _GENERIC_COMPLETION,
   },
 })
+
+// Resolve the completion copy for a device type. Returns the type's
+// bespoke config when present, else the generic fallback — a future
+// type that forgets to opt in still renders a working step.
+export function completionCopyFor(type) {
+  const def = FIXTURE_TYPES[type]
+  if (def && def.completion) return def.completion
+  return _GENERIC_COMPLETION
+}
 
 export const FIXTURE_TYPE_KEYS = Object.freeze(
   Object.keys(FIXTURE_TYPES))
