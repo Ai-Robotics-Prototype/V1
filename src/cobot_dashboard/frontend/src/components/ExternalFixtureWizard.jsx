@@ -668,6 +668,27 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
     })
     .filter(Boolean)
   const waitEntry = copy.wait || {}
+  // 2026-10-16 operator order: preselect the SENSOR option as the
+  // default when the step first loads — it is the recommended,
+  // deterministic answer across every device type that offers one.
+  // Operators who want timed or operator-confirm can still tap those;
+  // this just makes Next ready with one less click for the common
+  // path. For types without a sensor option (blow_off, which exposes
+  // only 'wait'), fall back to the FIRST option in copy.options so
+  // the step still arrives with a choice selected. The useEffect only
+  // fires when answers.completion is nullish — navigating back to the
+  // step preserves whatever the operator previously picked.
+  const defaultKind = options.some((o) => o.key === 'sensor')
+    ? 'sensor'
+    : (options[0] && options[0].key) || null
+  useEffect(() => {
+    if (!answers.completion && defaultKind) {
+      onCompletion(defaultKind)
+    }
+    // defaultKind is stable per device type; onCompletion is a
+    // reference the parent memoises. Only re-fire when the device
+    // type changes OR when completion flips back to nullish.
+  }, [answers.completion, defaultKind, onCompletion])
   return (
     <div data-testid="fixture-step-completion"
          data-device-type={String(answers.type || 'other')}
@@ -677,11 +698,17 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
       </div>
       {options.map((c) => {
         const on = kind === c.key
+        // "Recommended" chip on the preselected default (sensor
+        // everywhere it's offered; the first option for sensor-less
+        // types like blow_off). Rendered inline with the label so the
+        // operator sees WHY the choice is already selected.
+        const isDefault = c.key === defaultKind
         return (
           <button key={c.key}
                   data-testid="fixture-completion-choice"
                   data-value={c.key}
                   data-selected={String(on)}
+                  data-default={String(isDefault)}
                   onClick={() => onCompletion(c.key)}
                   style={{
                     textAlign: 'left', padding: '10px 12px',
@@ -689,8 +716,21 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
                     border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
                     borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
                   }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
-              {c.label}
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#111',
+                          display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>{c.label}</span>
+              {isDefault && (
+                <span
+                  data-testid="fixture-completion-recommended"
+                  style={{
+                    fontSize: 10, fontWeight: 700,
+                    letterSpacing: 0.4, textTransform: 'uppercase',
+                    padding: '2px 6px', borderRadius: 999,
+                    background: '#DCFCE7', color: '#166534',
+                  }}>
+                  Recommended
+                </span>
+              )}
             </div>
             <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
               {c.desc}

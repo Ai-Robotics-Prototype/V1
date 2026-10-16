@@ -258,6 +258,80 @@ test('Sensor callout reads copy.sensorNote (only when the config defines it)', (
 
 // ── (6) Config consistency: no "finished" in per-type copy ─────────
 
+// ── (7) 2026-10-16 default-preselection + Recommended chip ─────────
+
+test('CompletionStep preselects the sensor option on mount (data-driven default)', () => {
+  const idx = wizSrc.indexOf('function CompletionStep(')
+  const stop = wizSrc.indexOf('\nfunction ', idx + 1)
+  const chunk = wizSrc.slice(idx, stop > idx ? stop : idx + 8000)
+    .replace(/\{\s*\/\*[\s\S]*?\*\/\s*\}/g, '')
+    .replace(/\/\/[^\n]*$/gm, '')
+  // Derivation: default = 'sensor' when options includes it, else the
+  // first option in copy.options. Sensor-less types (blow_off) fall
+  // back to 'wait'.
+  assert.ok(
+    /const defaultKind\s*=\s*options\.some\(\(o\)\s*=>\s*o\.key\s*===\s*['"]sensor['"]\)\s*\?\s*['"]sensor['"]\s*:\s*\(options\[0\]/
+      .test(chunk),
+    v('CompletionStep must derive `defaultKind = options.some(o => '
+      + 'o.key === "sensor") ? "sensor" : (options[0] && options[0]'
+      + '.key) || null` — the data-driven default-preselection rule.'))
+  // useEffect must call onCompletion(defaultKind) when answers.completion
+  // is falsy. Navigating back preserves the operator's prior pick.
+  assert.ok(
+    /useEffect\(\(\)\s*=>\s*\{\s*\n\s*if \(!answers\.completion\s*&&\s*defaultKind\)\s*\{\s*\n\s*onCompletion\(defaultKind\)/
+      .test(chunk),
+    v('CompletionStep must useEffect-call onCompletion(defaultKind) '
+      + 'when answers.completion is nullish — preselect on first '
+      + 'arrival, preserve on back-nav.'))
+  // Dependency array must include answers.completion + defaultKind so
+  // a device-type change (which changes defaultKind) re-fires. The
+  // onCompletion ref doesn't change in practice but is listed for
+  // react-hooks exhaustive-deps.
+  assert.ok(
+    /\}, \[answers\.completion, defaultKind, onCompletion\]\)/.test(chunk),
+    v('CompletionStep useEffect deps must be [answers.completion, '
+      + 'defaultKind, onCompletion] — react-hooks/exhaustive-deps + '
+      + 'the type-change re-fire path.'))
+})
+
+test('Sensor option carries a "Recommended" chip when it is the default', () => {
+  const idx = wizSrc.indexOf('function CompletionStep(')
+  const stop = wizSrc.indexOf('\nfunction ', idx + 1)
+  const chunk = wizSrc.slice(idx, stop > idx ? stop : idx + 8000)
+  // The chip renders when the option is the default — gated on
+  // isDefault, which is `c.key === defaultKind`. For sensor-offering
+  // types the chip lands on sensor; for blow_off it lands on wait
+  // (which is also the only option — operator still sees a clear
+  // signal that THIS is the one to pick).
+  assert.ok(/const isDefault\s*=\s*c\.key\s*===\s*defaultKind/.test(chunk),
+    v('Each option render must compute isDefault = c.key === '
+      + 'defaultKind so the Recommended chip only appears on the '
+      + 'default row.'))
+  assert.ok(
+    /\{isDefault\s*&&[\s\S]{0,500}data-testid="fixture-completion-recommended"[\s\S]{0,600}Recommended/
+      .test(chunk),
+    v('CompletionStep must render a Recommended chip (data-testid='
+      + '"fixture-completion-recommended") when isDefault is true. The '
+      + 'chip body must read "Recommended" verbatim.'))
+  // Also pin the data-default attribute on the choice button so e2e
+  // tests can filter the default row directly.
+  assert.ok(/data-default=\{String\(isDefault\)\}/.test(chunk),
+    v('Each choice button must stamp data-default={String(isDefault)} '
+      + 'so operator-facing tests can select the default row.'))
+})
+
+test('Sensor-less type (blow_off) still preselects via the first-option fallback', () => {
+  // Behavioral invariant: for blow_off, defaultKind = 'wait' because
+  // 'sensor' isn't in options. CompletionStep still auto-sets
+  // answers.completion so Next transitions depend only on the wait_s
+  // value (which the operator must type). We assert the data-level
+  // guarantee here — the UI logic is pinned above.
+  const blowCopy = completionCopyFor('blow_off')
+  assert.deepEqual(blowCopy.options, ['wait'],
+    v('blow_off options must still be ["wait"] — the first-option '
+      + 'fallback for sensor-less types lands on wait.'))
+})
+
 test('No shipped type (except the generic "other" fallback) uses the word "finished" in its question', () => {
   // "finished" is the pre-fix generic wording the operator flagged as
   // not fitting specific types. Each shipped type MUST have replaced
