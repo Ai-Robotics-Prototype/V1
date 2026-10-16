@@ -23,6 +23,110 @@
   </head>
   <body>
     <div id="root"></div>
+    <div id="global-error-overlay" style="display:none"></div>
+    <!--
+      Global error visibility (2026-10-14 operator field report: the
+      new-program wizard payload step blanks on the tablet with no
+      visible error). This runs BEFORE any module loads and uses only
+      ES5 syntax so it can never itself fail to parse. It catches:
+        * window 'error' events (uncaught sync throws)
+        * 'unhandledrejection' (uncaught async / promise rejections)
+      and renders a visible fixed banner at the TOP of the page with
+      the message + source location + a Copy button, so a tablet user
+      who cannot open devtools can still READ what broke. React's own
+      error boundaries still handle render errors inside components;
+      this is the last-resort layer for everything that escapes them.
+    -->
+    <script>
+      (function () {
+        var seen = [];
+        function esc(s) {
+          return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+        function render() {
+          var box = document.getElementById('global-error-overlay');
+          if (!box) return;
+          if (!seen.length) { box.style.display = 'none'; return; }
+          box.style.display = 'block';
+          box.style.position = 'fixed';
+          box.style.top = '0';
+          box.style.left = '0';
+          box.style.right = '0';
+          box.style.zIndex = '2147483647';
+          box.style.background = '#7f1d1d';
+          box.style.color = '#fff';
+          box.style.font = '12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif';
+          box.style.padding = '10px 14px';
+          box.style.maxHeight = '45vh';
+          box.style.overflowY = 'auto';
+          box.style.borderBottom = '2px solid #fca5a5';
+          var html = '<div style="font-weight:700;margin-bottom:6px;">'
+            + 'Dashboard error (' + seen.length + ') — '
+            + '<a href="#" id="__ge_copy" style="color:#fecaca;text-decoration:underline;">copy</a>'
+            + ' &middot; '
+            + '<a href="#" id="__ge_dismiss" style="color:#fecaca;text-decoration:underline;">dismiss</a>'
+            + '</div>';
+          for (var i = 0; i < seen.length; i++) {
+            var e = seen[i];
+            html += '<div style="margin-bottom:8px;white-space:pre-wrap;word-break:break-word;">'
+              + '<b>' + esc(e.kind) + ':</b> ' + esc(e.msg)
+              + (e.src ? '<br><small style="opacity:.8;">' + esc(e.src) + '</small>' : '')
+              + (e.stack ? '<br><small style="opacity:.7;">' + esc(e.stack).slice(0, 1500) + '</small>' : '')
+              + '</div>';
+          }
+          box.innerHTML = html;
+          var copyA = document.getElementById('__ge_copy');
+          if (copyA) copyA.onclick = function (ev) {
+            ev.preventDefault();
+            try {
+              var txt = seen.map(function (e) {
+                return e.kind + ': ' + e.msg
+                  + (e.src ? '\n  at ' + e.src : '')
+                  + (e.stack ? '\n' + e.stack : '');
+              }).join('\n---\n');
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(txt);
+              } else {
+                var ta = document.createElement('textarea');
+                ta.value = txt; document.body.appendChild(ta);
+                ta.select(); document.execCommand('copy');
+                document.body.removeChild(ta);
+              }
+              copyA.textContent = 'copied';
+            } catch (e) { copyA.textContent = 'copy failed'; }
+          };
+          var dis = document.getElementById('__ge_dismiss');
+          if (dis) dis.onclick = function (ev) {
+            ev.preventDefault(); seen = []; render();
+          };
+        }
+        function push(kind, msg, src, stack) {
+          seen.push({ kind: kind, msg: msg, src: src, stack: stack });
+          if (seen.length > 20) seen = seen.slice(seen.length - 20);
+          try { render(); } catch (e) { /* never let the reporter crash the page */ }
+        }
+        window.addEventListener('error', function (ev) {
+          var m = (ev && ev.message) || 'unknown error';
+          var s = ev && ev.filename
+            ? (ev.filename + ':' + (ev.lineno || '?') + ':' + (ev.colno || '?'))
+            : '';
+          var st = (ev && ev.error && ev.error.stack) || '';
+          push('Error', m, s, st);
+        });
+        window.addEventListener('unhandledrejection', function (ev) {
+          var r = ev && ev.reason;
+          var m = (r && (r.message || r.toString && r.toString())) || 'unhandled rejection';
+          var st = (r && r.stack) || '';
+          push('Rejection', m, '', st);
+        });
+        // Expose a push hook so React error boundaries can forward
+        // caught errors into the same banner — one source of truth
+        // for "what's broken right now" on the tablet.
+        window.__cobotReportError = push;
+      })();
+    </script>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

@@ -3,6 +3,7 @@ import { Canvas, useFrame } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import { useCellWizardStore } from '../store/cellWizardStore'
+import { kbSafeModalContentStyle, kbSafeOverlayStyle } from '../lib/keyboardInset'
 
 const HOST     = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
 const WS_PROTO = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'
@@ -649,12 +650,14 @@ export default function SetupWizard({ onClose, onSaved }) {
       position: 'fixed', inset: 0, zIndex: 100,
       background: 'rgba(0,0,0,0.4)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
+      ...kbSafeOverlayStyle(),
     }}>
       <div style={{
-        width: '95%', maxWidth: 880, maxHeight: '95vh',
+        width: '95%', maxWidth: 880,
         background: '#fff', borderRadius: 16, overflow: 'hidden',
         boxShadow: '0 25px 60px rgba(0,0,0,0.25)',
         display: 'flex', flexDirection: 'column',
+        ...kbSafeModalContentStyle(95),
       }}>
         <div style={{
           padding: '14px 20px', borderBottom: '1px solid #e5e7eb',

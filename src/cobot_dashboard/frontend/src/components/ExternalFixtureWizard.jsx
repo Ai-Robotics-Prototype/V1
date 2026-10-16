@@ -1,0 +1,1085 @@
+import { useEffect, useMemo, useState } from 'react'
+import { GuidanceBlock } from './EOATSetupWizard'
+import WhyExpander from './WhyExpander'
+import {
+  FIXTURE_TYPES, FIXTURE_TYPE_KEYS,
+  compileFixtureRecord, fixturePortMap, completionCopyFor,
+  isPowerFixed, wiringLabelsFor,
+} from '../lib/fixturesData'
+import { wasAllocatedAsSpare } from '../lib/valveMapping'
+import {
+  listFixtures, saveFixture, removeFixture,
+} from '../lib/fixturesStore'
+import { listTools } from '../lib/toolsApi'
+import {
+  saveCellFixture, deleteCellFixture,
+} from '../lib/cellStore'
+import {
+  portDisplayName, portListDisplay, entrySubtitle, typeLabel,
+} from '../lib/cellEntryDisplay'
+import { useIoHardwareProfile } from '../lib/ioHardwareProfile'
+import { useSynapsePortmap } from '../lib/synapsePortmap'
+import {
+  useKeyboardInset, scrollFocusedIntoView, kbSafeModalContentStyle,
+  kbSafeOverlayStyle,
+} from '../lib/keyboardInset'
+
+// External Fixture Wizard (2026-09-22 operator directive).
+//
+// Process-language interview. The operator answers questions about
+// what the device DOES; the wizard compiles the answers to Synapse
+// port assignments. The wizard NEVER emits IO writes — the summary
+// is a wiring guide the operator confirms and wires.
+//
+// Screens (one question each; back-paths on every step):
+//   0. Device type (cards, per-type defaults)
+//   1. Power fork (air / own-controller / manual)
+//   2. Actuation branch:
+//      - air:            hold-on-loss (skipped for blow-off type)
+//      - own-controller: "does it signal back when finished?"
+//      - manual:         skipped
+//   3. Completion feedback (sensor / wait / operator)
+//   4. Name + Summary (glowing map + tick-off list + save)
+//
+// Records persist in localStorage via lib/fixturesStore. Backend
+// persistence is a named follow-up.
+//
+// Program-editor exposure ("Close Vice 1", "Wait Vice 1 done",
+// "Trigger Feeder") is DESIGNED into the record shape but WIRING
+// the editor is a named follow-up — not this session.
+
+const STEP_TITLES = [
+  '1. What kind of device is this?',
+  '2. How does this device work?',
+  '3. Confirm its behavior',
+  "4. How will the robot know it's finished?",
+  '5. Name + wire it up',
+]
+
+export default function ExternalFixtureWizard({ onClose, initialId = null }) {
+  const [step, setStep] = useState(0)
+  const [tools, setTools] = useState([])
+  const [fixtures, setFixtures] = useState([])
+  const [answers, setAnswers] = useState(() => ({}))
+  const [saved, setSaved] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const [picker, setPicker] = useState(initialId == null)
+  const [editingId, setEditingId] = useState(initialId)
+
+  useKeyboardInset()
+
+  useEffect(() => {
+    let alive = true
+    Promise.all([
+      listTools().catch(() => []),
+      listFixtures().catch(() => []),
+    ]).then(([t, f]) => {
+      if (!alive) return
+      setTools(t || [])
+      setFixtures(f || [])
+      if (editingId) {
+        const existing = (f || []).find((row) => row.id === editingId)
+        if (existing) {
+          setAnswers(_recordToAnswers(existing))
+          setPicker(false)
+        }
+      }
+    })
+    return () => { alive = false }
+  }, [editingId])
+
+  const typeDef = FIXTURE_TYPES[answers.type] || null
+
+  // Answers → record preview (also used for summary render).
+  const record = useMemo(() => {
+    if (!answers.type) return null
+    return compileFixtureRecord(answers, {
+      tools,
+      fixtures: fixtures.filter((f) => f.id !== editingId),
+    })
+  }, [answers, tools, fixtures, editingId])
+
+  const powerMode = record ? record.power_mode : null
+  const isAirBlowOff = record && record.actuation === 'blow_off'
+  const skipsActuation = (
+    powerMode === 'manual'
+    || (powerMode === 'air' && isAirBlowOff)
+  )
+  // 2026-10-16 operator order: for always-pneumatic types (vice, door,
+  // blow_off) skip the step-1 power question — the answer is always
+  // "robot controls its air" and the type's defaults.power_mode='air'
+  // is already applied when the operator picks the type (see TypePicker's
+  // onPick handler below). Data-driven via isPowerFixed(type).
+  const skipsPower = isPowerFixed(answers.type)
+
+  // canAdvance: which fields must be answered to leave the current step.
+  const canAdvance = (
+    step === 0 ? !!answers.type
+    : step === 1 ? !!powerMode
+    : step === 2 ? _actuationStepReady(powerMode, answers, skipsActuation)
+    : step === 3 ? _completionStepReady(answers)
+    : true
+  )
+
+  // Skip step 2 entirely for manual + air-blow-off (they have no
+  // actuation question to answer). Skip step 1 (power question) for
+  // always-pneumatic types — the operator never sees the "how does
+  // this device work?" screen for a vice / door / blow-off.
+  function nextStep() {
+    if (step === 0 && skipsPower) {
+      // Operator picked a type whose power is fixed-air. Skip the
+      // power question and land on actuation (step 2). If the type
+      // also skips actuation (blow-off), nextStep below jumps to 3.
+      const target = skipsActuation ? 3 : 2
+      setStep(target)
+      return
+    }
+    if (step === 1 && skipsActuation) {
+      setStep(3)
+      return
+    }
+    setStep(Math.min(4, step + 1))
+  }
+  function prevStep() {
+    if (step === 3 && skipsActuation) {
+      // Back from completion → actuation (if present) → power (if present).
+      if (skipsPower) {
+        setStep(skipsActuation ? 0 : 1)
+      } else {
+        setStep(1)
+      }
+      return
+    }
+    if (step === 2 && skipsPower) {
+      // Back from actuation → type picker (we never showed the power
+      // step for this type).
+      setStep(0)
+      return
+    }
+    setStep(Math.max(0, step - 1))
+  }
+
+  async function commitSave() {
+    if (!record) return
+    setBusy(true); setError(null)
+    try {
+      const withEditing = { ...record, id: editingId || null }
+      const persisted = await saveFixture(withEditing)
+      // Also write to the cell (single-source allocation truth).
+      // Backend failure here doesn't undo the local save — the cell
+      // will pick up the fixture on next reconcile.
+      try { await saveCellFixture(persisted) } catch { /* soft-fail */ }
+      setSaved(persisted)
+      setEditingId(persisted.id)
+      const refreshed = await listFixtures()
+      setFixtures(refreshed)
+    } catch (e) {
+      setError(String(e && e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function commitDelete(id) {
+    if (!id) return
+    setBusy(true); setError(null)
+    try {
+      await removeFixture(id)
+      try { await deleteCellFixture(id) } catch { /* soft-fail */ }
+      const refreshed = await listFixtures()
+      setFixtures(refreshed)
+      setPicker(true)
+      setEditingId(null)
+      setAnswers({})
+      setStep(0)
+      setSaved(null)
+    } catch (e) {
+      setError(String(e && e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function startFresh() {
+    setPicker(false)
+    setEditingId(null)
+    setAnswers({})
+    setStep(0)
+    setSaved(null)
+  }
+
+  function editExisting(row) {
+    setEditingId(row.id)
+    setAnswers(_recordToAnswers(row))
+    setPicker(false)
+    setStep(4)     // jump straight to summary for edits
+    setSaved(row)
+  }
+
+  return (
+    <div style={_backdrop} onClick={busy ? null : onClose}
+         data-testid="external-fixture-wizard">
+      <div style={_panel} onClick={(e) => e.stopPropagation()}>
+        <div style={_headerRow}>
+          <div style={_title}>External Fixtures</div>
+          <button style={_btnGhost} onClick={onClose}
+                  data-testid="external-fixture-close">
+            Close
+          </button>
+        </div>
+
+        {picker && (
+          <FixturePicker
+            fixtures={fixtures}
+            onNew={startFresh}
+            onEdit={editExisting}
+            onDelete={commitDelete}
+          />
+        )}
+
+        {!picker && (
+          <div data-testid="external-fixture-body">
+            <div style={_topRow}>
+              <button style={_btnGhost}
+                      data-testid="external-fixture-back-to-picker"
+                      onClick={() => { setPicker(true); setSaved(null) }}>
+                ← Fixtures list
+              </button>
+              <div style={{ fontSize: 14, color: '#374151' }}>
+                {STEP_TITLES[step]}
+              </div>
+            </div>
+
+            {step === 0 && (
+              <DeviceTypeStep
+                selected={answers.type}
+                onPick={(k) => setAnswers({
+                  ...answers, type: k,
+                  power_mode: FIXTURE_TYPES[k].defaults.power_mode || null,
+                  actuation: FIXTURE_TYPES[k].defaults.air_actuation || null,
+                  hold_on_loss:
+                    typeof FIXTURE_TYPES[k].defaults.hold_on_loss === 'boolean'
+                      ? FIXTURE_TYPES[k].defaults.hold_on_loss : null,
+                })}
+              />
+            )}
+
+            {step === 1 && (
+              <PowerForkStep
+                typeDef={typeDef}
+                selected={powerMode}
+                onPick={(pm) => setAnswers({
+                  ...answers,
+                  power_mode: pm,
+                  // Reset per-branch answers when power mode flips.
+                  hold_on_loss: pm === 'air'
+                    ? (typeof answers.hold_on_loss === 'boolean'
+                        ? answers.hold_on_loss
+                        : (typeDef?.defaults.hold_on_loss ?? null))
+                    : null,
+                  wants_done: pm === 'own_controller'
+                    ? (answers.wants_done ?? true) : false,
+                })}
+              />
+            )}
+
+            {step === 2 && !skipsActuation && powerMode === 'air' && (
+              <AirActuationStep
+                answers={answers}
+                onHoldChange={(v) => setAnswers({ ...answers, hold_on_loss: v })}
+              />
+            )}
+            {step === 2 && !skipsActuation && powerMode === 'own_controller' && (
+              <OwnControllerStep
+                answers={answers}
+                onWantsDoneChange={(v) => setAnswers({
+                  ...answers, wants_done: v,
+                })}
+              />
+            )}
+
+            {step === 3 && (
+              <CompletionStep
+                answers={answers}
+                onCompletion={(v) => setAnswers({ ...answers, completion: v })}
+                onWaitS={(v) => setAnswers({ ...answers, wait_s: v })}
+              />
+            )}
+
+            {step === 4 && record && (
+              <SummaryStep
+                answers={answers}
+                setAnswers={setAnswers}
+                record={record}
+                saved={saved}
+                busy={busy}
+                error={error}
+                onSave={commitSave}
+              />
+            )}
+
+            <div style={_footerRow}>
+              {step > 0 && (
+                <button style={_btnGhost}
+                        data-testid="external-fixture-back"
+                        onClick={prevStep}>
+                  ← Back
+                </button>
+              )}
+              <div style={{ flex: 1 }} />
+              {step < 4 && (
+                <button
+                  data-testid="external-fixture-next"
+                  disabled={!canAdvance}
+                  onClick={nextStep}
+                  style={{
+                    ..._btnPrim,
+                    opacity: canAdvance ? 1 : 0.4,
+                    cursor: canAdvance ? 'pointer' : 'not-allowed',
+                  }}>
+                  Next →
+                </button>
+              )}
+              {step === 4 && !saved && (
+                <button
+                  data-testid="external-fixture-save"
+                  disabled={busy}
+                  onClick={commitSave}
+                  style={_btnPrim}>
+                  {busy ? 'Saving…' : 'Add Fixture'}
+                </button>
+              )}
+              {step === 4 && saved && (
+                <button
+                  data-testid="external-fixture-done"
+                  onClick={() => { setPicker(true); setSaved(null) }}
+                  style={_btnPrim}>
+                  Done
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function _actuationStepReady(powerMode, answers, skipsActuation) {
+  if (skipsActuation) return true
+  if (powerMode === 'air') return typeof answers.hold_on_loss === 'boolean'
+  if (powerMode === 'own_controller') return typeof answers.wants_done === 'boolean'
+  return true
+}
+
+function _completionStepReady(answers) {
+  if (!answers.completion) return false
+  if (answers.completion === 'wait') {
+    const n = Number(answers.wait_s)
+    return Number.isFinite(n) && n > 0
+  }
+  return true
+}
+
+function _recordToAnswers(rec) {
+  return {
+    id: rec.id,
+    type: rec.type,
+    power_mode: rec.power_mode,
+    actuation: rec.actuation,
+    hold_on_loss: rec.hold_on_loss,
+    completion: rec.completion,
+    wait_s: rec.wait_s,
+    wants_done: !!rec.in_done,
+    name: rec.name,
+    created_at: rec.created_at,
+  }
+}
+
+// ── Steps ───────────────────────────────────────────────────────────
+
+function FixturePicker({ fixtures, onNew, onEdit, onDelete }) {
+  // Profile-aware subtitles: in OEM mode the picker row renders raw
+  // controller channels (DO3 / DI4) instead of Synapse port names.
+  const profile = useIoHardwareProfile()
+  const portmap = useSynapsePortmap()
+  return (
+    <div data-testid="external-fixture-picker">
+      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 12 }}>
+        External fixtures are things around your robot — clamps,
+        turntables, part feeders, air blasts — that the program
+        works with during a cycle.
+      </div>
+      <button
+        data-testid="external-fixture-new"
+        onClick={onNew}
+        style={{
+          ..._btnPrim, marginBottom: 12, minWidth: 200,
+        }}>
+        + Add a new fixture
+      </button>
+      {fixtures.length === 0 && (
+        <div style={{
+          padding: 14, borderRadius: 8, background: '#F9FAFB',
+          color: '#374151', fontSize: 13,
+        }}>
+          No fixtures yet. Add one to get started.
+        </div>
+      )}
+      {fixtures.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {fixtures.map((f) => (
+            <div key={f.id}
+                 data-testid="external-fixture-picker-row"
+                 data-fixture-id={f.id}
+                 style={{
+                   display: 'flex', gap: 10, alignItems: 'center',
+                   padding: '10px 12px', border: '1px solid #E5E7EB',
+                   borderRadius: 8, background: '#fff',
+                 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
+                  {f.name}
+                </div>
+                <div style={{ fontSize: 12, color: '#6B7280' }}
+                     data-testid="external-fixture-picker-row-subtitle"
+                     data-io-profile={profile}>
+                  {entrySubtitle(f, { profile, portmap })}
+                </div>
+              </div>
+              <button
+                data-testid="external-fixture-edit"
+                data-fixture-id={f.id}
+                onClick={() => onEdit(f)}
+                style={_btnGhost}>Edit</button>
+              <button
+                data-testid="external-fixture-delete"
+                data-fixture-id={f.id}
+                onClick={() => onDelete(f.id)}
+                style={{ ..._btnGhost, color: '#B91C1C',
+                          borderColor: '#FCA5A5' }}>Delete</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DeviceTypeStep({ selected, onPick }) {
+  // 2026-10-13 operator directive (continues the picker-declutter
+  // sweep landed on operation cards + EOAT tool cards): the device
+  // picker is NAME-only. The 2026-10-09 short desc line is retired
+  // here for consistency — every picker in the authoring flow
+  // (operation / EOAT / fixture) now shows the label alone, and
+  // the behavioural detail still lives in the LATER wizard steps
+  // where the questions are actually asked (PowerForkStep covers
+  // "robot tells it to go", AirActuationStep covers hold-on-loss +
+  // the safety-guard case). `t.desc` + `t.why` stay on
+  // FIXTURE_TYPES as dormant data for a future deep-link / help
+  // surface. Fixed card height keeps the grid scannable even when
+  // a label wraps across two lines on narrow tablets.
+  return (
+    <div data-testid="fixture-step-type"
+         style={{ display: 'grid', gap: 10,
+                  gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))' }}>
+      {FIXTURE_TYPE_KEYS.map((k) => {
+        const t = FIXTURE_TYPES[k]
+        const on = selected === k
+        return (
+          <button key={k}
+                  data-testid="fixture-type-card"
+                  data-type-key={k}
+                  data-selected={String(on)}
+                  onClick={() => onPick(k)}
+                  style={{
+                    textAlign: 'left', padding: '14px 16px',
+                    minHeight: 56,
+                    background: on ? '#EFF6FF' : '#fff',
+                    border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
+                    borderRadius: 8, cursor: 'pointer',
+                    fontFamily: 'inherit',
+                  }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#111827' }}>
+              {t.label}
+            </div>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function PowerForkStep({ typeDef, selected, onPick }) {
+  const options = [
+    { key: 'air',
+      label: 'The robot controls its air',
+      desc: 'The robot sends air to the device to open or close it.' },
+    { key: 'own_controller',
+      label: 'It has its own controls — the robot just tells it to go',
+      desc: 'The device runs itself. The robot sends a start signal '
+        + 'and waits for the device to finish.' },
+    { key: 'manual',
+      label: 'A person operates it',
+      desc: 'A human handles the device. The robot pauses and asks '
+        + 'the operator to press continue.' },
+  ]
+  return (
+    <div data-testid="fixture-step-power"
+         style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ fontSize: 13, color: '#374151' }}>
+        {typeDef
+          ? <>How does the <b>{typeDef.label.toLowerCase()}</b> work?</>
+          : 'How does this device work?'}
+      </div>
+      {options.map((o) => {
+        const on = selected === o.key
+        return (
+          <button key={o.key}
+                  data-testid="fixture-power-choice"
+                  data-value={o.key}
+                  data-selected={String(on)}
+                  onClick={() => onPick(o.key)}
+                  style={{
+                    textAlign: 'left', padding: '10px 12px',
+                    background: on ? '#DBEAFE' : '#fff',
+                    border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
+                    borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
+                  }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
+              {o.label}
+            </div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
+              {o.desc}
+            </div>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function AirActuationStep({ answers, onHoldChange }) {
+  const hold = answers.hold_on_loss
+  const cards = [
+    { key: true,
+      title: 'Yes — keep holding',
+      desc: 'The device holds whatever it is holding when power or '
+        + 'air is lost. Pick this if letting go would drop a part '
+        + 'or damage something.' },
+    { key: false,
+      title: 'No — let go',
+      desc: 'The device opens on its own when power or air is lost. '
+        + 'Pick this for guards or doors that should open for a '
+        + 'person to walk through.' },
+  ]
+  return (
+    <div data-testid="fixture-step-air"
+         data-preselected-hold="true"
+         style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
+        If the robot suddenly stops, should this keep holding the
+        part?
+      </div>
+      <div style={{ display: 'flex', gap: 10 }}>
+        {cards.map((c) => {
+          const on = hold === c.key
+          return (
+            <button key={String(c.key)}
+                    data-testid="fixture-hold-choice"
+                    data-value={String(c.key)}
+                    data-selected={String(on)}
+                    onClick={() => onHoldChange(c.key)}
+                    style={{
+                      flex: 1, textAlign: 'left', padding: '12px 14px',
+                      background: on
+                        ? (c.key ? '#DCFCE7' : '#DBEAFE')
+                        : '#fff',
+                      border: `1px solid ${on
+                        ? (c.key ? '#22C55E' : '#2563EB') : '#d1d5db'}`,
+                      borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
+                    }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>
+                {c.title}
+              </div>
+              <div style={{ fontSize: 12, color: '#374151', marginTop: 4 }}>
+                {c.desc}
+              </div>
+            </button>
+          )
+        })}
+      </div>
+      {hold === true && (
+        <div data-testid="fixture-hold-recommended-copy"
+             style={{
+               padding: '8px 12px', background: '#ECFDF5',
+               border: '1px solid #6EE7B7', borderRadius: 6,
+               fontSize: 12, color: '#065F46', lineHeight: 1.5,
+             }}>
+          Recommended — the part won't drop.
+        </div>
+      )}
+      <WhyExpander
+        label="Why does this matter?"
+        testId="fixture-hold-why">
+        "Yes" installs a 5/2 DS (double-solenoid) valve so the device
+        remembers its last commanded position when power drops. "No"
+        installs a 5/2 SS (single-solenoid) valve with a spring that
+        returns the device to its home position.
+      </WhyExpander>
+    </div>
+  )
+}
+
+function OwnControllerStep({ answers, onWantsDoneChange }) {
+  const wants = answers.wants_done !== false
+  return (
+    <div data-testid="fixture-step-own-controller"
+         style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
+        Does the device tell the robot when it's finished?
+      </div>
+      <div style={{ fontSize: 12, color: '#6b7280' }}>
+        The robot always sends the start signal. The device telling
+        the robot "I'm done" is a separate wire. If it doesn't, the
+        robot will wait a fixed amount of time instead.
+      </div>
+      <div style={{ display: 'flex', gap: 10 }}>
+        {[true, false].map((v) => {
+          const on = wants === v
+          return (
+            <button key={String(v)}
+                    data-testid="fixture-wants-done"
+                    data-value={String(v)}
+                    data-selected={String(on)}
+                    onClick={() => onWantsDoneChange(v)}
+                    style={{
+                      flex: 1, padding: '10px 12px',
+                      background: on ? '#DBEAFE' : '#fff',
+                      border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
+                      borderRadius: 8, cursor: 'pointer', fontWeight: 700,
+                      fontFamily: 'inherit',
+                    }}>
+              {v ? 'Yes — it sends a done signal'
+                 : 'No — the robot will wait a set time'}
+            </button>
+          )
+        })}
+      </div>
+      <WhyExpander
+        label="Which is safer?"
+        testId="fixture-wants-done-why">
+        A done signal is safer than a timer — the robot never guesses
+        whether the device finished. Pick "No" only when the device
+        has no spare output to wire back.
+      </WhyExpander>
+    </div>
+  )
+}
+
+function CompletionStep({ answers, onCompletion, onWaitS }) {
+  // 2026-10-16 operator field report: generic "How will the robot know
+  // it's finished?" copy did not fit a door (operators think of a door
+  // as reaching open/closed, not finishing). Fix: pull the completion
+  // copy from the device-type config via completionCopyFor(answers.type),
+  // which is purely data — no per-type if/else chain here. Blow-off,
+  // for example, only exposes the 'wait' option and labels it "Pulse
+  // length"; door asks "How will the robot know the door is open or
+  // closed?" with position-sensor copy.
+  const copy = completionCopyFor(answers.type)
+  const kind = answers.completion
+  const options = (copy.options || ['sensor', 'wait', 'operator'])
+    .map((key) => {
+      const entry = copy[key]
+      if (!entry) return null
+      return { key, label: entry.label, desc: entry.desc }
+    })
+    .filter(Boolean)
+  const waitEntry = copy.wait || {}
+  // 2026-10-16 operator order: preselect the SENSOR option as the
+  // default when the step first loads — it is the recommended,
+  // deterministic answer across every device type that offers one.
+  // Operators who want timed or operator-confirm can still tap those;
+  // this just makes Next ready with one less click for the common
+  // path. For types without a sensor option (blow_off, which exposes
+  // only 'wait'), fall back to the FIRST option in copy.options so
+  // the step still arrives with a choice selected. The useEffect only
+  // fires when answers.completion is nullish — navigating back to the
+  // step preserves whatever the operator previously picked.
+  const defaultKind = options.some((o) => o.key === 'sensor')
+    ? 'sensor'
+    : (options[0] && options[0].key) || null
+  useEffect(() => {
+    if (!answers.completion && defaultKind) {
+      onCompletion(defaultKind)
+    }
+    // defaultKind is stable per device type; onCompletion is a
+    // reference the parent memoises. Only re-fire when the device
+    // type changes OR when completion flips back to nullish.
+  }, [answers.completion, defaultKind, onCompletion])
+  return (
+    <div data-testid="fixture-step-completion"
+         data-device-type={String(answers.type || 'other')}
+         style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ fontSize: 13, color: '#374151' }}>
+        {copy.question}
+      </div>
+      {options.map((c) => {
+        const on = kind === c.key
+        // "Recommended" chip on the preselected default (sensor
+        // everywhere it's offered; the first option for sensor-less
+        // types like blow_off). Rendered inline with the label so the
+        // operator sees WHY the choice is already selected.
+        const isDefault = c.key === defaultKind
+        return (
+          <button key={c.key}
+                  data-testid="fixture-completion-choice"
+                  data-value={c.key}
+                  data-selected={String(on)}
+                  data-default={String(isDefault)}
+                  onClick={() => onCompletion(c.key)}
+                  style={{
+                    textAlign: 'left', padding: '10px 12px',
+                    background: on ? '#DBEAFE' : '#fff',
+                    border: `1px solid ${on ? '#2563EB' : '#d1d5db'}`,
+                    borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
+                  }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#111',
+                          display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>{c.label}</span>
+              {isDefault && (
+                <span
+                  data-testid="fixture-completion-recommended"
+                  style={{
+                    fontSize: 10, fontWeight: 700,
+                    letterSpacing: 0.4, textTransform: 'uppercase',
+                    padding: '2px 6px', borderRadius: 999,
+                    background: '#DCFCE7', color: '#166534',
+                  }}>
+                  Recommended
+                </span>
+              )}
+            </div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
+              {c.desc}
+            </div>
+          </button>
+        )
+      })}
+      {kind === 'wait' && (
+        <div data-testid="fixture-wait-field"
+             style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <label style={{ fontSize: 13, color: '#374151' }}>
+            {waitEntry.waitLabel || 'Wait time'} ({waitEntry.waitHint || 'seconds'}):
+          </label>
+          <input
+            type="number" step="0.1" min="0"
+            data-testid="fixture-wait-s"
+            value={answers.wait_s ?? ''}
+            onChange={(e) => onWaitS(e.target.value)}
+            onFocus={(e) => scrollFocusedIntoView(e.currentTarget)}
+            style={{
+              padding: '6px 10px', fontSize: 14, width: 100,
+              border: '1px solid #d1d5db', borderRadius: 6,
+              fontFamily: 'inherit',
+            }} />
+          <span style={{ fontSize: 12, color: '#6B7280' }}>
+            {waitEntry.waitHint || 'seconds'}
+          </span>
+        </div>
+      )}
+      {kind === 'sensor' && copy.sensorNote && (
+        <div style={{
+          padding: '8px 12px', background: '#FFFBEB',
+          border: '1px solid #FDE68A', borderRadius: 6,
+          fontSize: 12, color: '#92400E', lineHeight: 1.5,
+        }}>
+          {copy.sensorNote}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }) {
+  const port = fixturePortMap(record)
+  // Profile-aware wiring: the Synapse mode shows "Valve 05" / "IN 03",
+  // the OEM mode shows the controller channels (DO5, DI3). Threaded
+  // into WiringChecklist below (which also drives the imperative
+  // "Connect …" instructions) and into GuidanceBlock's glowing map.
+  const profile = useIoHardwareProfile()
+  const portmap = useSynapsePortmap()
+  return (
+    <div data-testid="fixture-step-summary"
+         data-io-profile={profile}
+         style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div>
+        <div style={{ fontSize: 12, color: '#6B7280', fontWeight: 600,
+                      textTransform: 'uppercase', letterSpacing: 0.4 }}>
+          Name
+        </div>
+        <input
+          type="text"
+          value={answers.name ?? record.name}
+          onChange={(e) => setAnswers({ ...answers, name: e.target.value })}
+          onFocus={(e) => scrollFocusedIntoView(e.currentTarget)}
+          data-testid="fixture-name-input"
+          placeholder={record.name}
+          style={{
+            marginTop: 4, padding: '8px 10px', fontSize: 14,
+            width: '100%', maxWidth: 320,
+            border: '1px solid #d1d5db', borderRadius: 6,
+            fontFamily: 'inherit',
+          }} />
+      </div>
+
+      <div style={{
+        padding: 12, background: '#F9FAFB',
+        border: '1px solid #E5E7EB', borderRadius: 8,
+        fontSize: 13, color: '#111827', lineHeight: 1.6,
+      }} data-testid="fixture-summary-record">
+        <div><b>Kind:</b> {typeLabel(record)}</div>
+        <div><b>How it works:</b> {_powerLabel(record.power_mode)}</div>
+        {record.hold_on_loss !== null && (
+          <div>
+            <b>If the robot stops:</b>{' '}
+            {record.hold_on_loss ? 'Keeps holding' : 'Lets go'}
+          </div>
+        )}
+        <div>
+          <b>Robot waits by:</b>{' '}
+          {_completionLabel(record.completion, record.wait_s)}
+        </div>
+      </div>
+
+      {/* 2026-10-16 operator order: imperative wiring instructions +
+          per-port tick-off, with type-specific signal names ("clamp
+          air line" for a vice, "door position sensor" for a door, …).
+          Reads record.valve / record.out / record.in_done — the ports
+          the shared allocator (allocateFixturePorts in fixturesData.js)
+          assigned at compile time, so the operator never picks a
+          DO/DI number. Profile-aware port names via portDisplayName
+          (Synapse vs OEM). The glowing map below (GuidanceBlock)
+          highlights the same ports — one shared component, no fork. */}
+      <WiringChecklist record={record} profile={profile} portmap={portmap} />
+
+      <GuidanceBlock port={port} />
+
+      {saved && (
+        <div data-testid="fixture-saved"
+             style={{
+               padding: '10px 12px', background: '#ECFDF5',
+               border: '1px solid #6EE7B7', borderRadius: 6,
+               color: '#065F46', fontSize: 12,
+             }}>
+          "{saved.name}" saved to Fixtures. Wire the glowing points
+          on the map.
+        </div>
+      )}
+      {error && (
+        <div style={{
+          padding: '10px 12px', background: '#FEE2E2',
+          border: '1px solid #FCA5A5', borderRadius: 6,
+          color: '#7F1D1D', fontSize: 12,
+        }}>
+          {error}
+        </div>
+      )}
+      {busy && (
+        <div style={{ fontSize: 12, color: '#6B7280' }}>Working…</div>
+      )}
+      {!record.valve && record.power_mode === 'air' && (
+        <div data-testid="fixture-no-spare-valve"
+             style={{
+               padding: '10px 12px', background: '#FEF3C7',
+               border: '1px solid #FDE68A', borderRadius: 6,
+               color: '#92400E', fontSize: 12,
+             }}>
+          No spare air slots left on the controller. Remove an
+          unused tool or fixture to free one up, then come back.
+        </div>
+      )}
+    </div>
+  )
+}
+
+// 2026-10-16 WiringChecklist — the operator-facing "Connect X to Y"
+// panel the Summary step renders at the end of fixture setup. Reads
+// the ports the shared allocator (allocateFixturePorts) assigned to
+// this record; names each signal in the device's own terms via
+// wiringLabelsFor(record.type); surfaces profile-aware port names
+// (Synapse Valve 05 / IN 03, or OEM DO5 / DI3) via portDisplayName.
+// Per-port tick-off is local component state — not persisted on the
+// record (it's just operator working memory while they wire).
+function WiringChecklist({ record, profile, portmap }) {
+  const [done, setDone] = useState({})
+  if (!record) return null
+  const labels = wiringLabelsFor(record.type)
+  const rows = []
+  if (record.valve) {
+    // 2026-10-16 operator order: when a TYPED valve requirement
+    // (hold-on-loss vice → 5/2 DS, vacuum → HI/LO 3/2 N/C, …) lands
+    // on a SPARE slot because every dedicated matching slot was
+    // already claimed, surface a plain-copy warning. The spare must
+    // be physically fitted with the right valve class or the typed
+    // behavior won't actually happen. (wasAllocatedAsSpare returns
+    // false when valve_type is null — e.g. an "other"/custom fixture
+    // whose actuation didn't resolve to a specific class.)
+    rows.push({
+      key:  record.valve,
+      kind: 'valve',
+      label: labels.valve,
+      port:  portDisplayName(record.valve, { profile, portmap }),
+      spareWarning: wasAllocatedAsSpare(record.valve, record.valve_type)
+        ? record.valve_type
+        : null,
+    })
+  }
+  if (record.out) {
+    rows.push({
+      key:  record.out,
+      kind: 'out',
+      label: labels.out,
+      port:  portDisplayName(record.out, { profile, portmap }),
+      spareWarning: null,
+    })
+  }
+  if (record.in_done) {
+    rows.push({
+      key:  record.in_done,
+      kind: 'in_done',
+      label: labels.in_done,
+      port:  portDisplayName(record.in_done, { profile, portmap }),
+      spareWarning: null,
+    })
+  }
+  if (rows.length === 0) return null
+  const toggle = (k) => setDone((prev) => ({ ...prev, [k]: !prev[k] }))
+  return (
+    <div
+      data-testid="fixture-wiring-checklist"
+      data-io-profile={profile}
+      data-row-count={String(rows.length)}
+      style={{
+        padding: 12,
+        background: '#EFF6FF', border: '1px solid #BFDBFE',
+        borderRadius: 8,
+        display: 'flex', flexDirection: 'column', gap: 10,
+      }}>
+      <div style={{
+        fontSize: 12, fontWeight: 700, color: '#1E3A8A',
+        textTransform: 'uppercase', letterSpacing: 0.4,
+      }}>
+        Wire these ports
+      </div>
+      {rows.map((row) => {
+        const checked = !!done[row.key]
+        return (
+          <label
+            key={row.key}
+            data-testid="fixture-wiring-row"
+            data-port-kind={row.kind}
+            data-port-id={row.key}
+            data-connected={String(checked)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 12,
+              padding: '8px 10px',
+              background: checked ? '#DCFCE7' : '#fff',
+              border: `1px solid ${checked ? '#86EFAC' : '#BFDBFE'}`,
+              borderRadius: 6, cursor: 'pointer',
+              fontSize: 13, color: '#111827',
+            }}>
+            <input
+              type="checkbox" checked={checked}
+              onChange={() => toggle(row.key)}
+              data-testid="fixture-wiring-connected"
+              style={{ transform: 'scale(1.3)' }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600 }}>
+                Connect {record.name}&rsquo;s {row.label} to{' '}
+                <span style={{ color: '#1E3A8A' }}>{row.port}</span>
+              </div>
+              {row.spareWarning && (
+                <div
+                  data-testid="fixture-wiring-spare-warning"
+                  data-required-valve-type={row.spareWarning}
+                  style={{
+                    marginTop: 4, padding: '6px 8px',
+                    background: '#FFFBEB', border: '1px solid #FCD34D',
+                    borderRadius: 4,
+                    fontSize: 11, color: '#92400E', fontWeight: 600,
+                  }}>
+                  This is a SPARE slot — fit a {row.spareWarning} valve
+                  there, or the {record.name} won&rsquo;t behave as
+                  configured. (The panel&rsquo;s dedicated{' '}
+                  {row.spareWarning} slot is already taken by another
+                  tool or fixture.)
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }}>
+                Tap when connected
+              </div>
+            </div>
+          </label>
+        )
+      })}
+    </div>
+  )
+}
+
+function _powerLabel(pm) {
+  if (pm === 'air') return 'The robot controls its air'
+  if (pm === 'own_controller') return 'It has its own controls — the robot tells it to go'
+  if (pm === 'manual') return 'A person operates it'
+  return '—'
+}
+
+function _completionLabel(kind, waitS) {
+  if (kind === 'sensor') return 'A sensor tells it'
+  if (kind === 'wait') return `Waiting ${waitS ?? '?'} s`
+  if (kind === 'operator') return 'A person will press continue'
+  return '—'
+}
+
+// ── Styles (local module tokens; no page-level styling) ─────────────
+
+const _backdrop = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+  zIndex: 9998, display: 'flex', alignItems: 'center',
+  justifyContent: 'center',
+  ...kbSafeOverlayStyle(),
+}
+const _panel = {
+  background: '#fff', borderRadius: 12,
+  padding: 24, width: 'min(960px, 96vw)',
+  boxShadow: '0 20px 40px rgba(0,0,0,0.3)',
+  fontFamily: 'inherit',
+  // Shared keyboard-safe sizing — the one snippet every prompt /
+  // modal / wizard container spreads to stay above the on-screen
+  // keyboard on tablet. See lib/keyboardInset.kbSafeModalContentStyle.
+  ...kbSafeModalContentStyle(),
+}
+const _title = {
+  fontSize: 20, fontWeight: 700, marginBottom: 12, color: '#111827',
+}
+const _headerRow = {
+  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+}
+const _topRow = {
+  display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14,
+}
+const _footerRow = {
+  display: 'flex', gap: 8, alignItems: 'center', marginTop: 14,
+}
+const _btnPrim = {
+  padding: '10px 18px', fontSize: 14, fontWeight: 700,
+  background: '#0284c7', color: '#fff', border: '1px solid #0369a1',
+  borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit',
+}
+const _btnGhost = {
+  padding: '10px 16px', fontSize: 14, fontWeight: 600,
+  background: '#fff', color: '#374151',
+  border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+  fontFamily: 'inherit',
+}

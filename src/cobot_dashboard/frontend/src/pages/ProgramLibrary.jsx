@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useStore } from '../store/useStore'
+import { loadProgramFlow } from '../lib/loadProgramFlow'
+import ConfirmModal from '../components/ConfirmModal'
 
 // ---------------------------------------------------------------------------
 // Program Library — file-explorer style grid view
@@ -223,7 +225,8 @@ function ProgramTile({ prog, onClick, folderName, cellName }) {
   )
 }
 
-function ProgramDetailsModal({ prog, onClose, onEdit, onDuplicate, onDelete }) {
+function ProgramDetailsModal({ prog, onClose, onLoadToMonitor, onEdit,
+                               onDuplicate, onDelete, loading }) {
   if (!prog) return null
   return (
     <div
@@ -274,13 +277,28 @@ function ProgramDetailsModal({ prog, onClose, onEdit, onDuplicate, onDelete }) {
         </div>
 
         <div style={{ display: 'flex', gap: 8, marginTop: 24, flexWrap: 'wrap' }}>
-          <button onClick={() => onEdit(prog.id)}
+          {/* Primary action: LOAD (not run) — pushes the program to
+              the controller via push_only and navigates to Monitor.
+              Motion still requires the operator to tap Run on the
+              Monitor screen. Never bare "Run" on a button that
+              doesn't run. */}
+          <button onClick={() => onLoadToMonitor(prog)}
+                  disabled={loading}
+                  style={{
+                    ...modalBtn('#16A34A', '#fff', '#15803d'),
+                    flex: '1 1 100%',
+                    opacity: loading ? 0.7 : 1,
+                    cursor: loading ? 'wait' : 'pointer',
+                  }}>
+            {loading ? 'Loading…' : 'Load to Monitor →'}
+          </button>
+          <button onClick={() => onEdit(prog.id)} disabled={loading}
                   style={modalBtn('#eff6ff', '#2563EB', '#bfdbfe')}>Edit</button>
-          <button onClick={() => onDuplicate(prog.id)}
+          <button onClick={() => onDuplicate(prog.id)} disabled={loading}
                   style={modalBtn('#f3f4f6', '#374151', '#d1d5db')}>Duplicate</button>
-          <button onClick={() => onDelete(prog.id)}
+          <button onClick={() => onDelete(prog.id)} disabled={loading}
                   style={modalBtn('#fef2f2', '#DC2626', '#fecaca')}>Delete</button>
-          <button onClick={onClose}
+          <button onClick={onClose} disabled={loading}
                   style={modalBtn('#fff', '#6b7280', '#d1d5db')}>Close</button>
         </div>
       </div>
@@ -314,10 +332,30 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   const [rootDragOver, setRootDragOver]     = useState(false)
   const [error, setError]                   = useState(null)
   const [foldersHydrated, setFoldersHydrated] = useState(false)
+  const [loadingToMonitor, setLoadingToMonitor] = useState(false)
+  // 2026-10-15 operator directive: destructive confirms (delete program,
+  // delete folder) run through the app-theme ConfirmModal — same shape
+  // Enable / Orient / profile-switch use (import-identity, no fork).
+  // The pendingDelete record describes what to delete; the modal reads
+  // `kind` to render the right copy and `onConfirm` dispatches to the
+  // matching doDelete* helper. Null → modal closed.
+  //
+  // Shapes:
+  //   { kind: 'program', progId, name, isResident }
+  //   { kind: 'folder',  folderId, name }
+  const [pendingDelete, setPendingDelete] = useState(null)
 
   const setLoadedProgram = useStore((s) => s.setLoadedProgram)
   const setTab           = useStore((s) => s.setTab)
   const addToast         = useStore((s) => s.addToast)
+  const currentProgramId = useStore((s) => s.currentProgram?.id)
+  const setCurrentProgram = useStore((s) => s.setCurrentProgram)
+  const clearCurrentProgram = useStore((s) => s.clearCurrentProgram)
+  // Resident-program mirror from the server (D9 line_map wire). If
+  // the deleted program equals this, the confirm dialog surfaces the
+  // controller-keeps-its-copy warning; the run gate then refuses with
+  // outcome.kind='resident_deleted' until another program is pushed.
+  const residentProgramId = useStore((s) => s.robot?.program?.resident_program_id)
 
   // Fetch folders (and refresh programs / cells via the store) on
   // mount. App-level hydration already kicked off programs + cells
@@ -359,6 +397,41 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
     }
   }, [programs, selectedProgram])
 
+  // Load-to-Monitor primary action (2026-09-04). Routes through the
+  // SAME lib/loadProgramFlow helper Monitor's Change Program overlay
+  // uses — one loader, not a second parallel implementation. Never
+  // publishes `run` or motion verbs; only push_only:true. On success
+  // we close the detail modal and navigate to the Monitor tab so the
+  // operator sees the loaded program, its steps, taught-pose status,
+  // and speed. Run remains exclusively the Monitor screen's Run
+  // button.
+  async function loadToMonitor(prog) {
+    if (!prog || !prog.id) return
+    setLoadingToMonitor(true)
+    try {
+      const result = await loadProgramFlow({
+        programId:         prog.id,
+        programLabel:      prog.name || prog.id,
+        setCurrentProgram,
+        addToast,
+        // No pushingProgramName setter here — the Monitor tab has its
+        // own local state for that pill. Library-triggered loads
+        // navigate immediately; a subsequent push during Monitor's
+        // mount lifecycle is not what fires it.
+      })
+      // Navigate regardless of push outcome. If refused, the toast
+      // explains why; the program is still loaded locally per the
+      // 184ada3 commit-regardless rule — the operator sees it in
+      // Monitor and can hit Push if the refusal was transient.
+      if (result && (result.ok || result.program)) {
+        setSelectedProgram(null)
+        setTab('monitor')
+      }
+    } finally {
+      setLoadingToMonitor(false)
+    }
+  }
+
   async function editProgram(progId) {
     try {
       const res = await fetch('/api/programs/' + encodeURIComponent(progId))
@@ -385,11 +458,32 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
     }
   }
 
-  async function deleteProgram(progId) {
-    if (!confirm('Delete this program?')) return
+  // Opens the app-theme ConfirmModal for a delete; the actual DELETE
+  // fetch happens in doDeleteProgram, called from the modal's onConfirm.
+  // Splitting is deliberate: the modal has its own render/mount cycle,
+  // and keeping the API call in a dedicated helper means ONLY the Delete
+  // button fires it (behavior-identical to the retired confirm() guard).
+  function deleteProgram(progId) {
+    const row = (programs || []).find((p) => p.id === progId)
+    const name = (row && row.name) || progId
+    const isResident = !!(residentProgramId && residentProgramId === progId)
+    setPendingDelete({ kind: 'program', progId, name, isResident })
+  }
+
+  async function doDeleteProgram(progId) {
     try {
       const res = await fetch('/api/programs/' + encodeURIComponent(progId), { method: 'DELETE' })
       if (!res.ok) throw new Error('HTTP ' + res.status)
+      // Clear the currentProgram slot if it referred to the deleted
+      // id — otherwise the editor tab keeps showing a ghost that
+      // Save/Push would either re-create the file or 404 against.
+      // 2026-10-15: route through the shared clearCurrentProgram()
+      // action so Library delete + hydratePrograms reconcile share
+      // the same empty-program shape (de-dupes the inline literal
+      // that previously lived here, closes the drift risk).
+      if (currentProgramId && currentProgramId === progId) {
+        clearCurrentProgram()
+      }
       load()
     } catch (e) {
       addToast('Delete failed: ' + (e.message || e), 'error')
@@ -421,8 +515,15 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
     } catch {}
   }
 
-  async function deleteFolder(folderId) {
-    if (!confirm('Delete this folder? Programs inside will be moved to the root level.')) return
+  // Folder delete — same ConfirmModal path as deleteProgram. Opens the
+  // modal with the folder's name; doDeleteFolder fires on confirm.
+  function deleteFolder(folderId) {
+    const f = (folders || []).find((x) => x.id === folderId)
+    const name = (f && f.name) || folderId
+    setPendingDelete({ kind: 'folder', folderId, name })
+  }
+
+  async function doDeleteFolder(folderId) {
     try {
       await fetch('/api/folders/' + encodeURIComponent(folderId), { method: 'DELETE' })
       if (currentFolder === folderId) setCurrentFolder(null)
@@ -669,10 +770,46 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
 
       <ProgramDetailsModal
         prog={selectedProgram}
+        loading={loadingToMonitor}
         onClose={() => setSelectedProgram(null)}
+        onLoadToMonitor={loadToMonitor}
         onEdit={editProgram}
         onDuplicate={duplicateProgram}
         onDelete={deleteProgram}
+      />
+
+      {/* 2026-10-15 operator directive: destructive-action confirms
+          (delete program, delete folder) render the shared app-theme
+          ConfirmModal — same shell + tokens + keyboard contract as
+          Enable / Orient / profile-switch. Native window.confirm is
+          retired from this page's delete path. Plain operator copy:
+          names the item, no file-system jargon (".json", ".deleted"),
+          no implementation detail. Danger-red primary; Cancel + Escape
+          dismiss without firing the DELETE. */}
+      <ConfirmModal
+        open={!!pendingDelete}
+        danger
+        testIdPrefix={pendingDelete?.kind === 'folder'
+          ? 'folder-delete-confirm'
+          : 'program-delete-confirm'}
+        title={pendingDelete?.kind === 'folder'
+          ? 'Delete this folder?'
+          : 'Delete this program?'}
+        body={pendingDelete?.kind === 'folder'
+          ? `Delete "${pendingDelete?.name}"? Programs inside this folder will move to the root level.`
+          : (pendingDelete?.isResident
+            ? `Delete "${pendingDelete?.name}"? This program is currently loaded on the robot — the robot keeps its copy until you load a different program, but it will no longer appear in your library and Run will refuse to fire against it.`
+            : `Delete "${pendingDelete?.name}"? This program will be removed from your library. It can be recovered if needed — ask support.`)}
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          const target = pendingDelete
+          setPendingDelete(null)
+          if (!target) return
+          if (target.kind === 'folder')  doDeleteFolder(target.folderId)
+          if (target.kind === 'program') doDeleteProgram(target.progId)
+        }}
       />
     </div>
   )

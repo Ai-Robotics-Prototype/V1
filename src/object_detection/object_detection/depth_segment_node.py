@@ -2725,7 +2725,18 @@ class DepthSegmentNode(Node):
                 o['_holes']            = []
                 o['_match_reason']     = ''
                 o['_match_source']     = ''
-        else:
+        elif self._detection_mode == 'library':
+            # Identity matching is a Library-Parts-mode feature. In All
+            # Objects mode (default) the matcher does NOT run — every
+            # detection is published with match fields left as their
+            # dataclass defaults (part_name=None, match_score=0.0, …)
+            # and the annotated overlay uses the generic-detection
+            # renderer. This is the "actually not executing the
+            # identity stack" contract restored 2026-07-27; previously
+            # the matcher ran every frame and _publish filtered its
+            # output for display, which was the single biggest per-
+            # frame cost and coupled every detection to a library
+            # score the operator did not ask for.
             self._match_parts(stable)
         # Keep the latest stable list around so a teach command can
         # capture the user's chosen detection without needing the
@@ -4958,9 +4969,111 @@ class DepthSegmentNode(Node):
                 pos = end
                 on = not on
 
+    def _publish_annotated_generic(self, objects, h, w, rgb):
+        """June-2 generic-detection overlay (2026-07-27 restore).
+
+        The All Objects mode renderer — used when identity matching is
+        gated off. Draws exactly what the RoboAi-era Monitor photo
+        shows: a distance-coloured 2D bbox rectangle + a cyan projected
+        3D OBB wireframe (from the 8 3D corners in `o['corners']`) + a
+        cyan orientation arrow at the bbox centre pointing along the
+        OBB's yaw + a distance / size / yaw text label in a solid
+        colour band above the bbox. No pills, no dashes, no five-state
+        colour code — every object is treated as an anonymous detection
+        because the matcher has not run.
+
+        Interfaces preserved: publishes to the same `/perception/
+        annotated` topic, uses the same image dimensions + encoding
+        as the identity overlay, so the dashboard consumer needs no
+        change.
+        """
+        img = PILImage.fromarray(rgb.copy(), 'RGB')
+        draw = ImageDraw.Draw(img)
+        for o in objects:
+            x0, y0, x1, y1 = o['bbox_px']
+            px, py, pz = o['pos']
+            sx, sy, sz = o['size_3d']
+            roll, pitch, yaw = o['euler']
+            col = self._dist_color(pz)
+
+            # 2D bbox — plain rectangle, distance-coloured.
+            draw.rectangle([x0, y0, x1, y1], outline=col, width=3)
+
+            # Cyan projected 3D OBB wireframe. When the object's fit
+            # collapsed to an AABB fallback, `obb` will be False and
+            # we skip the wireframe (the 2D bbox is sufficient).
+            if o.get('obb') and o.get('corners') is not None:
+                proj = self._project(o['corners'], w, h)
+                if proj is not None:
+                    self._draw_obb_wireframe(draw, proj, (0, 220, 255))
+
+            # Cyan orientation arrow at bbox centre. The image-frame
+            # angle IS the OBB's yaw component (rotation about the
+            # camera Z = optical axis = image normal) so we can point
+            # the arrow with sin/cos of yaw directly.
+            yaw_deg = yaw * 180.0 / math.pi
+            cx_box = (x0 + x1) * 0.5
+            cy_box = (y0 + y1) * 0.5
+            arrow_len = max(x1 - x0, y1 - y0) * 0.4
+            ex = cx_box + arrow_len * math.cos(yaw)
+            ey = cy_box + arrow_len * math.sin(yaw)
+            cyan = (0, 220, 255)
+            draw.line([(cx_box, cy_box), (ex, ey)], fill=cyan, width=2)
+            head = max(6.0, arrow_len * 0.20)
+            for a in (yaw + 2.6, yaw - 2.6):
+                draw.line([(ex, ey),
+                           (ex - head * math.cos(a), ey - head * math.sin(a))],
+                          fill=cyan, width=2)
+
+            # Distance / size / yaw label above the bbox in a solid
+            # colour band. `sz` is intentionally omitted from the size
+            # readout — the yaw-only OBB collapses vertical extent to
+            # a single number, and the two-XY-dim read is what the
+            # operator scans for.
+            w_cm = int(round(sx * 100))
+            h_cm = int(round(sy * 100))
+            label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
+            label_font = _ANNOT_FONT_SMALL
+            bbox_text = draw.textbbox((0, 0), label, font=label_font)
+            tw = bbox_text[2] - bbox_text[0] + 8
+            th = bbox_text[3] - bbox_text[1] + 6
+            # Prefer above the bbox; when clipped at the top, drop
+            # below. Edge-aware horizontal clamp so a bbox flush to
+            # the right edge doesn't push the label off-image.
+            label_y = y0 - th - 2
+            if label_y < 0:
+                label_y = min(h - th, y1 + 2)
+            label_x = max(0, min(int(x0), w - tw))
+            draw.rectangle([label_x, label_y, label_x + tw, label_y + th], fill=col)
+            draw.text((label_x + 4, label_y + 2), label,
+                      fill=(255, 255, 255), font=label_font)
+
+        msg = Image()
+        msg.header.stamp = (self._depth_hdr.stamp if self._depth_hdr
+                            else self.get_clock().now().to_msg())
+        msg.header.frame_id = self.frame_id
+        msg.height = h
+        msg.width = w
+        msg.encoding = 'rgb8'
+        msg.step = w * 3
+        msg.data = img.tobytes()
+        self.ann_pub.publish(msg)
+
     def _publish_annotated(self, objects, h, w):
         rgb = self._color_rgb
         if rgb is None or rgb.shape[0] != h or rgb.shape[1] != w:
+            return
+        # Mode-branched overlay (2026-07-27 restore). In All Objects
+        # mode (the default) render the June-2 generic-detection
+        # overlay: 2D bbox in distance-color + cyan projected 3D OBB
+        # wireframe + cyan orientation arrow + distance/size/yaw
+        # label. In Library Parts mode (or teach) keep the current
+        # pill/dashed/colored identity overlay because that mode's
+        # value is exactly the identity signals. Teach mode always
+        # routes through the identity renderer so the teach-green
+        # box + capture affordance keeps working.
+        if self._detection_mode != 'library' and not self._teach_mode:
+            self._publish_annotated_generic(objects, h, w, rgb)
             return
         img = PILImage.fromarray(rgb.copy(), 'RGB')
         draw = ImageDraw.Draw(img)
