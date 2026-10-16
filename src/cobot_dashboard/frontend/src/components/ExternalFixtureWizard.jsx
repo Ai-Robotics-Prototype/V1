@@ -6,6 +6,7 @@ import {
   compileFixtureRecord, fixturePortMap, completionCopyFor,
   isPowerFixed, wiringLabelsFor,
 } from '../lib/fixturesData'
+import { wasAllocatedAsSpare } from '../lib/valveMapping'
 import {
   listFixtures, saveFixture, removeFixture,
 } from '../lib/fixturesStore'
@@ -917,11 +918,22 @@ function WiringChecklist({ record, profile, portmap }) {
   const labels = wiringLabelsFor(record.type)
   const rows = []
   if (record.valve) {
+    // 2026-10-16 operator order: when a TYPED valve requirement
+    // (hold-on-loss vice → 5/2 DS, vacuum → HI/LO 3/2 N/C, …) lands
+    // on a SPARE slot because every dedicated matching slot was
+    // already claimed, surface a plain-copy warning. The spare must
+    // be physically fitted with the right valve class or the typed
+    // behavior won't actually happen. (wasAllocatedAsSpare returns
+    // false when valve_type is null — e.g. an "other"/custom fixture
+    // whose actuation didn't resolve to a specific class.)
     rows.push({
       key:  record.valve,
       kind: 'valve',
       label: labels.valve,
       port:  portDisplayName(record.valve, { profile, portmap }),
+      spareWarning: wasAllocatedAsSpare(record.valve, record.valve_type)
+        ? record.valve_type
+        : null,
     })
   }
   if (record.out) {
@@ -930,6 +942,7 @@ function WiringChecklist({ record, profile, portmap }) {
       kind: 'out',
       label: labels.out,
       port:  portDisplayName(record.out, { profile, portmap }),
+      spareWarning: null,
     })
   }
   if (record.in_done) {
@@ -938,6 +951,7 @@ function WiringChecklist({ record, profile, portmap }) {
       kind: 'in_done',
       label: labels.in_done,
       port:  portDisplayName(record.in_done, { profile, portmap }),
+      spareWarning: null,
     })
   }
   if (rows.length === 0) return null
@@ -986,6 +1000,23 @@ function WiringChecklist({ record, profile, portmap }) {
                 Connect {record.name}&rsquo;s {row.label} to{' '}
                 <span style={{ color: '#1E3A8A' }}>{row.port}</span>
               </div>
+              {row.spareWarning && (
+                <div
+                  data-testid="fixture-wiring-spare-warning"
+                  data-required-valve-type={row.spareWarning}
+                  style={{
+                    marginTop: 4, padding: '6px 8px',
+                    background: '#FFFBEB', border: '1px solid #FCD34D',
+                    borderRadius: 4,
+                    fontSize: 11, color: '#92400E', fontWeight: 600,
+                  }}>
+                  This is a SPARE slot — fit a {row.spareWarning} valve
+                  there, or the {record.name} won&rsquo;t behave as
+                  configured. (The panel&rsquo;s dedicated{' '}
+                  {row.spareWarning} slot is already taken by another
+                  tool or fixture.)
+                </div>
+              )}
               <div style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }}>
                 Tap when connected
               </div>

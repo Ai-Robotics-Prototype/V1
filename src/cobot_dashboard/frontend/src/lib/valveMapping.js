@@ -136,3 +136,22 @@ export function slotAcceptsType(slotId, requiredType) {
   if (t === requiredType) return true
   return /^SPARE/.test(t)
 }
+
+// 2026-10-16 operator order: when a TYPED valve requirement
+// (requiredType non-null) is allocated to a SPARE slot — because
+// every dedicated matching slot was already claimed — the operator
+// must physically fit the right valve class at that spare, or the
+// typed behavior (e.g. hold-on-loss for a vice) won't actually
+// happen. Returns true in that risk condition so the wizard UI
+// can surface a plain-copy warning next to the port assignment.
+// A spare that lands a null-requirement allocation is NOT a risk
+// (the operator picked the spare on purpose for a flexible slot).
+export function wasAllocatedAsSpare(slotId, requiredType) {
+  if (!requiredType) return false
+  const slot = VALVE_SLOTS.find((s) => s.id === slotId)
+  if (!slot) return false
+  if (!isSpareSlot(slot)) return false
+  // The slot IS a spare AND there's a specific typed requirement →
+  // operator must fit the right valve class there.
+  return true
+}

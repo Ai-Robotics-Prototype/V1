@@ -26,6 +26,7 @@ import {
   CAPABILITY_CATALOG as _CAPABILITY_CATALOG,
   capabilityDef, actuatorsFromCapabilities,
 } from '../lib/eoatCapabilities'
+import { wasAllocatedAsSpare } from '../lib/valveMapping'
 
 // Standalone EOAT Setup wizard.
 //
@@ -1296,20 +1297,47 @@ function CustomEOATFlow({
             <div><b>Does:</b> {actuators.length}{' '}
               thing{actuators.length === 1 ? '' : 's'}
             </div>
-            {(resolved.actuators || []).map((a, i) => (
-              <div key={i} data-testid="custom-eoat-summary-actuator"
-                   style={{ marginLeft: 12 }}>
-                • {a.label}{a.valve ? ` → wire to ${portDisplayName(a.valve, _portOpts)}` : ''}
-                {a.type === 'double_acting'
-                  && (a.hold_on_loss
-                       ? ' (keeps holding on power loss)'
-                       : ' (lets go on power loss)')}
-                {a.type === 'vacuum' && a.holds_via === 'check_valve'
-                  && ' (keeps holding on air loss)'}
-                {a.type === 'vacuum' && a.holds_via !== 'check_valve'
-                  && ' (lets go on air loss)'}
-              </div>
-            ))}
+            {(resolved.actuators || []).map((a, i) => {
+              // 2026-10-16 operator order: if a typed valve requirement
+              // landed on a SPARE slot (because the panel's dedicated
+              // matching slot was already claimed), surface a warning
+              // next to the per-actuator wire-to line. Operator must
+              // physically fit the right valve class at that spare.
+              const spareReq = a.valve && a.recommended_valve_type
+                && wasAllocatedAsSpare(a.valve, a.recommended_valve_type)
+                ? a.recommended_valve_type
+                : null
+              return (
+                <div key={i} data-testid="custom-eoat-summary-actuator"
+                     style={{ marginLeft: 12 }}>
+                  • {a.label}{a.valve ? ` → wire to ${portDisplayName(a.valve, _portOpts)}` : ''}
+                  {a.type === 'double_acting'
+                    && (a.hold_on_loss
+                         ? ' (keeps holding on power loss)'
+                         : ' (lets go on power loss)')}
+                  {a.type === 'vacuum' && a.holds_via === 'check_valve'
+                    && ' (keeps holding on air loss)'}
+                  {a.type === 'vacuum' && a.holds_via !== 'check_valve'
+                    && ' (lets go on air loss)'}
+                  {spareReq && (
+                    <div
+                      data-testid="custom-eoat-summary-spare-warning"
+                      data-required-valve-type={spareReq}
+                      style={{
+                        marginTop: 4, padding: '6px 8px',
+                        background: '#FFFBEB', border: '1px solid #FCD34D',
+                        borderRadius: 4,
+                        fontSize: 11, color: '#92400E', fontWeight: 600,
+                      }}>
+                      This is a SPARE slot — fit a {spareReq} valve there,
+                      or {a.label} won&rsquo;t behave as configured.
+                      (The panel&rsquo;s dedicated {spareReq} slot is
+                      already taken by another tool or fixture.)
+                    </div>
+                  )}
+                </div>
+              )
+            })}
             <div><b>Sensors:</b> {sensorCount}
               {resolved.required_inputs.length > 0
                 && ` → wire to ${portListDisplay(resolved.required_inputs, ', ', _portOpts)}`}
