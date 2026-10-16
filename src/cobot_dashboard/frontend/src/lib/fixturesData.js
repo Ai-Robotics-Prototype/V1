@@ -132,6 +132,11 @@ export const FIXTURE_TYPES = Object.freeze({
     // is skipped for this type and power_mode is auto-set to 'air'
     // from `defaults.power_mode`. See isPowerFixed() below.
     power_fixed: true,
+    // 2026-10-16: type-specific wiring labels — the Summary step
+    // renders "Connect the vice's clamp air line to VALVE 05" (not
+    // the generic "air line") so the operator sees the signal in
+    // their own words.
+    wiring_labels: { valve: 'clamp air line', in_done: 'clamp sensor' },
     defaults: {
       power_mode: 'air',
       air_actuation: 'double',
@@ -175,6 +180,7 @@ export const FIXTURE_TYPES = Object.freeze({
     key: 'indexer', label: 'Rotary Table / Indexer',
     desc: 'Spins to a new position.',
     icon: 'indexer',
+    wiring_labels: { out: 'index START signal', in_done: 'in-position sensor' },
     defaults: {
       power_mode: 'own_controller',
       hold_on_loss: null,
@@ -215,6 +221,7 @@ export const FIXTURE_TYPES = Object.freeze({
     key: 'feeder', label: 'Part Feeder / Conveyor',
     desc: 'Delivers the next part.',
     icon: 'feeder',
+    wiring_labels: { out: 'feed START signal', in_done: 'part-present sensor' },
     defaults: {
       power_mode: 'own_controller',
       hold_on_loss: null,
@@ -258,6 +265,7 @@ export const FIXTURE_TYPES = Object.freeze({
     icon: 'blow_off',
     // Blow-off is pneumatic by name — skip the power question.
     power_fixed: true,
+    wiring_labels: { valve: 'blow-off air line' },
     defaults: {
       power_mode: 'air',
       air_actuation: 'blow_off',
@@ -291,6 +299,10 @@ export const FIXTURE_TYPES = Object.freeze({
     icon: 'door',
     // Door / slide is always pneumatic — skip the power question.
     power_fixed: true,
+    wiring_labels: {
+      valve:   'door air line',
+      in_done: 'door position sensor',
+    },
     defaults: {
       power_mode: 'air',
       air_actuation: 'double',
@@ -373,6 +385,34 @@ export function completionCopyFor(type) {
 export function isPowerFixed(type) {
   const def = FIXTURE_TYPES[type]
   return !!(def && def.power_fixed === true)
+}
+
+// 2026-10-16 operator order: at the end of fixture setup the wizard
+// must TELL the operator — in device-specific terms — which Synapse
+// ports to wire everything to. Each FIXTURE_TYPES entry carries a
+// wiring_labels sub-object whose keys line up with the record's port
+// fields (valve, out, in_done). CompletionCopyFor-style data-driven
+// path, no per-type if/else in the UI.
+//
+// Shape:
+//   wiring_labels: {
+//     valve?:   string,   // e.g. "clamp air line" (vice)
+//     out?:     string,   // e.g. "START signal" (feeder)
+//     in_done?: string,   // e.g. "clamp sensor" (vice)
+//   }
+const _GENERIC_WIRING = Object.freeze({
+  valve:   'air line',
+  out:     'START signal',
+  in_done: 'done sensor',
+})
+export function wiringLabelsFor(type) {
+  const def = FIXTURE_TYPES[type]
+  if (def && def.wiring_labels) {
+    // Spread onto _GENERIC_WIRING so a partial override still gets
+    // sensible defaults for the keys it didn't define.
+    return { ..._GENERIC_WIRING, ...def.wiring_labels }
+  }
+  return _GENERIC_WIRING
 }
 
 export const FIXTURE_TYPE_KEYS = Object.freeze(
@@ -596,17 +636,23 @@ export function fixturePortMap(rec) {
   const required_valves = rec.valve ? [rec.valve] : []
   const required_outputs = rec.out ? [rec.out] : []
   const required_inputs = rec.in_done ? [rec.in_done] : []
+  // 2026-10-16 operator order: callouts now name the signal in the
+  // device's OWN terms via wiringLabelsFor(rec.type). A vice's valve
+  // reads "Connect Vice 1's clamp air line to V05" instead of the
+  // generic "air line"; a door's in_done reads "Wire Door 1's door
+  // position sensor to IN03".
+  const labels = wiringLabelsFor(rec.type)
   if (rec.valve) {
     callouts[rec.valve] =
-      `Connect ${rec.name}'s air line to ${rec.valve}`
+      `Connect ${rec.name}'s ${labels.valve} to ${rec.valve}`
   }
   if (rec.out) {
     callouts[rec.out] =
-      `Wire ${rec.name}'s START input to ${rec.out}`
+      `Wire ${rec.name}'s ${labels.out} to ${rec.out}`
   }
   if (rec.in_done) {
     callouts[rec.in_done] =
-      `Wire ${rec.name}'s DONE sensor to ${rec.in_done}`
+      `Wire ${rec.name}'s ${labels.in_done} to ${rec.in_done}`
   }
   return {
     key: `fixture:${rec.id || rec.name}`,

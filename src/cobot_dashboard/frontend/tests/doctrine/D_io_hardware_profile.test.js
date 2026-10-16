@@ -614,9 +614,13 @@ test('ExternalFixtureWizard threads {profile, portmap} through its displays', ()
     v('FixturePicker row subtitle must call entrySubtitle(f, '
       + '{profile, portmap}) — the profile-aware path.'))
   assert.ok(
-    /portDisplayName\(id,\s*\{\s*profile,\s*portmap\s*\}\)/.test(extFixSrc),
-    v('SummaryStep "wire ... to" rows must route through '
-      + 'portDisplayName(id, {profile, portmap}).'))
+    /portDisplayName\([^,]+,\s*\{\s*profile,\s*portmap\s*\}\)/.test(extFixSrc),
+    v('SummaryStep\'s port-display path must route through '
+      + 'portDisplayName(<id>, {profile, portmap}) — the WiringChecklist '
+      + '(2026-10-16) calls it per-port for the imperative "Connect …" '
+      + 'rows. (Pre-2026-10-16 the Summary\'s "wire … to" literals '
+      + 'called _port(record.valve) directly; those were replaced by '
+      + 'the WiringChecklist panel.)'))
 })
 
 test('EOATSetupWizard custom summary + SavedScreen are profile-aware', () => {

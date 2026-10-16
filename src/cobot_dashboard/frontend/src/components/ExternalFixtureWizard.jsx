@@ -4,7 +4,7 @@ import WhyExpander from './WhyExpander'
 import {
   FIXTURE_TYPES, FIXTURE_TYPE_KEYS,
   compileFixtureRecord, fixturePortMap, completionCopyFor,
-  isPowerFixed,
+  isPowerFixed, wiringLabelsFor,
 } from '../lib/fixturesData'
 import {
   listFixtures, saveFixture, removeFixture,
@@ -803,12 +803,12 @@ function CompletionStep({ answers, onCompletion, onWaitS }) {
 
 function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }) {
   const port = fixturePortMap(record)
-  // Profile-aware receipt: in OEM mode the "Wire ... to" rows show
-  // controller channels (DO3, DI4) instead of Synapse port names,
-  // matching what the operator actually lands on the cabinet block.
+  // Profile-aware wiring: the Synapse mode shows "Valve 05" / "IN 03",
+  // the OEM mode shows the controller channels (DO5, DI3). Threaded
+  // into WiringChecklist below (which also drives the imperative
+  // "Connect …" instructions) and into GuidanceBlock's glowing map.
   const profile = useIoHardwareProfile()
   const portmap = useSynapsePortmap()
-  const _port = (id) => portDisplayName(id, { profile, portmap })
   return (
     <div data-testid="fixture-step-summary"
          data-io-profile={profile}
@@ -846,20 +846,22 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
             {record.hold_on_loss ? 'Keeps holding' : 'Lets go'}
           </div>
         )}
-        {record.valve && (
-          <div><b>Wire air line to:</b> {_port(record.valve)}</div>
-        )}
-        {record.out && (
-          <div><b>Wire start signal to:</b> {_port(record.out)}</div>
-        )}
-        {record.in_done && (
-          <div><b>Wire done sensor to:</b> {_port(record.in_done)}</div>
-        )}
         <div>
           <b>Robot waits by:</b>{' '}
           {_completionLabel(record.completion, record.wait_s)}
         </div>
       </div>
+
+      {/* 2026-10-16 operator order: imperative wiring instructions +
+          per-port tick-off, with type-specific signal names ("clamp
+          air line" for a vice, "door position sensor" for a door, …).
+          Reads record.valve / record.out / record.in_done — the ports
+          the shared allocator (allocateFixturePorts in fixturesData.js)
+          assigned at compile time, so the operator never picks a
+          DO/DI number. Profile-aware port names via portDisplayName
+          (Synapse vs OEM). The glowing map below (GuidanceBlock)
+          highlights the same ports — one shared component, no fork. */}
+      <WiringChecklist record={record} profile={profile} portmap={portmap} />
 
       <GuidanceBlock port={port} />
 
@@ -897,6 +899,100 @@ function SummaryStep({ answers, setAnswers, record, saved, busy, error, onSave }
           unused tool or fixture to free one up, then come back.
         </div>
       )}
+    </div>
+  )
+}
+
+// 2026-10-16 WiringChecklist — the operator-facing "Connect X to Y"
+// panel the Summary step renders at the end of fixture setup. Reads
+// the ports the shared allocator (allocateFixturePorts) assigned to
+// this record; names each signal in the device's own terms via
+// wiringLabelsFor(record.type); surfaces profile-aware port names
+// (Synapse Valve 05 / IN 03, or OEM DO5 / DI3) via portDisplayName.
+// Per-port tick-off is local component state — not persisted on the
+// record (it's just operator working memory while they wire).
+function WiringChecklist({ record, profile, portmap }) {
+  const [done, setDone] = useState({})
+  if (!record) return null
+  const labels = wiringLabelsFor(record.type)
+  const rows = []
+  if (record.valve) {
+    rows.push({
+      key:  record.valve,
+      kind: 'valve',
+      label: labels.valve,
+      port:  portDisplayName(record.valve, { profile, portmap }),
+    })
+  }
+  if (record.out) {
+    rows.push({
+      key:  record.out,
+      kind: 'out',
+      label: labels.out,
+      port:  portDisplayName(record.out, { profile, portmap }),
+    })
+  }
+  if (record.in_done) {
+    rows.push({
+      key:  record.in_done,
+      kind: 'in_done',
+      label: labels.in_done,
+      port:  portDisplayName(record.in_done, { profile, portmap }),
+    })
+  }
+  if (rows.length === 0) return null
+  const toggle = (k) => setDone((prev) => ({ ...prev, [k]: !prev[k] }))
+  return (
+    <div
+      data-testid="fixture-wiring-checklist"
+      data-io-profile={profile}
+      data-row-count={String(rows.length)}
+      style={{
+        padding: 12,
+        background: '#EFF6FF', border: '1px solid #BFDBFE',
+        borderRadius: 8,
+        display: 'flex', flexDirection: 'column', gap: 10,
+      }}>
+      <div style={{
+        fontSize: 12, fontWeight: 700, color: '#1E3A8A',
+        textTransform: 'uppercase', letterSpacing: 0.4,
+      }}>
+        Wire these ports
+      </div>
+      {rows.map((row) => {
+        const checked = !!done[row.key]
+        return (
+          <label
+            key={row.key}
+            data-testid="fixture-wiring-row"
+            data-port-kind={row.kind}
+            data-port-id={row.key}
+            data-connected={String(checked)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 12,
+              padding: '8px 10px',
+              background: checked ? '#DCFCE7' : '#fff',
+              border: `1px solid ${checked ? '#86EFAC' : '#BFDBFE'}`,
+              borderRadius: 6, cursor: 'pointer',
+              fontSize: 13, color: '#111827',
+            }}>
+            <input
+              type="checkbox" checked={checked}
+              onChange={() => toggle(row.key)}
+              data-testid="fixture-wiring-connected"
+              style={{ transform: 'scale(1.3)' }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600 }}>
+                Connect {record.name}&rsquo;s {row.label} to{' '}
+                <span style={{ color: '#1E3A8A' }}>{row.port}</span>
+              </div>
+              <div style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }}>
+                Tap when connected
+              </div>
+            </div>
+          </label>
+        )
+      })}
     </div>
   )
 }
