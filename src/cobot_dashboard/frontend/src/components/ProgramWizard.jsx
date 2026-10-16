@@ -2061,8 +2061,8 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
 
   return (
     <QuestionCard
-      question="How many vices hold the part in the machine?"
-      description="Vices are air-controlled; the program will clamp each one after loading, wait for the machine cycle to finish, then unclamp before removing the finished part. 0 = the machine holds the part by itself (self-clamping chuck, magnetic bed, etc.)."
+      question="How many vices or workholding fixtures will be in the machine?"
+      description="Workholding fixtures (vices, clamps, chucks, …) are air-controlled; the program will clamp each one after loading, wait for the machine cycle to finish, then unclamp before removing the finished part. 0 = the machine holds the part by itself (self-clamping chuck, magnetic bed, etc.)."
     >
       <div data-testid="machine-vice-count"
            data-value={String(count)}
@@ -2075,17 +2075,33 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
                 disabled={count <= MIN}
                 onClick={() => setCount(count - 1)}
                 style={stepperBtn(count <= MIN)}>−</button>
-        <input
-          type="number" inputMode="numeric" min={MIN} max={MAX} value={count}
+        {/* 2026-10-16 operator order: READ-ONLY display driven by the
+            +/− buttons. The pre-fix <input type="number"> rendered
+            native spinner arrows inside the box (redundant with the
+            flanking buttons) and pushed the number off-center. A plain
+            <div> with role="spinbutton" + aria-valuenow carries the
+            same accessibility affordance without the native chrome. */}
+        <div
           data-testid="machine-vice-count-input"
-          onChange={(e) => setCount(parseInt(e.target.value, 10))}
+          role="spinbutton"
+          aria-label="vice count"
+          aria-valuenow={count}
+          aria-valuemin={MIN}
+          aria-valuemax={MAX}
+          tabIndex={0}
           style={{
-            width: 96, textAlign: 'center',
+            width: 96, minHeight: 56,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            textAlign: 'center',
             fontSize: 28, fontWeight: 800, color: '#111',
             padding: '12px 10px',
+            background: '#fff',
             border: '2px solid #e5e7eb', borderRadius: 10,
             fontVariantNumeric: 'tabular-nums',
-          }} />
+            userSelect: 'none',
+          }}>
+          {count}
+        </div>
         <button type="button" aria-label="increase"
                 data-testid="machine-vice-count-inc"
                 disabled={count >= MAX}
@@ -2101,8 +2117,8 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
                borderRadius: 8, color: '#15803D', fontSize: 13,
                lineHeight: 1.5,
              }}>
-          No vices — the machine holds the part itself. The program
-          will not emit any clamp I/O.
+          No workholding fixtures — the machine holds the part itself.
+          The program will not emit any clamp I/O.
         </div>
       )}
 
@@ -2128,7 +2144,7 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
                borderRadius: 8, color: '#991B1B', fontSize: 13,
                lineHeight: 1.5,
              }}>
-          You have {fixtures.length} vice{fixtures.length === 1 ? '' : 's'}
+          You have {fixtures.length} workholding fixture{fixtures.length === 1 ? '' : 's'}
           {' '}set up but asked for {count}. Set up more in External
           Fixtures, or reduce the count.
         </div>
@@ -2138,7 +2154,7 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
         <div data-testid="machine-fixtures-picker"
              style={{ marginTop: 4 }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
-            Which vice is each one?
+            Which workholding fixture is each one?
           </div>
           {slotIds.map((id, idx) => {
             const fx = vicesFirst.find((f) => f.id === id) || null
@@ -2166,7 +2182,7 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
                      borderRadius: 8,
                    }}>
                 <div style={{ fontSize: 14, fontWeight: 700, color: '#111', minWidth: 72 }}>
-                  Vice {idx + 1}
+                  Fixture {idx + 1}
                 </div>
                 <select value={id}
                         onChange={(e) => setSlot(idx, e.target.value)}
@@ -2199,8 +2215,8 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
                   <div
                     data-testid="machine-vice-slot-duplicate-error"
                     style={{ fontSize: 11, color: '#991B1B', fontWeight: 700 }}>
-                    Can&rsquo;t use the same fixture as another vice — each
-                    vice is separate hardware.
+                    Can&rsquo;t use the same fixture twice — each
+                    fixture is separate hardware.
                   </div>
                 )}
               </div>
@@ -2208,7 +2224,7 @@ function MachineFixturesBody({ answers, setAnswer, goNext }) {
           })}
           {count > 1 && !hasDuplicate && !notEnoughFixtures && (
             <div style={{ marginTop: 8, fontSize: 12, color: '#2563EB' }}>
-              {count} vices will be loaded before the machine starts.
+              {count} workholding fixtures will be loaded before the machine starts.
               Each gets its own load position in the teach step.
             </div>
           )}

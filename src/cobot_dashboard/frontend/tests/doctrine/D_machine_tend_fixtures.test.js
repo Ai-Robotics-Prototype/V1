@@ -243,7 +243,7 @@ test('MachineFixturesBody reads cell.fixtures via the shared cell ref', () => {
 
 test('MachineFixturesBody writes answers.machine_fixture_ids as an array', () => {
   const idx = progWizSrc.indexOf('function MachineFixturesBody(')
-  const chunk = progWizSrc.slice(idx, idx + 8000)
+  const chunk = progWizSrc.slice(idx, idx + 12000)
   assert.ok(/setAnswer\(['"]machine_fixture_ids['"],/.test(chunk),
     v('MachineFixturesBody must call setAnswer("machine_fixture_ids", '
       + '…) with the operator\'s selection — the ordered id list '
@@ -258,14 +258,18 @@ test('MachineFixturesBody writes answers.machine_fixture_ids as an array', () =>
 
 // ── (5a) 2026-10-15 addendum: how-many-vices count replaces the yes/no gate ──
 
-test('MachineFixturesBody asks "How many vices" with a count stepper', () => {
+test('MachineFixturesBody asks the broader "workholding fixtures" count question', () => {
   const idx = progWizSrc.indexOf('function MachineFixturesBody(')
-  const chunk = progWizSrc.slice(idx, idx + 8000)
+  const chunk = progWizSrc.slice(idx, idx + 12000)
   // The headline question must be the direct count copy — plain,
-  // operator-written, no yes/no gate.
-  assert.ok(/How many vices hold the part in the machine\?/.test(chunk),
-    v('MachineFixturesBody must ask "How many vices hold the part in '
-      + 'the machine?" verbatim per the 2026-10-15 addendum.'))
+  // operator-written, no yes/no gate. 2026-10-16 operator addendum
+  // broadened the wording from "vices" to "vices or workholding
+  // fixtures" so the question covers clamps / chucks / any
+  // workholding without an edge-case feel.
+  assert.ok(/How many vices or workholding fixtures will be in the machine\?/.test(chunk),
+    v('MachineFixturesBody must ask "How many vices or workholding '
+      + 'fixtures will be in the machine?" verbatim per the 2026-10-16 '
+      + 'operator addendum.'))
   assert.ok(/data-testid="machine-vice-count"/.test(chunk),
     v('MachineFixturesBody must render data-testid="machine-vice-count" '
       + '— the stepper wrapper that carries the current count value '
@@ -280,7 +284,7 @@ test('MachineFixturesBody asks "How many vices" with a count stepper', () => {
 
 test('MachineFixturesBody persists answers.machine_vice_count', () => {
   const idx = progWizSrc.indexOf('function MachineFixturesBody(')
-  const chunk = progWizSrc.slice(idx, idx + 8000)
+  const chunk = progWizSrc.slice(idx, idx + 12000)
   assert.ok(/setAnswer\(['"]machine_vice_count['"],/.test(chunk),
     v('MachineFixturesBody must call setAnswer("machine_vice_count", '
       + '…) so the count persists on the saved program and codegen can '
@@ -319,7 +323,7 @@ test('Yes/No clamp-gate copy has been RETIRED from MachineFixturesBody', () => {
 
 test('Count == 0 renders a self-clamp info block', () => {
   const idx = progWizSrc.indexOf('function MachineFixturesBody(')
-  const chunk = progWizSrc.slice(idx, idx + 8000)
+  const chunk = progWizSrc.slice(idx, idx + 12000)
   assert.ok(/data-testid="machine-vice-selfclamp"/.test(chunk),
     v('When count == 0 the body must render '
       + 'data-testid="machine-vice-selfclamp" — the plain self-clamping '
@@ -328,6 +332,108 @@ test('Count == 0 renders a self-clamp info block', () => {
     v('Count-0 copy must plainly state the program will not emit '
       + 'any clamp I/O (same effect as the retired "No fixture" '
       + 'branch, now reached via count=0 instead of a yes/no gate).'))
+})
+
+
+// ── (5a-ii) 2026-10-16 count-stepper: no native spinner + centered ──
+
+test('Count-stepper number box is a read-only display (no native spinner)', () => {
+  // Scope strictly to MachineFixturesBody — stop at the next
+  // function declaration so other wizard bodies' legitimate
+  // <input type="number"> fields (manual-TCP entry, machine-IO
+  // config, …) don't trip this pin.
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const stop = progWizSrc.indexOf('\nfunction ', idx + 1)
+  // Strip JSX {/* … */} comment blocks + // line comments so docstring
+  // snippets that mention <input type="number"> for context don't trip
+  // the negation. (The regen docstring in the actual component
+  // explains WHY the input was retired; this pin cares about live
+  // JSX only.)
+  const chunk = progWizSrc.slice(idx, stop > idx ? stop : idx + 12000)
+    .replace(/\{\s*\/\*[\s\S]*?\*\/\s*\}/g, '')
+    .replace(/\/\/[^\n]*$/gm, '')
+  // Operator order 2026-10-16: the pre-fix <input type="number"> inside
+  // the stepper rendered native up/down arrows (redundant with the
+  // flanking +/− buttons) and pushed the number off-center. Replaced
+  // with a read-only <div> whose value is driven by the +/− buttons.
+  // The read-only path is operator-preferred over CSS -webkit-
+  // appearance:none because it eliminates the spinner surface area
+  // entirely — no cross-browser render drift.
+  const inputBlockMatch = chunk.match(
+    /data-testid="machine-vice-count-input"[\s\S]{0,1500}/)
+  assert.ok(inputBlockMatch,
+    v('The machine-vice-count-input element must exist in '
+      + 'MachineFixturesBody.'))
+  const inputBlock = inputBlockMatch[0].slice(0, 1500)
+  // The element must NOT be an <input type="number"> — that is the
+  // regression surface this pin seals.
+  assert.equal(
+    /<input\b[\s\S]{0,400}type=["']number["'][\s\S]{0,400}data-testid="machine-vice-count-input"/
+      .test(chunk),
+    false,
+    v('machine-vice-count-input must NOT be an <input type="number"> '
+      + '— that renders the native spinner arrows the 2026-10-16 '
+      + 'operator order asked us to retire.'))
+  assert.ok(
+    /role="spinbutton"[\s\S]{0,200}aria-valuenow=\{count\}/.test(inputBlock)
+      || /aria-valuenow=\{count\}[\s\S]{0,200}role="spinbutton"/.test(inputBlock),
+    v('The read-only display must carry role="spinbutton" + '
+      + 'aria-valuenow={count} so assistive tech still sees it as a '
+      + 'numeric control even though it has no native chrome.'))
+  // aria-valuemin + aria-valuemax round out the a11y surface.
+  assert.ok(
+    /aria-valuemin=\{MIN\}/.test(inputBlock)
+      && /aria-valuemax=\{MAX\}/.test(inputBlock),
+    v('The read-only display must carry aria-valuemin={MIN} + '
+      + 'aria-valuemax={MAX} for a11y.'))
+})
+
+test('Count-stepper number is centered horizontally AND vertically', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 12000)
+  const inputBlockMatch = chunk.match(
+    /data-testid="machine-vice-count-input"[\s\S]{0,1500}/)
+  assert.ok(inputBlockMatch, v('machine-vice-count-input must exist.'))
+  const inputBlock = inputBlockMatch[0].slice(0, 1500)
+  // Horizontal: textAlign center is required; vertical: flex + alignItems:center
+  // + justifyContent:center on the box itself (there is no native
+  // vertical center in a <div> otherwise).
+  assert.ok(/textAlign:\s*['"]center['"]/.test(inputBlock),
+    v('machine-vice-count-input must set textAlign: "center" — '
+      + 'horizontal centering.'))
+  assert.ok(
+    /display:\s*['"]flex['"][\s\S]{0,200}alignItems:\s*['"]center['"][\s\S]{0,200}justifyContent:\s*['"]center['"]/
+      .test(inputBlock),
+    v('machine-vice-count-input must be display:flex + '
+      + 'alignItems:"center" + justifyContent:"center" so the number '
+      + 'sits dead-center vertically AND horizontally in the box.'))
+})
+
+test('Broader "workholding fixture" wording is consistent across the picker', () => {
+  const idx = progWizSrc.indexOf('function MachineFixturesBody(')
+  const chunk = progWizSrc.slice(idx, idx + 12000)
+  // The picker sub-label reads "Which workholding fixture is each one?"
+  // (updated from "Which vice is each one?") so the picker's heading
+  // matches the broadened headline.
+  assert.ok(/Which workholding fixture is each one\?/.test(chunk),
+    v('Picker sub-label must read "Which workholding fixture is each '
+      + 'one?" verbatim — consistent with the broader "vices or '
+      + 'workholding fixtures" headline.'))
+  // Per-slot label broadened to "Fixture N" (was "Vice N").
+  assert.ok(/Fixture \{idx \+ 1\}/.test(chunk),
+    v('Per-slot label must read "Fixture {idx + 1}" (broadened from '
+      + '"Vice {idx + 1}" to match the workholding-fixtures wording).'))
+  // Self-clamp callout + capacity banner + trailing N-count line all
+  // use the broader term too.
+  assert.ok(/No workholding fixtures — the machine holds the part itself/.test(chunk),
+    v('Self-clamp callout must read "No workholding fixtures — the '
+      + 'machine holds the part itself." (broadened from "No vices").'))
+  assert.ok(/You have \{fixtures\.length\} workholding fixture/.test(chunk),
+    v('Capacity banner must say "You have N workholding fixture(s)" '
+      + '(broadened from "N vice(s)").'))
+  assert.ok(/\{count\} workholding fixtures will be loaded/.test(chunk),
+    v('Trailing count line must say "N workholding fixtures will be '
+      + 'loaded…" (broadened from "N vices").'))
 })
 
 
@@ -430,11 +536,12 @@ test('Duplicate-slot defensive error row (for hand-edited saved programs)', () =
       + 'data-testid="machine-vice-slot-duplicate-error" so e2e tests '
       + 'can observe the error path.'))
   assert.ok(
-    /Can[\s\S]{0,10}t use the same fixture as another vice[\s\S]{0,80}each[\s\S]{0,30}vice is separate hardware/
+    /Can[\s\S]{0,10}t use the same fixture twice[\s\S]{0,80}each[\s\S]{0,30}fixture is separate hardware/
       .test(chunk),
     v('Duplicate error copy must explain in plain operator language '
-      + 'that each vice is separate hardware — per the 2026-10-15 '
-      + 'operator directive.'))
+      + 'that each fixture is separate hardware (broadened from the '
+      + '"vice" wording per the 2026-10-16 workholding-fixtures '
+      + 'addendum).'))
   // The slot container must carry data-duplicate so operator-facing
   // tests can filter.
   assert.ok(/data-duplicate=\{String\(isDuplicate\)\}/.test(chunk),
