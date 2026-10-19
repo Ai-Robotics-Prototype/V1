@@ -2607,7 +2607,17 @@ const PAGES = [
   // All gated on operation === 'palletize' plus the chosen pallet_mode.
   // ──────────────────────────────────────────────────────────────────
 
-  // P1: Shared pallet layout (rows / cols / layers / spacing / order)
+  // P1: Shared pallet layout (rows / cols / layers / BOX SIZE / order).
+  //
+  // 2026-10-19 operator directive — ALIGNED stacking only. The
+  // operator enters the BOX size (L × W × H) + an optional gap; the
+  // wizard derives slot pitch (spacing_x = box_length + gap, spacing_y
+  // = box_width + gap) and layer offset (box_height + gap). Boxes
+  // stack directly, same orientation on every layer, anchored to the
+  // taught origin corner.
+  //
+  // Interlocked (brick) stacking — alternating rotation per layer —
+  // is a FUTURE advanced option. NOT built this session.
   {
     id: 'pallet_layout',
     skip: (answers) => answers.operation !== 'palletize',
@@ -2615,12 +2625,32 @@ const PAGES = [
       const rows   = answers.pallet_rows   ?? 4
       const cols   = answers.pallet_cols   ?? 4
       const layers = answers.pallet_layers ?? 1
-      const sx     = answers.pallet_spacing_x_mm ?? 150
-      const sy     = answers.pallet_spacing_y_mm ?? 150
-      const lz     = answers.pallet_layer_height_mm ?? 100
+      // Box size (mm internal, inches on display per the units work).
+      // Defaults: a 6″ × 4″ × 4″ box is a reasonable starting point for
+      // small-case palletizing. Operator picks the real values.
+      const boxL   = answers.pallet_box_length_mm ?? 150
+      const boxW   = answers.pallet_box_width_mm  ?? 100
+      const boxH   = answers.pallet_box_height_mm ?? 100
+      // Gap default = 0 mm (touching). Operator-adjustable, no cap on
+      // small positive values. Spacing = box dim + gap; layer offset =
+      // box height + gap. Both are derived at render AND persisted so
+      // downstream readers (codegen, pallet_place expansion) see the
+      // computed values with zero behavioural change vs the pre-box
+      // flow.
+      const gapMm  = answers.pallet_box_gap_mm ?? 0
+      const sx     = boxL + gapMm                 // spacing between columns
+      const sy     = boxW + gapMm                 // spacing between rows
+      const lz     = boxH + gapMm                 // layer offset Z
       const order  = answers.pallet_fill_order || 'row_lr'
       const total  = rows * cols * layers
       const isDepal = answers.pallet_mode === 'depalletize'
+
+      // Derivation (box dim + gap → spacing / layer offset) is kept
+      // in a single place: `buildPalletConfig` reads box_* answer
+      // fields and emits spacing_x_mm / spacing_y_mm / layer_height_mm
+      // on the saved pallet config. The summary page below also
+      // computes from the same inputs. No answer-mutation side-effect
+      // in render — the render stays pure.
 
       const setInt = (key, v, lo, hi) => {
         const n = parseInt(v, 10)
@@ -2686,18 +2716,50 @@ const PAGES = [
             </label>
           </div>
 
-          <DistanceSlider label="Spacing X (centre-to-centre)" mmValue={sx}
-            onCommitMm={(v) => setAnswer('pallet_spacing_x_mm', v)}
+          {/* 2026-10-19 operator directive — the operator enters BOX
+              size (L × W × H) instead of raw slot pitch + layer
+              height. Spacing is derived (box dim + gap) and layer
+              offset is derived (box height + gap). Aligned stacking,
+              same orientation every layer, anchored to the taught
+              origin corner. */}
+          <DistanceSlider label="Box length" mmValue={boxL}
+            onCommitMm={(v) => setAnswer('pallet_box_length_mm', v)}
             minMm={10} maxMm={500} stepMm={5}
-            description="Distance between columns" />
-          <DistanceSlider label="Spacing Y (centre-to-centre)" mmValue={sy}
-            onCommitMm={(v) => setAnswer('pallet_spacing_y_mm', v)}
+            description="Along the row axis (direction of columns)" />
+          <DistanceSlider label="Box width" mmValue={boxW}
+            onCommitMm={(v) => setAnswer('pallet_box_width_mm', v)}
             minMm={10} maxMm={500} stepMm={5}
-            description="Distance between rows" />
-          <DistanceSlider label="Layer height Z" mmValue={lz}
-            onCommitMm={(v) => setAnswer('pallet_layer_height_mm', v)}
+            description="Along the column axis (direction of rows)" />
+          <DistanceSlider label="Box height" mmValue={boxH}
+            onCommitMm={(v) => setAnswer('pallet_box_height_mm', v)}
             minMm={10} maxMm={300} stepMm={5}
-            description="Vertical offset added per layer" />
+            description="Per-layer vertical rise" />
+          <DistanceSlider label="Gap between boxes" mmValue={gapMm}
+            onCommitMm={(v) => setAnswer('pallet_box_gap_mm', v)}
+            minMm={0} maxMm={50} stepMm={1}
+            description="Clearance between boxes (default 0″, boxes touching)" />
+
+          <div style={{
+            padding: 10, background: '#f0fdf4', border: '1px solid #bbf7d0',
+            borderRadius: 8, marginBottom: 14, fontSize: 12, color: '#065F46',
+          }}>
+            <div style={{ fontWeight: 700, marginBottom: 2 }}>
+              Derived from box + gap:
+            </div>
+            Row pitch (centre-to-centre between columns): {formatInLabel(sx)} —
+            box length {formatInLabel(boxL)} + gap {formatInLabel(gapMm)}
+            <br />
+            Column pitch (centre-to-centre between rows): {formatInLabel(sy)} —
+            box width {formatInLabel(boxW)} + gap {formatInLabel(gapMm)}
+            <br />
+            Layer offset Z: {formatInLabel(lz)} — box height {formatInLabel(boxH)}
+            {' + gap '}{formatInLabel(gapMm)}
+            <br />
+            <span style={{ color: '#374151' }} data-testid="pallet-aligned-note">
+              Aligned stacking — every box in the same orientation on every
+              layer. Interlocked (brick) stacking is a future option.
+            </span>
+          </div>
 
           <div style={{
             padding: 14, background: '#eff6ff', border: '1px solid #bfdbfe',
@@ -3290,6 +3352,16 @@ const PAGES = [
       const cols      = answers.pallet_cols   ?? 4
       const layers    = answers.pallet_layers ?? 1
       const total     = rows * cols * layers
+      // Box-derived spacing / layer offset — mirrors the derivation
+      // in buildPalletConfig so the review surface shows the SAME
+      // numbers that will be stored.
+      const _boxL     = answers.pallet_box_length_mm ?? 150
+      const _boxW     = answers.pallet_box_width_mm  ?? 100
+      const _boxH     = answers.pallet_box_height_mm ?? 100
+      const _gap      = answers.pallet_box_gap_mm    ?? 0
+      const _spacingX = _boxL + _gap
+      const _spacingY = _boxW + _gap
+      const _layerH   = _boxH + _gap
       const orderLabel = {
         row_lr: 'Row by row L→R',
         row_rl: 'Row by row R→L',
@@ -3349,10 +3421,13 @@ const PAGES = [
               {rows} rows × {cols} cols × {layers} layers = {total} parts
             </div>
             <div style={{ color: '#6b7280' }}>
-              Spacing: {formatInLabel(answers.pallet_spacing_x_mm ?? 150)} × {formatInLabel(answers.pallet_spacing_y_mm ?? 150)}
+              Box: {formatInLabel(_boxL)} × {formatInLabel(_boxW)} × {formatInLabel(_boxH)}
+              {' '}(gap {formatInLabel(_gap)})
             </div>
             <div style={{ color: '#6b7280' }}>
-              Layer height: {formatInLabel(answers.pallet_layer_height_mm ?? 100)}
+              Spacing: {formatInLabel(_spacingX)} × {formatInLabel(_spacingY)}
+              {' '}· Layer offset: {formatInLabel(_layerH)}
+              {' '}· Aligned
             </div>
             <div style={{ color: '#6b7280' }}>
               {isDepal ? 'Pick' : 'Fill'} order: {isDepal ? `Top layer first, ${orderLabel}` : orderLabel}
@@ -3691,13 +3766,39 @@ function buildPalletConfig(answers) {
   const corner2 = readTaught(answers, 'taught_pallet_corner2')
   const corner3 = readTaught(answers, 'taught_pallet_corner3')
   const part    = readTaught(answers, 'taught_pallet_part')
+  // 2026-10-19 operator directive — box-driven spacing. The wizard
+  // asks box L × W × H + optional gap; spacing_x = L + gap,
+  // spacing_y = W + gap, layer_height = H + gap. Aligned (column)
+  // stacking only — same orientation every box, every layer,
+  // anchored to the taught origin corner. The box dims + gap are
+  // persisted on the pallet config so the operator sees the SAME
+  // numbers on re-open (round-trip). Interlocked (brick) stacking
+  // is a future advanced option — NOT built this session.
+  const boxL = answers.pallet_box_length_mm ?? 150
+  const boxW = answers.pallet_box_width_mm  ?? 100
+  const boxH = answers.pallet_box_height_mm ?? 100
+  const gap  = answers.pallet_box_gap_mm    ?? 0
+  const spacingX = boxL + gap
+  const spacingY = boxW + gap
+  const layerH   = boxH + gap
   return {
     rows:            answers.pallet_rows   ?? 4,
     cols:            answers.pallet_cols   ?? 4,
     layers:          answers.pallet_layers ?? 1,
-    spacing_x_mm:    answers.pallet_spacing_x_mm   ?? 150,
-    spacing_y_mm:    answers.pallet_spacing_y_mm   ?? 150,
-    layer_height_mm: answers.pallet_layer_height_mm ?? 100,
+    // Derived from box + gap. Legacy readers see the same field
+    // names and MM values they always have — zero behavioural
+    // change in codegen / pallet_place expansion.
+    spacing_x_mm:    spacingX,
+    spacing_y_mm:    spacingY,
+    layer_height_mm: layerH,
+    // Box dims + gap — persisted so re-opening the wizard round-
+    // trips to the SAME box-size inputs rather than back-solving
+    // from spacing.
+    box_length_mm:   boxL,
+    box_width_mm:    boxW,
+    box_height_mm:   boxH,
+    box_gap_mm:      gap,
+    stacking_pattern: 'aligned',
     fill_order:      answers.pallet_fill_order || 'row_lr',
     // Legacy corner_tcp mirror (backwards-compat with old readers
     // that consume the pallet block outside pallet_place — the 3D
@@ -3712,8 +3813,8 @@ function buildPalletConfig(answers) {
     corner3_tcp: Array.isArray(corner3?.tcp) ? [...corner3.tcp] : null,
     part_tcp:    Array.isArray(part?.tcp)    ? [...part.tcp]    : null,
     teach_mode:  'far_slot',            // retained for schema; v2 ignores
-    pitch_row_mm: answers.pallet_spacing_x_mm   ?? 150,
-    pitch_col_mm: answers.pallet_spacing_y_mm   ?? 150,
+    pitch_row_mm: spacingX,
+    pitch_col_mm: spacingY,
   }
 }
 
