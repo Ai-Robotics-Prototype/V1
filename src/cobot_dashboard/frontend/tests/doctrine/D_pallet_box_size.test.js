@@ -19,11 +19,18 @@
 // built this session.
 //
 // Pins:
-//   * ProgramWizard pallet_layout page mounts a DistanceSlider for
-//     EACH of the four box inputs (Box length, Box width, Box height,
-//     Gap between boxes).
+//   * ProgramWizard pallet_layout page mounts a NumericField for
+//     EACH of the four box inputs — Box length, Box width, Box
+//     height, Gap between boxes. NumericField renders a plain
+//     type="text" box with inputMode="decimal" (no stepper arrows,
+//     no native spinner, parse-on-blur). This is the 2026-10-19
+//     SECOND operator directive: type the number, no adjuster.
+//   * The four box inputs are NOT DistanceSlider (slider is the
+//     retired treatment per the second directive).
 //   * The three retired "Spacing X / Spacing Y / Layer height Z"
 //     slider labels no longer appear in the pallet_layout live code.
+//   * Labels show inches ("Box length (in)" etc.); the inch→mm
+//     boundary happens at onCommit via inToMm(), unchanged.
 //   * The pallet_layout page carries an "Aligned stacking" note
 //     explaining interlocked is a future option.
 //   * buildPalletConfig derives spacing_x_mm = box_length_mm +
@@ -32,6 +39,8 @@
 //     saved pallet config so the inputs round-trip to the config.
 //   * Default box dims + gap are stable (regression pin on operator-
 //     facing defaults).
+//   * NumericField itself renders type="text" (not type="number")
+//     so there is no native spinner anywhere.
 //
 // Failure format: DOCTRINE PALLET_BOX VIOLATED: <detail>
 
@@ -60,30 +69,119 @@ const live = _liveCode(progWizSrc)
 
 // ── (1) Box inputs mounted on the pallet_layout page ────────────────
 
-test('pallet_layout page mounts the four box-size DistanceSliders', () => {
-  for (const label of [
-    'Box length',
-    'Box width',
-    'Box height',
-    'Gap between boxes',
+// Narrow the scan to the pallet_layout page body so pins fire on THIS
+// page, not on other pages that still use DistanceSlider (approach /
+// retract heights elsewhere stay sliders — out of scope for the
+// text-field directive).
+function _palletLayoutBody(src) {
+  const marker = /\{\s*\n?\s*id:\s*['"]pallet_layout['"]/g.exec(src)
+  assert.ok(marker, v('pallet_layout page entry not found'))
+  const start = marker.index
+  // Find the matching closing brace of this PAGES entry — look for
+  // the balanced `}` that closes the object. We scan forward from
+  // the entry's own `{`.
+  const openBrace = src.indexOf('{', start)
+  let depth = 0
+  for (let i = openBrace; i < src.length; i++) {
+    const ch = src[i]
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return src.slice(openBrace, i + 1)
+    }
+  }
+  throw new Error(v('unbalanced braces in pallet_layout body'))
+}
+
+const palletLayoutLive = _palletLayoutBody(live)
+
+test('pallet_layout page mounts the four box-size NumericField inputs', () => {
+  // Each box dim + the gap renders as a NumericField with the inch
+  // label we show the operator. The data-testids are the stable
+  // handles — the labels are allowed to shift copy without
+  // breaking the pin, but the testid must stay.
+  for (const testid of [
+    'pallet-box-length-in',
+    'pallet-box-width-in',
+    'pallet-box-height-in',
+    'pallet-box-gap-in',
   ]) {
-    assert.ok(live.includes(`label="${label}"`),
-      v(`pallet_layout page must mount a DistanceSlider labelled "${label}" `
-        + `— the four box-size inputs that replace manual spacing entry.`))
+    assert.ok(palletLayoutLive.includes(`data-testid="${testid}"`),
+      v(`pallet_layout page must mount a NumericField with `
+        + `data-testid="${testid}" — the plain text-entry input for `
+        + `that box dim (no slider, no stepper).`))
   }
 })
 
-test('pallet_layout page writes box_* answer keys through onCommitMm', () => {
+test('pallet_layout page writes box_* answer keys through NumericField onCommit', () => {
   for (const key of [
     'pallet_box_length_mm',
     'pallet_box_width_mm',
     'pallet_box_height_mm',
     'pallet_box_gap_mm',
   ]) {
-    assert.ok(new RegExp(`setAnswer\\(['"]${key}['"]`).test(live),
-      v(`pallet_layout slider for ${key} must call setAnswer('${key}', v) `
-        + `so the box dim persists through buildPalletConfig.`))
+    assert.ok(new RegExp(`setAnswer\\(['"]${key}['"]`).test(palletLayoutLive),
+      v(`pallet_layout NumericField for ${key} must call `
+        + `setAnswer('${key}', inToMm(v)) so the box dim persists `
+        + `through buildPalletConfig.`))
   }
+})
+
+test('box inputs are plain text-entry fields, not DistanceSlider or steppers', () => {
+  // Zero DistanceSliders on this page. (DistanceSlider is still used
+  // elsewhere — approach/retract heights, etc. — so this check is
+  // scoped to the pallet_layout body only.)
+  assert.equal(/<DistanceSlider\b/.test(palletLayoutLive), false,
+    v('pallet_layout page must NOT render any DistanceSlider — box '
+      + 'dimensions are plain text-entry per the 2026-10-19 second '
+      + 'operator directive.'))
+
+  // Box inputs flow through NumericField. The component itself
+  // renders a plain type="text" input (see NumericField.jsx) —
+  // no native number spinner. We assert on the import so a future
+  // regression that reaches for a different numeric control is
+  // caught.
+  assert.ok(/import NumericField from ['"]\.\/NumericField['"]/.test(live),
+    v('ProgramWizard must import NumericField — the shared text-'
+      + 'entry component for every numeric field in the wizard.'))
+
+  // NumericField mounted on EACH box testid.
+  for (const testid of ['pallet-box-length-in', 'pallet-box-width-in',
+                        'pallet-box-height-in', 'pallet-box-gap-in']) {
+    const re = new RegExp(
+      `<NumericField\\b[\\s\\S]{0,400}?data-testid="${testid}"`)
+    assert.ok(re.test(palletLayoutLive),
+      v(`Each box testid "${testid}" must be the data-testid of a `
+        + `<NumericField ...> element — the plain text-entry input.`))
+  }
+})
+
+test('box input labels show inches', () => {
+  // The operator sees the units next to the number they type.
+  for (const label of [
+    'Box length (in)',
+    'Box width (in)',
+    'Box height (in)',
+    'Gap between boxes (in)',
+  ]) {
+    assert.ok(palletLayoutLive.includes(label),
+      v(`pallet_layout page must label the box input "${label}" — `
+        + `inches shown next to the field so the operator types in `
+        + `the same units as the rest of the wizard.`))
+  }
+})
+
+test('NumericField itself renders type="text", not type="number"', () => {
+  // Doctrine on the shared component: no native spinner anywhere.
+  // Reading the component source directly so a future flip from
+  // text to number would fail this pin, not just the box inputs.
+  const nf = readSrc('components/NumericField.jsx')
+  assert.ok(/type="text"/.test(nf),
+    v('NumericField must render type="text" so no browser renders '
+      + 'native stepper arrows on any numeric input in the wizard.'))
+  assert.equal(/type="number"/.test(nf), false,
+    v('NumericField must NOT render type="number" — that enables '
+      + 'the browser spinner.'))
 })
 
 

@@ -2721,23 +2721,84 @@ const PAGES = [
               height. Spacing is derived (box dim + gap) and layer
               offset is derived (box height + gap). Aligned stacking,
               same orientation every layer, anchored to the taught
-              origin corner. */}
-          <DistanceSlider label="Box length" mmValue={boxL}
-            onCommitMm={(v) => setAnswer('pallet_box_length_mm', v)}
-            minMm={10} maxMm={500} stepMm={5}
-            description="Along the row axis (direction of columns)" />
-          <DistanceSlider label="Box width" mmValue={boxW}
-            onCommitMm={(v) => setAnswer('pallet_box_width_mm', v)}
-            minMm={10} maxMm={500} stepMm={5}
-            description="Along the column axis (direction of rows)" />
-          <DistanceSlider label="Box height" mmValue={boxH}
-            onCommitMm={(v) => setAnswer('pallet_box_height_mm', v)}
-            minMm={10} maxMm={300} stepMm={5}
-            description="Per-layer vertical rise" />
-          <DistanceSlider label="Gap between boxes" mmValue={gapMm}
-            onCommitMm={(v) => setAnswer('pallet_box_gap_mm', v)}
-            minMm={0} maxMm={50} stepMm={1}
-            description="Clearance between boxes (default 0″, boxes touching)" />
+              origin corner.
+
+              2026-10-19 (second directive) — box dimensions are plain
+              TEXT-ENTRY fields. The operator types a number — no
+              slider, no stepper, no native spin arrows. NumericField
+              handles that: type="text", inputMode="decimal", parse-
+              on-blur, no eager keystroke commit, no browser rounding.
+              Mobile keypad is numeric, kb-safe-modal-shell keeps the
+              field visible while the keyboard is up.
+
+              Count fields (rows/cols/layers) stay NumericField too
+              but with integer=true + the same text-entry UX. These
+              were ALREADY text-entry via NumericField; nothing to
+              migrate there. Same component everywhere — one
+              consistent "type the number" treatment per the pin. */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
+                        gap: 10, marginBottom: 12 }}>
+            <label>
+              <div style={{ fontSize: 12, fontWeight: 600,
+                            color: '#374151', marginBottom: 4 }}>
+                Box length (in)
+              </div>
+              <NumericField min={0.4} max={20} step="0.1"
+                value={mmToIn(boxL, 2)}
+                onCommit={(v) => setAnswer('pallet_box_length_mm', inToMm(v))}
+                aria-label="Box length (in)"
+                data-testid="pallet-box-length-in"
+                style={inputBox} />
+              <div style={{ fontSize: 11, color: '#6b7280', marginTop: 4 }}>
+                Along the row axis (direction of columns)
+              </div>
+            </label>
+            <label>
+              <div style={{ fontSize: 12, fontWeight: 600,
+                            color: '#374151', marginBottom: 4 }}>
+                Box width (in)
+              </div>
+              <NumericField min={0.4} max={20} step="0.1"
+                value={mmToIn(boxW, 2)}
+                onCommit={(v) => setAnswer('pallet_box_width_mm', inToMm(v))}
+                aria-label="Box width (in)"
+                data-testid="pallet-box-width-in"
+                style={inputBox} />
+              <div style={{ fontSize: 11, color: '#6b7280', marginTop: 4 }}>
+                Along the column axis (direction of rows)
+              </div>
+            </label>
+            <label>
+              <div style={{ fontSize: 12, fontWeight: 600,
+                            color: '#374151', marginBottom: 4 }}>
+                Box height (in)
+              </div>
+              <NumericField min={0.4} max={12} step="0.1"
+                value={mmToIn(boxH, 2)}
+                onCommit={(v) => setAnswer('pallet_box_height_mm', inToMm(v))}
+                aria-label="Box height (in)"
+                data-testid="pallet-box-height-in"
+                style={inputBox} />
+              <div style={{ fontSize: 11, color: '#6b7280', marginTop: 4 }}>
+                Per-layer vertical rise
+              </div>
+            </label>
+          </div>
+          <label style={{ display: 'block', marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 600,
+                          color: '#374151', marginBottom: 4 }}>
+              Gap between boxes (in)
+            </div>
+            <NumericField min={0} max={4} step="0.05"
+              value={mmToIn(gapMm, 2)}
+              onCommit={(v) => setAnswer('pallet_box_gap_mm', inToMm(v))}
+              aria-label="Gap between boxes (in)"
+              data-testid="pallet-box-gap-in"
+              style={{ ...inputBox, maxWidth: 180 }} />
+            <div style={{ fontSize: 11, color: '#6b7280', marginTop: 4 }}>
+              Clearance between boxes (default 0″, boxes touching)
+            </div>
+          </label>
 
           <div style={{
             padding: 10, background: '#f0fdf4', border: '1px solid #bbf7d0',
