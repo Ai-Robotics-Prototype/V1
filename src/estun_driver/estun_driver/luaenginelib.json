@@ -1,0 +1,1462 @@
+{
+    "movJ": {
+        "lua": "movJ($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movJ({jp={1,2,3,4,5,6}},{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${search},onpercent=${optional.onpercent}})",
+        "luak": "movJ(p1)",
+        "vars": [
+            "p1",
+            "vv",
+            "av"
+        ]
+    },
+    "movL": {
+        "lua": "movL($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movL({jp={1,2,3,4,5,6}},{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luak": "movL(p1)",
+        "vars": [
+            "p1",
+            "vv",
+            "av"
+        ],
+        "examples": [
+            "movL({jp={1,2,3,4,5,6}},{v=1000,a=3000,b=100,coor=1,tool=1})\n",
+            "movL(p1,{v=1000,a=3000,b=100,coor=1,tool=1})\n"
+        ]
+    },
+    "movC": {
+        "lua": "movC($1,$2,{v=${optional.vv},a=${optional.av},b=${optional.b},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movC({jp={1,2,3,4,5,6}},{jp={1,2,3,4,5,6}},{v=${optional.vv},a=${optional.av},b=${optional.b},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luak": "movC(p1,p2)",
+        "vars": [
+            "p1",
+            "p2",
+            "vv",
+            "av"
+        ]
+    },
+    "movCircle": {
+        "lua": "movCircle($1,$2,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},circleNum=${optional.circleNum},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movCircle({jp={1,2,3,4,5,6}},{jp={1,2,3,4,5,6}},{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},circleNum=${optional.circleNum},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luak": "movCircle(p1,p2)",
+        "vars": [
+            "p1",
+            "p2",
+            "vv",
+            "av"
+        ]
+    },
+    "movAS": {
+        "lua": "movAS($1,$2,$3,$4,$5,{v=${optional.vv},a=${optional.av},coor=${optional.coor},tool=${optional.tool},swingAmp=${optional.swingAmp},swingFreq=${optional.swingFreq},useAdaptiveOrientation=${optional.useAdaptiveOrientation},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movAS(p1,p2,$3,$4,$5,{v=${optional.vv},a=${optional.av},coor=${optional.coor},tool=${optional.tool},swingAmp=${optional.swingAmp},swingFreq=${optional.swingFreq},useAdaptiveOrientation=${optional.useAdaptiveOrientation},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luak": "movAS(p1,p2,$3,$4,$5)",
+        "vars": [
+            "p1",
+            "p2",
+            "vv",
+            "av"
+        ]
+    },
+    "movAST": {
+        "lua": "movAST($1,$2,$3,${getAST},{v=${optional.vv},a=${optional.av},coor=${optional.coor},tool=${optional.tool},swingAmp=${optional.swingAmp},swingFreq=${optional.swingFreq},useAdaptiveOrientation=${optional.useAdaptiveOrientation},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movAST(p1,p2,p3,{radialStep=0}, {v=1000,a=3000,b=100,rb=100,coor=1,tool=1,swingAmp=0,swingFreq=10,useAdaptiveOrientation=false,search=\"getDI(1) == 1\",onpercent={}})",
+        "luak": "movAST(p1,p2,p3)",
+        "vars": [
+            "p1",
+            "p2",
+            "p3",
+            "vv",
+            "av"
+        ],
+        "examples": [
+            "movAST(p1, p2, p3, {pitch=20}, {v=1000,a=3000,b=100,rb=100,coor=1,tool=1,swingAmp=0,swingFreq=10,useAdaptiveOrientation=false,search=\"getDI(1) == 1\",onpercent={}})"
+        ],
+        "fns": {
+            "getAST": "getASTRuleFn"
+        }
+    },
+    "movLW": {
+        "lua": "movLW($1,$2,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movLW({jp={1,2,3,4,5,6}},$2,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luak": "movLW(p1)",
+        "vars": [
+            "p1",
+            "vv",
+            "av",
+            "onpercent"
+        ]
+    },
+    "movCW": {
+        "lua": "movCW($1,$2,$3,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movCW({jp={1,2,3,4,5,6}},{jp={1,2,3,4,5,6}},$3,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luak": "movCW(p1,p2)",
+        "vars": [
+            "p1",
+            "p2",
+            "vv",
+            "av",
+            "onpercent"
+        ]
+    },
+    "setSpeedJ": {
+        "lua": "setSpeedJ(${vvd})",
+        "luas": "setSpeedJ(${vvd})",
+        "luak": "setSpeedJ(${vvd})",
+        "vars": [
+            "vvd"
+        ]
+    },
+    "setAccJ": {
+        "lua": "setAccJ(${avd})",
+        "luas": "setAccJ(${avd})",
+        "luak": "setAccJ(${avd})",
+        "vars": [
+            "avd"
+        ]
+    },
+    "setSpeedL": {
+        "lua": "setSpeedL(${vvd})",
+        "luas": "setSpeedL(${vvd})",
+        "luak": "setSpeedL(${vvd})",
+        "vars": [
+            "vvd"
+        ]
+    },
+    "setAccL": {
+        "lua": "setAccL(${avd})",
+        "luas": "setAccL(${avd})",
+        "luak": "setAccL(${avd})",
+        "vars": [
+            "avd"
+        ]
+    },
+    "searchSuccessed": {
+        "lua": "$1 = searchSuccessed()",
+        "vars": [
+            "var"
+        ]
+    },
+    "getJoint": {
+        "lua": "$1 = getJoint()",
+        "luas": "p1 = getJoint()",
+        "vars": [
+            "var"
+        ]
+    },
+    "getTCP": {
+        "lua": "$2 = getTCP($1)",
+        "luas": "p1 = getTCP($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "aposToCpos": {
+        "lua": "$3 = aposToCpos($1,$2)",
+        "luas": "p2 = aposToCpos({jp={1,2,3,4,5,6}},$2)",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "cposToApos": {
+        "lua": "${var} = cposToApos(${p1},${optional})",
+        "luas": "p2 = cposToApos({cp={1,2,3,4,5,6}},$2)",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "cposToCpos": {
+        "lua": "$4 = cposToCpos($1,$2,$3)",
+        "luas": "p2 = cposToCpos({cp={1,2,3,4,5,6}},$2,$3)",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "getCoor": {
+        "lua": "${var} = getCoor(${coor})",
+        "luas": "coor = getCoor($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getTool": {
+        "lua": "${var} = getTool(${tool})",
+        "luas": "tool = getTool($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "arrayAdd": {
+        "lua": "$3 = arrayAdd($1,$2)",
+        "luas": "arr3 = arrayAdd($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "arraySub": {
+        "lua": "$3 = arraySub($1,$2)",
+        "luas": "arr3 = arraySub($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "coorTrans": {
+        "lua": "${var} = coorTrans($1,$2,${basetypeCT})",
+        "luas": "coor2 = coorTrans($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "userOffset": {
+        "lua": "${var} = userOffset($1,$2,${basetypeUO})",
+        "luas": "userCoor2 = userOffset($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "toolOffset": {
+        "lua": "${var} = toolOffset($1,$2,${basetypeTO})",
+        "luas": "toolCoor2 = toolOffset($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "coorRel": {
+        "lua": "${var} = coorRel(${p1},${offset},${coor})",
+        "luas": "p2 = coorRel({cp={1,2,3,4,5,6}},$2,$3)",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "toolRel": {
+        "lua": "${var} = toolRel(${p1},${offset})",
+        "luas": "p2 = toolRel({cp={1,2,3,4,5,6}},$2)",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "jointRel": {
+        "lua": "${var} = jointRel(${p1},${offset})",
+        "luas": "p2 = jointRel({jp={1,2,3,4,5,6}},$2)",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "getJointTorque": {
+        "lua": "$2 = getJointTorque($1)",
+        "luas": "torque = getJointTorque($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getJointExternalTorque": {
+        "lua": "$2 = getJointExternalTorque($1)",
+        "luas": "torque = getJointExternalTorque($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getTrayPos": {
+        "lua": "${var} = getTrayPos(${trayname},${pnum})",
+        "luas": "p1 = getTrayPos($1,$2)",
+        "vars": [
+            "var",
+            "pnum"
+        ]
+    },
+    "posInverse": {
+        "lua": "$2 = posInverse($1)",
+        "luas": "p2 = posInverse({cp={1,2,3,4,5,6}})",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "distance": {
+        "lua": "$3 = distance($1,$2)",
+        "luas": "dis = distance({cp={1,2,3,4,5,6}},{cp={1,2,3,4,5,6}})",
+        "vars": [
+            "p1",
+            "p2",
+            "var"
+        ]
+    },
+    "interPos": {
+        "lua": "$4 = interPos($1,$2,$3)",
+        "luas": "p3 = interPos({cp={1,2,3,4,5,6}},{cp={1,2,3,4,5,6}},$3)",
+        "vars": [
+            "p1",
+            "p2",
+            "var"
+        ]
+    },
+    "planeTrans": {
+        "lua": "$6 = planeTrans($1,$2,$3,$4,$5)",
+        "luas": "p2 = planeTrans({cp={1,2,3,4,5,6}},$2,$3,$4,$5)",
+        "vars": [
+            "p1",
+            "var"
+        ]
+    },
+    "getTrajStart": {
+        "lua": "$2 = getTrajStart($1)",
+        "luas": "p1 = getTrajStart($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getTrajEnd": {
+        "lua": "$2 = getTrajEnd($1)",
+        "luas": "p1 = getTrajEnd($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "movJCoorRel": {
+        "lua": "movJCoorRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movJCoorRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${search},onpercent=${optional.onpercent}})",
+        "luak": "movJCoorRel($1)",
+        "vars": [
+            "vv",
+            "av"
+        ]
+    },
+    "movLCoorRel": {
+        "lua": "movLCoorRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movLCoorRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${search},onpercent=${optional.onpercent}})",
+        "luak": "movLCoorRel($1)",
+        "vars": [
+            "vv",
+            "av"
+        ]
+    },
+    "movJToolRel": {
+        "lua": "movJToolRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movJToolRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},tool=${optional.tool},search=${search},onpercent=${optional.onpercent}})",
+        "luak": "movJToolRel($1)",
+        "vars": [
+            "vv",
+            "av"
+        ]
+    },
+    "movLToolRel": {
+        "lua": "movLToolRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movLToolRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},tool=${optional.tool},search=${search},onpercent=${optional.onpercent}})",
+        "luak": "movLToolRel($1)",
+        "vars": [
+            "vv",
+            "av"
+        ]
+    },
+    "movJJointRel": {
+        "lua": "movJJointRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},search=${optional.search},onpercent=${optional.onpercent}})",
+        "luas": "movJJointRel($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},search=${search},onpercent=${optional.onpercent}})",
+        "luak": "movJJointRel($1)",
+        "vars": [
+            "vv",
+            "av"
+        ]
+    },
+    "if": {
+        "lua": "if ($1) then\n$c\n#0end",
+        "vars": [
+            "ke"
+        ]
+    },
+    "elseif": {
+        "lua": "elseif ($1) then\n$c\n#0end",
+        "vars": [
+            "ke"
+        ]
+    },
+    "else": {
+        "lua": "else \n$c\n#0end"
+    },
+    "for": {
+        "lua": "for $1 do\n$c\n#0end",
+        "vars": [
+            "ke"
+        ]
+    },
+    "while": {
+        "lua": "while ($1) do\n$c\n#0end",
+        "vars": [
+            "ke"
+        ]
+    },
+    "repeat": {
+        "lua": "repeat\n$c"
+    },
+    "until": {
+        "lua": "until ($1)",
+        "vars": [
+            "ke"
+        ]
+    },
+    "script": {
+        "lua": "$1",
+        "vars": [
+            "scripttext"
+        ]
+    },
+    "note": {
+        "lua": "--$1",
+        "vars": [
+            "notetext"
+        ]
+    },
+    "callModule": {
+        "lua": "${var} = callModule(${modulename},${submodulename},${argsmodule})",
+        "luas": "res = callModule(${modulename},${submodulename})",
+        "vars": [
+            "var",
+            "argsmodule"
+        ],
+        "args": [
+            "argsmodule"
+        ],
+        "examples": [
+            "--模块名：新模块1\n --方法名：方法1\n --模块计算参数1(args[1])+参数2(args[2])，计算结果放于参数3(args[3])\nfunction add(a,b)\n  a=a\n  b=b\n  c=a+b\n  return c\nend\nargs[3]=add(args[1],args[2])",
+            " callModule(\"新模块1\",\"方法1\")\n  n=2\n  m=2\n  print(n,m)\n--打印结果：3",
+            " a=3\n  b=4\n  c=0\n  callModule(\"新模块1\",\"方法1\",a,b,c)\n  print(c)\n--打印结果：7"
+        ]
+    },
+    "print": {
+        "args": [
+            "args"
+        ]
+    },
+    "popUp": {
+        "args": [
+            "args"
+        ]
+    },
+    "goto": {
+        "lua": "goto $1",
+        "luas": "goto label",
+        "luak": "goto label",
+        "vars": [
+            "gotoval"
+        ]
+    },
+    "label": {
+        "lua": "::$1::",
+        "luas": "::label::",
+        "luak": "::label::",
+        "vars": [
+            "labelval"
+        ]
+    },
+    "equal": {
+        "lua": "${var} = ${ke}",
+        "luas": "var1 = var2",
+        "luak": "var1 = var2",
+        "vars": [
+            "var",
+            "ke"
+        ]
+    },
+    "break": {
+        "lua": "break",
+        "luas": "break",
+        "luak": "break"
+    },
+    "return": {
+        "lua": "return ${ke}",
+        "luas": "return",
+        "luak": "return",
+        "vars": [
+            "ke"
+        ]
+    },
+    "setDO": {
+        "lua": "setDO($1,$2)",
+        "luas": "setDO($1,$2)",
+        "vars": [
+            "port"
+        ]
+    },
+    "getDI": {
+        "lua": "$2 = getDI($1)",
+        "luas": "val = getDI($1)",
+        "vars": [
+            "port",
+            "var"
+        ]
+    },
+    "getDO": {
+        "lua": "$2 = getDO($1)",
+        "luas": "val = getDO($1)",
+        "vars": [
+            "port",
+            "var"
+        ]
+    },
+    "getDIGroup": {
+        "lua": "$3 = getDIGroup($1,$2)",
+        "luas": "val = getDIGroup($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getDOGroup": {
+        "lua": "$3 = getDOGroup($1,$2)",
+        "luas": "val = getDOGroup($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "setAO": {
+        "lua": "setAO($1,$2)",
+        "luas": "setAO($1,$2)",
+        "vars": [
+            "port"
+        ]
+    },
+    "getAI": {
+        "lua": "$2 = getAI($1)",
+        "luas": "val = getAI($1)",
+        "vars": [
+            "port",
+            "var"
+        ]
+    },
+    "getAO": {
+        "lua": "$2 = getAO($1)",
+        "luas": "val = getAO($1)",
+        "vars": [
+            "port",
+            "var"
+        ]
+    },
+    "createSocketClient": {
+        "lua": "${var} = createSocketClient($1,$2,$3)",
+        "luas": "res = createSocketClient($1,$2,$3)",
+        "vars": [
+            "var"
+        ]
+    },
+    "connectSocketClient": {
+        "lua": "${var} = connectSocketClient(${clientname},${timeout})",
+        "luas": "res = connectSocketClient($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "writeSocketClient": {
+        "lua": "${var} = writeSocketClient(${clientname},${senddata})",
+        "luas": "res = writeSocketClient($1,$3)",
+        "vars": [
+            "var",
+            "senddata"
+        ]
+    },
+    "writeByteSocketClient": {
+        "lua": "${var} = writeByteSocketClient(${clientname},${arrnumber},${scktype},${isbigendian})",
+        "luas": "res = writeByteSocketClient($1,$2,$3,$4)",
+        "vars": [
+            "var"
+        ]
+    },
+    "readSocketClient": {
+        "lua": "${var},${res} = readSocketClient(${clientname},${timeout})",
+        "luas": "res,data = readSocketClient($1,$2)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "readByteSocketClient": {
+        "lua": "${var},${res} = readByteSocketClient(${clientname},${scktype},${isbigendian},${timeout})",
+        "luas": "res,data = readByteSocketClient($1,$2,$3,$4)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "createSocketServer": {
+        "lua": "${var} = createSocketServer(${servername},${serverport})",
+        "luas": "res = createSocketServer($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "waitConnectSocketServer": {
+        "lua": "${var} = waitConnectSocketServer(${servername},${timeout})",
+        "luas": "res = waitConnectSocketServer($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "writeSocketServer": {
+        "lua": "${var} = writeSocketServer(${servername},${senddata})",
+        "luas": "res = writeSocketServer($1,$3)",
+        "vars": [
+            "var",
+            "senddata"
+        ]
+    },
+    "writeByteSocketServer": {
+        "lua": "${var} = writeByteSocketServer(${servername},${arrnumber},${scktype},${isbigendian})",
+        "luas": "res = writeByteSocketServer($1,$2,$3,$4)",
+        "vars": [
+            "var"
+        ]
+    },
+    "readSocketServer": {
+        "lua": "${var},${res} = readSocketServer(${servername},${timeout})",
+        "luas": "res,data = readSocketServer($1,$2)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "readByteSocketServer": {
+        "lua": "${var},${res} = readByteSocketServer(${servername},${scktype},${isbigendian},${timeout})",
+        "luas": "res,data = readByteSocketServer($1,$2,$3,$4)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "getRegisterBool": {
+        "lua": "$2 = getRegisterBool($1)",
+        "luas": "res = getRegisterBool($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getRegisterInt": {
+        "lua": "$2 = getRegisterInt($1)",
+        "luas": "res = getRegisterInt($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getRegisterFloat": {
+        "lua": "$2 = getRegisterFloat($1)",
+        "luas": "res = getRegisterFloat($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "getExtendArrayData": {
+        "lua": "${var} = getExtendArrayData(${geindex},${gedatatype},${gecount})",
+        "luas": "res = getExtendArrayData($1,$2,$3)",
+        "luak": "res = getExtendArrayData($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "RS485init": {
+        "lua": "$4 = RS485init($1,$2,$3)",
+        "luas": "res = RS485init($1,$2,$3)",
+        "vars": [
+            "var"
+        ]
+    },
+    "RS485flush": {
+        "lua": "$2 = RS485flush($1)",
+        "luas": "res = RS485flush($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "RS485write": {
+        "lua": "$3 = RS485write(${rstype},${rsarrayint})",
+        "luas": "res = RS485write($1,${rsarrayint})",
+        "luak": "res = RS485write($1,${rsarrayint})",
+        "vars": [
+            "var",
+            "rsarrayint"
+        ]
+    },
+    "RS485read": {
+        "lua": "${var},${res} = RS485read(${rstype},${rlen},${timeout})",
+        "luas": "res,data = RS485read($1,$2,$3)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "readCoils": {
+        "lua": "${var},${res} = readCoils(${rstype},${raddr},${rlen},${options})",
+        "luas": "res,data = readCoils($1,$2,$3,$4)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "readDiscreteInputs": {
+        "lua": "${var},${res} = readDiscreteInputs(${rstype},${raddr},${rlen},${options})",
+        "luas": "res,data = readDiscreteInputs($1,$2,$3,$4)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "readHoldingRegisters": {
+        "lua": "${var},${res} = readHoldingRegisters(${rstype},${raddr},${relen},${options})",
+        "luas": "res,data = readHoldingRegisters($1,$2,$3,$4)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "readInputRegisters": {
+        "lua": "${var},${res} = readInputRegisters(${rstype},${raddr},${relen},${options})",
+        "luas": "res,data = readInputRegisters($1,$2,$3,$4)",
+        "vars": [
+            "var",
+            "res"
+        ]
+    },
+    "writeSingleCoil": {
+        "lua": "$5 = writeSingleCoil($1,$2,$3,$4)",
+        "luas": "res = writeSingleCoil($1,$2,$3,$4)",
+        "vars": [
+            "var"
+        ]
+    },
+    "writeSingleRegister": {
+        "lua": "$5 = writeSingleRegister($1,$2,$3,$4)",
+        "luas": "res = writeSingleRegister($1,$2,$3,$4)",
+        "vars": [
+            "var"
+        ]
+    },
+    "writeMultipleCoils": {
+        "lua": "$5 = writeMultipleCoils($1,$2,$3,$4)",
+        "luas": "res = writeMultipleCoils($1,$2,$3,$4)",
+        "vars": [
+            "var"
+        ]
+    },
+    "writeMultipleRegisters": {
+        "lua": "$5 = writeMultipleRegisters($1,$2,$3,$4)",
+        "luas": "res = writeMultipleRegisters($1,$2,$3,$4)",
+        "vars": [
+            "var"
+        ]
+    },
+    "waitCondition": {
+        "lua": "${var} = waitCondition(${condition},${timeout})",
+        "luas": "res = waitCondition($1,$2)",
+        "vars": [
+            "var"
+        ]
+    },
+    "systemTime": {
+        "lua": "$1 = systemTime()",
+        "luas": "res = systemTime()",
+        "vars": [
+            "var"
+        ]
+    },
+    "createTray": {
+        "lua": "createTray(${trayname},${trayconfig},{${traypoints}})",
+        "luas": "createTray($1,{2},{p1,p2})",
+        "luak": "createTray($1,{2},{p1,p2})",
+        "vars": [
+            "traypoints"
+        ],
+        "args": [
+            "traypoints"
+        ]
+    },
+    "bitAnd": {
+        "lua": "${var} = ${b1} & ${b2}",
+        "luas": "res = $1 & $2",
+        "luak": "res = $1 & $2",
+        "vars": [
+            "b1",
+            "b2",
+            "var"
+        ]
+    },
+    "bitOr": {
+        "lua": "${var} = ${b1} | ${b2}",
+        "luas": "res = $1 | $2",
+        "luak": "res = $1 | $2",
+        "vars": [
+            "b1",
+            "b2",
+            "var"
+        ]
+    },
+    "bitXOr": {
+        "lua": "${var} = ${b1} ~ ${b2}",
+        "luas": "res = $1 ~ $2",
+        "luak": "res = $1 ~ $2",
+        "vars": [
+            "b1",
+            "b2",
+            "var"
+        ]
+    },
+    "bitNot": {
+        "lua": "${var} = ~${b1}",
+        "luas": "res = ~$1",
+        "luak": "res = ~$1",
+        "vars": [
+            "b1",
+            "var"
+        ]
+    },
+    "bitLSH": {
+        "lua": "${var} =  ${b1} << ${n}",
+        "luas": "res = $1 << $2",
+        "luak": "res = $1 << $2",
+        "vars": [
+            "b1",
+            "var"
+        ]
+    },
+    "bitRSH": {
+        "lua": "${var} = ${b1} >> ${n}",
+        "luas": "res = $1 >> $2",
+        "luak": "res = $1 >> $2",
+        "vars": [
+            "b1",
+            "var"
+        ]
+    },
+    "sin": {
+        "lua": "${var} = math.sin(${fnvar})",
+        "luas": "res = math.sin($2)",
+        "luak": "res = math.sin($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "cos": {
+        "lua": "${var} = math.cos(${fnvar})",
+        "luas": "res = math.cos($2)",
+        "luak": "res = math.cos($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "tan": {
+        "lua": "${var} = math.tan(${fnvar})",
+        "luas": "res = math.tan($2)",
+        "luak": "res = math.tan($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "asin": {
+        "lua": "${var} = math.asin(${fnvar})",
+        "luas": "res = math.asin($2)",
+        "luak": "res = math.asin($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "acos": {
+        "lua": "${var} = math.acos(${fnvar})",
+        "luas": "res = math.acos($2)",
+        "luak": "res = math.acos($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "atan": {
+        "lua": "${var} = math.atan(${fnvar})",
+        "luas": "res = math.atan($2)",
+        "luak": "res = math.atan($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "atan2": {
+        "lua": "${var} = math.atan(${fnvar})",
+        "luas": "res = math.atan(y, x)",
+        "luak": "res = math.atan(y, x)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "sinh": {
+        "lua": "${var} = (math.exp(${fnvar}) - math.exp(-${fnvar})) / 2",
+        "luas": "res = (math.exp(x) - math.exp(-x)) / 2",
+        "luak": "res = (math.exp(x) - math.exp(-x)) / 2",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "cosh": {
+        "lua": "${var} = (math.exp(${fnvar}) + math.exp(-${fnvar})) / 2",
+        "luas": "res = (math.exp(x) + math.exp(-x)) / 2",
+        "luak": "res = (math.exp(x) + math.exp(-x)) / 2",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "tanh": {
+        "lua": "${var} = (math.exp(${fnvar}) - math.exp(-${fnvar})) / (math.exp(${fnvar}) + math.exp(-${fnvar}))",
+        "luas": "res = (math.exp(x) - math.exp(-x)) / (math.exp(x) + math.exp(-x))",
+        "luak": "res = (math.exp(x) - math.exp(-x)) / (math.exp(x) + math.exp(-x))",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "log": {
+        "lua": "${var} = math.log(${fnvar})",
+        "luas": "res = math.log($2)",
+        "luak": "res = math.log($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "log10": {
+        "lua": "${var} = math.log(${fnvar},10)",
+        "luas": "res = math.log(x,10)",
+        "luak": "res = math.log(x,10)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "sqrt": {
+        "lua": "${var} = math.sqrt(${fnvar})",
+        "luas": "res = math.sqrt($2)",
+        "luak": "res = math.sqrt($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "exp": {
+        "lua": "${var} = math.exp(${fnvar})",
+        "luas": "res = math.exp($2)",
+        "luak": "res = math.exp($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "pow": {
+        "lua": "${var} = ${s1} ^ ${s2}",
+        "luas": "res = s1 ^ s2",
+        "luak": "res = s1 ^ s2",
+        "vars": [
+            "s1",
+            "s2",
+            "var"
+        ]
+    },
+    "deg": {
+        "lua": "${var} = math.deg(${fnvar})",
+        "luas": "res = math.deg($2)",
+        "luak": "res = math.deg($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "rad": {
+        "lua": "${var} = math.rad(${fnvar})",
+        "luas": "res = math.rad($2)",
+        "luak": "res = math.rad($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "fmod": {
+        "lua": "${var} = math.fmod(${fnvar})",
+        "luas": "res = math.fmod($2)",
+        "luak": "res = math.fmod($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "floor": {
+        "lua": "${var} = math.floor(${fnvar})",
+        "luas": "res = math.floor($2)",
+        "luak": "res = math.floor($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "random": {
+        "lua": "${var} = math.random(${fnvar})",
+        "luas": "res = math.random($2)",
+        "luak": "res = math.random($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "byte": {
+        "lua": "${var} = table.pack(string.byte(${fnvar}))",
+        "luas": "res = string.byte($2)",
+        "luak": "res = string.byte($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "char": {
+        "lua": "${var} = string.char(${fnvar})",
+        "luas": "res = string.char($2)",
+        "luak": "res = string.char($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "find": {
+        "lua": "${var} = table.pack(string.find(${fnvar}))",
+        "luas": "res = string.find($2)",
+        "luak": "res = string.find($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "format": {
+        "lua": "${var} = string.format(${fnvar})",
+        "luas": "res = string.format($2)",
+        "luak": "res = string.format($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "gsub": {
+        "lua": "${var} = string.gsub(${fnvar})",
+        "luas": "res = string.gsub($2)",
+        "luak": "res = string.gsub($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "len": {
+        "lua": "${var} = string.len(${fnvar})",
+        "luas": "res = string.len($2)",
+        "luak": "res = string.len($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "lower": {
+        "lua": "${var} = string.lower(${fnvar})",
+        "luas": "res = string.lower($2)",
+        "luak": "res = string.lower($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "upper": {
+        "lua": "${var} = string.upper(${fnvar})",
+        "luas": "res = string.upper($2)",
+        "luak": "res = string.upper($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "reverse": {
+        "lua": "${var} = string.reverse(${fnvar})",
+        "luas": "res = string.reverse($2)",
+        "luak": "res = string.reverse($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "sub": {
+        "lua": "${var} = string.sub(${fnvar})",
+        "luas": "res = string.sub($2)",
+        "luak": "res = string.sub($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "append": {
+        "lua": "${var} = ${s1} .. ${s2}",
+        "luas": "res = s1 .. s2",
+        "luak": "res = s1 .. s2",
+        "vars": [
+            "s1",
+            "s2",
+            "var"
+        ]
+    },
+    "trimLeft": {
+        "lua": "${var} = string.gsub(${fnvar}, '^%s*(.*)', '%1')",
+        "luas": "res = string.gsub($2, '^%s*(.*)', '%1')",
+        "luak": "res = string.gsub($2, '^%s*(.*)', '%1')",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "trimRight": {
+        "lua": "${var} = string.gsub(${fnvar}, '(.-)%s*$', '%1')",
+        "luas": "res = string.gsub($2, '(.-)%s*$', '%1')",
+        "luak": "res = string.gsub($2, '(.-)%s*$', '%1')",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "tostring": {
+        "lua": "${var} = tostring(${fnvar})",
+        "luas": "res = tostring($2)",
+        "luak": "res = tostring($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "tonumber": {
+        "lua": "${var} = tonumber(${fnvar})",
+        "luas": "res = tonumber($2)",
+        "luak": "res = tonumber($2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "strcmp": {
+        "lua": "${var} = strcmp(${fnvar})",
+        "luas": "res = strcmp(s1,s2)",
+        "luak": "res = strcmp(s1,s2)",
+        "vars": [
+            "fnvar",
+            "var"
+        ],
+        "args": [
+            "fnvar"
+        ]
+    },
+    "strToNumberArray": {
+        "lua": "${var} = strToNumberArray(${vars},${option})",
+        "luas": "res = strToNumberArray($2,$3)",
+        "vars": [
+            "var",
+            "vars"
+        ]
+    },
+    "arrayToStr": {
+        "lua": "${var} = arrayToStr(${vararr},${option})",
+        "luas": "res = arrayToStr($2,$3)",
+        "vars": [
+            "var",
+            "vararr"
+        ]
+    },
+    "getCurSeam": {
+        "lua": "${var} = getCurSeam(${smindex}})",
+        "luas": "res = getCurSeam($1)",
+        "vars": [
+            "var"
+        ]
+    },
+    "weldSingle": {
+        "lua": "weldSingle(${weldart},${lrtrack},${tbtrack},${skipweld},${intmtweld})\n$c",
+        "luas": "weldSingle(weldart,lrtrack,tbtrack,skipweld,intmtweld)",
+        "luak": "weldSingle(weldart,lrtrack,tbtrack,skipweld,intmtweld)",
+        "examples": [
+            "weldSingle(工艺模版编号,左右跟踪使能,上下跟踪使能,段焊,间隔)\nmovJ(p1)--空间点\nmovL(p2)--起弧点\narcOn()--起弧\nmovL()--焊接点\narcOff()--熄弧\nmovJ()--空间点"
+        ]
+    },
+    "weldMulti": {
+        "lua": "weldMulti(${p1},${p2},{${pwm}},${weldmulti},${lrtrack},${tbtrack},${weldselect})\nwhile(not isMultiWeldFinished(0)) do\n$c\nend",
+        "luas": "weldMulti(p1,p2,pwm,weldmulti,lrtrack,tbtrack,weldselect)",
+        "luak": "weldMulti(p1,p2,pwm,weldmulti,lrtrack,tbtrack,weldselect)",
+        "reps": [
+            "${arcon}\nif (getCurSeam(0) ~= 1) then\nweldNextSeam(0)\nelse\n${arcmiddle}\nend\n${arcoff}\n",
+            {
+                "arcon": [
+                    "",
+                    "arcOn()",
+                    [
+                        [
+                            "mov",
+                            "setMultiWeldOffset(0)\n",
+                            9999
+                        ]
+                    ]
+                ],
+                "arcmiddle": [
+                    "arcOn()",
+                    "arcOff()"
+                ],
+                "arcoff": [
+                    "arcOff()",
+                    ""
+                ]
+            }
+        ],
+        "vars": [
+            "p1",
+            "p2"
+        ],
+        "args": [
+            "pwm"
+        ],
+        "examples": [
+            "weldMulti(参考点1,参考点2,{起弧指令前一个点,起弧指令后一个点},工艺模版编号,左右跟踪使能,上下跟踪使能)\n\nwhile(not isMultiWeldFinished(0)) do--判断当前焊接焊道是否不是最后一道焊道\nsetMultiWeldOffset(0)--下发对应焊道的焊接参数\nmovJ()--空间点\nmovL()--起弧点\narcOn()--起弧\n\nif (getCurSeam(0) ~= 1) then--判断当前焊道是否不等于1\nweldNextSeam(0)--判断成立执行该行程序，焊接后续焊道\nelse--判断不成立执行后续程序，焊接第一道焊缝\nmovL()--焊接点\nend\n\narcOff()--熄弧\nmovJ()--空间点\nend\n\nmovJ()--空间点"
+        ]
+    },
+    "intermittentWelding": {
+        "lua": "intermittentWelding(${p1},${p2},${weldlen},${imtstep})",
+        "luas": "intermittentWelding(p1,p2,weldlen,imtstep)",
+        "vars": [
+            "p1",
+            "p2"
+        ]
+    },
+    "weldL": {
+        "lua": "weldL($1,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}},$3)",
+        "luas": "weldL({jp={1,2,3,4,5,6}},{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}},$3)",
+        "luak": "weldL(p1)",
+        "vars": [
+            "p1",
+            "vv",
+            "av"
+        ]
+    },
+    "weldC": {
+        "lua": "weldC($1,$2,{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}},$4)",
+        "luas": "weldC({jp={1,2,3,4,5,6}},{jp={1,2,3,4,5,6}},{v=${optional.vv},a=${optional.av},b=${optional.b},rb=${optional.rb},coor=${optional.coor},tool=${optional.tool},search=${optional.search},onpercent=${optional.onpercent}},$4)",
+        "luak": "movC(p1,p2)",
+        "vars": [
+            "p1",
+            "p2",
+            "vv",
+            "av"
+        ]
+    },
+    "createSingleWeldTemplate": {
+        "examples": [
+            "local id = 1--设置焊缝ID\ncreateSingleWeldTemplate(id,1)--将工艺模版1中的参数下发给焊缝1\nenableSingleWeld(id)--下发焊缝1参数\nmovJ()--空间点\nmovL()--起弧点\narcOn()--起弧\nmovL()--焊接点\narcOff()--收弧\nmovJ(P4)--空间点"
+        ]
+    },
+    "createMultiWeld": {
+        "examples": [
+            "local id = 1--设置焊缝ID\ncreateMultiWeld(id,1)--将工艺模版1中的参数下发给焊缝1\nsetMultiweldRefPoints(id,{参考点1,参考点2},{焊接开始点,焊接点（起弧后第一个点位）})--通过设置参考点及焊缝点（若为圆弧则3点均填写）创建偏移坐标系\nsetMultiWeldPath(id,1,3)--设置当前焊缝1从第1道焊缝焊接至第3条焊缝，不设置则默认全部焊接\nenableMultiWeld(id)\n\n--判断当前焊接焊缝是否为第一道焊缝\nif getCurSeam(id) == 1 then--如果当前需要焊接的焊道数为1\nmovJ()--空间点\nmovL()--起弧点\narcOn()--起弧\nmovL()--焊接点\narcOff()--熄弧\nmovJ()--空间点\nend\n\n--后续焊道焊接\nwhile (not isMultiWeldFinished(id)) do--判断当前焊缝不是最后焊道\nmovJ()--空间点\nsetMultiWeldOffset(id)--下发对应焊道的焊接参数\nmovL()--起弧点\narcOn()--起弧\nweldNextSeam(id)--执行对应偏移量的轨迹\narcOff()--熄弧\nmovJ()--空间点\nend\n"
+        ]
+    },
+    "setLeftPallet": {
+        "lua": "setLeftPallet(${ptempid},${movParam},${catchParam},${putParam},${boxPoints},${interlayerPoints})",
+        "fns": {
+            "boxPoints": "boxRuleFn",
+            "interlayerPoints": "interlayerRuleFn"
+        }
+    },
+    "setRightPallet": {
+        "lua": "setRightPallet(${ptempid},${movParam},${catchParam},${putParam},${boxPoints},${interlayerPoints})",
+        "fns": {
+            "boxPoints": "boxRuleFn",
+            "interlayerPoints": "interlayerRuleFn"
+        }
+    },
+    "palletizerRun": {
+        "lua": "while(true) do\npalletizerRun()\nend"
+    },
+    "setConveyorTarget": {
+        "lua": "${var} = setConveyorTarget(${conveyorId},${conveyorTarget},{type=${cType},id=${cId}})",
+        "luas": "res = setConveyorTarget(${conveyorId},${conveyorTarget})",
+        "luak": "res = setConveyorTarget(${conveyorId},${conveyorTarget})",
+        "vars": [
+            "var",
+            "conveyorTarget",
+            "cType",
+            "cId"
+        ]
+    },
+    "waitConveyorObj": {
+        "lua": "${var},${res},${ctype},${cid} = waitConveyorObj(${conveyorId},${timeoutd})",
+        "luas": "res,p1,objType,objId = waitConveyorObj(${conveyorId},${timeoutd})",
+        "luak": "res,p1,type,id = waitConveyorObj(${conveyorId},${timeoutd})",
+        "vars": [
+            "var",
+            "res",
+            "ctype",
+            "cid"
+        ]
+    },
+    "syncConveyorL": {
+        "lua": "syncConveyorL($1,$2,$3)",
+        "luas": "syncConveyorL($1,$2)",
+        "vars": [
+            "p1"
+        ]
+    },
+    "setConveyorOffset": {
+        "lua": "setConveyorOffset($1,{x=${cx},y=${cy},z=${cz},a=${ca},b=${cb},c=${cc}})",
+        "luas": "setConveyorOffset($1,{x=1,y=1,z=1})",
+        "args": [
+            "options"
+        ]
+    },
+    "ByteWrapper": {
+        "luas": "bw = ByteWrapper()",
+        "luak": "bw = ByteWrapper()"
+    },
+    "bwsize": {
+        "luas": "res = bw:size()",
+        "luak": "res = bw:size()"
+    },
+    "bwresize": {
+        "luas": "bw:resize($1)",
+        "luak": "bw:resize($1)"
+    },
+    "bwsetBigEndian": {
+        "luas": "bw:setBigEndian()",
+        "luak": "bw:setBigEndian()"
+    },
+    "bwsetLittleEndian": {
+        "luas": "bw:setLittleEndian()",
+        "luak": "bw:setLittleEndian()"
+    },
+    "bwadd": {
+        "luas": "res = bw:add($1,$2)",
+        "luak": "res = bw:add($1,$2)"
+    },
+    "bwset": {
+        "luas": "bw:set($1,$2,$3)",
+        "luak": "bw:set($1,$2,$3)"
+    },
+    "bwget": {
+        "luas": "bw:get($1,$2,$3)",
+        "luak": "bw:get($1,$2,$3)"
+    },
+    "bwappend": {
+        "luas": "bw:append($1,$2,$3)",
+        "luak": "bw:append($1,$2,$3)"
+    },
+    "bwcopy": {
+        "luas": "bw:copy($1,$2,$3,$4)",
+        "luak": "bw:copy($1,$2,$3,$4)"
+    },
+    "bwprintByte": {
+        "luas": "bw:printByte($1,$2,$3)",
+        "luak": "bw:printByte($1,$2,$3)"
+    }
+}
