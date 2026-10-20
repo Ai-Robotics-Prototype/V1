@@ -293,7 +293,13 @@ function evalBuildStepsCore() {
   const verifyM     = progWizSrc.match(/function verificationStepsForEoat\(cellEoat[\s\S]*?\n\}/)
   const cellVocabM = progWizSrc.match(/function _cellVocabOpts\(cellEoat, synapsePortmap\)\s*\{[\s\S]*?\n\}/)
   const palletM = progWizSrc.match(/function buildPalletizeSteps\(answers, cellEoat = null, synapsePortmap = null\)\s*\{[\s\S]*?\n\}/)
-  if (!readTaughtM || !cellVocabM || !palletM || !verifyM) {
+  // 2026-10-20: buildSteps / buildPalletizeSteps now route the FIRST
+  // move_home through _homeStepFromAnswers so answers.taught_home lands
+  // on steps[0] (operator field report, D_wizard_home_taught pin).
+  // The sandbox needs the helper too; otherwise every pin that eval's
+  // buildSteps fails at the first move_home push.
+  const homeHelperM = progWizSrc.match(/function _homeStepFromAnswers\(answers, label\)\s*\{[\s\S]*?\n\}/)
+  if (!readTaughtM || !cellVocabM || !palletM || !verifyM || !homeHelperM) {
     throw new Error('could not extract helper functions')
   }
   // Stub the effector + machine_tend emitters so we only measure the
@@ -325,6 +331,7 @@ function evalBuildStepsCore() {
     `function waypointStepsForJunction() { return [] }`,
     verifyM[0],
     readTaughtM[0],
+    homeHelperM[0],
     cellVocabM[0],
     palletM[0],
     m[0],

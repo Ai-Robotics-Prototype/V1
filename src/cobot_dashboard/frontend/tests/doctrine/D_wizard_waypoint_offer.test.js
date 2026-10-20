@@ -286,8 +286,10 @@ test('buildSteps injects waypoints at every main-position seam', () => {
   const idx = progWizSrc.indexOf('function buildSteps(answers, portmap = null')
   const chunk = progWizSrc.slice(idx, idx + 28000)
   // home_to_pick — AFTER the start move_home, BEFORE pick approach.
+  // Anchor accepts EITHER the bare literal OR the _homeStepFromAnswers
+  // helper call (2026-10-20: start move_home now carries taught_home).
   assert.ok(
-    /action: 'move_home', label: 'Move to home position'[\s\S]{0,400}waypointStepsForJunction\(answers, 'home_to_pick'/
+    /(?:action: 'move_home', label: 'Move to home position'|_homeStepFromAnswers\(answers, 'Move to home position'\))[\s\S]{0,400}waypointStepsForJunction\(answers, 'home_to_pick'/
       .test(chunk),
     v('buildSteps must inject waypointStepsForJunction(home_to_pick) '
       + 'immediately after the start move_home — the arm leaves home, '
@@ -323,17 +325,21 @@ test('buildPalletizeSteps injects waypoints at pallet seams', () => {
   const idx = progWizSrc.indexOf('function buildPalletizeSteps')
   const chunk = progWizSrc.slice(idx, idx + 12000)
   // home_to_pick — AFTER start move_home, BEFORE readySteps (so it
-  // runs ONCE at program start, not every pallet cycle).
+  // runs ONCE at program start, not every pallet cycle). Anchor accepts
+  // EITHER the bare literal OR the _homeStepFromAnswers helper call
+  // (2026-10-20: start move_home now carries taught_home).
   assert.ok(
-    /action: 'move_home', label: 'Move to home position'[\s\S]{0,800}waypointStepsForJunction\(answers, 'home_to_pick'[\s\S]{0,400}readySteps\(\)/
+    /(?:action: 'move_home', label: 'Move to home position'|_homeStepFromAnswers\(answers, 'Move to home position'\))[\s\S]{0,800}waypointStepsForJunction\(answers, 'home_to_pick'[\s\S]{0,400}readySteps\(\)/
       .test(chunk),
     v('buildPalletizeSteps must inject home_to_pick waypoints BEFORE '
       + 'readySteps() — they run once at program start, not every '
       + 'pallet cycle.'))
   // place_to_home — AFTER the loop marker, BEFORE return move_home
-  // (so they run ONCE at program end, not every cycle).
+  // (so they run ONCE at program end, not every cycle). Widened the
+  // post-place_to_home span to 800 chars (2026-10-20) so an explanatory
+  // comment above the bare return move_home doesn't blow the match.
   assert.ok(
-    /action: 'loop',[\s\S]{0,600}pallet_loop: true[\s\S]{0,600}waypointStepsForJunction\(answers, 'place_to_home'[\s\S]{0,400}'Return to home'/
+    /action: 'loop',[\s\S]{0,600}pallet_loop: true[\s\S]{0,600}waypointStepsForJunction\(answers, 'place_to_home'[\s\S]{0,800}'Return to home'/
       .test(chunk),
     v('buildPalletizeSteps must inject place_to_home waypoints AFTER '
       + 'the loop marker and BEFORE the return move_home — once at '

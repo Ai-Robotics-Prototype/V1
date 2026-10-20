@@ -3879,6 +3879,44 @@ function buildPalletConfig(answers) {
   }
 }
 
+// 2026-10-20 operator field report: wizard-authored palletize + pick_and_place
+// programs showed HOME as untaught in the saved program, even though the
+// operator taught it in the wizard. Root cause: the bare `move_home` emits
+// below never read `answers.taught_home`, so the pose landed in
+// `config.taught_home` (where buildPalletConfig stashes it for round-trip)
+// but NEVER on `steps[0].taught_joints` — where every reader (editor's
+// isTeachable, pending-pose gate `program_ops.check_program_pending_poses`,
+// codegen) actually looks per-step.
+//
+// Pick's emission at buildPalletizeSteps:3975-3980 is the pattern — read
+// `readTaught(answers, 'taught_pick')` and embed joints / TCP / taught /
+// position_role on the step. Home gets the same treatment here. Only the
+// FIRST move_home needs the taught payload; the pending-pose gate's
+// sibling-scan rule (program_ops.py:1545-1570) rescues the trailing
+// "Return to home" against the first move_home automatically — matching
+// how the editor's isTeachable already behaves.
+//
+// `position_role: 'home'` is the role_map key the gate also reads via the
+// `derived_from` path; emitting it keeps the role catalogue consistent
+// across pick / place / home.
+function _homeStepFromAnswers(answers, label) {
+  const h = readTaught(answers, 'taught_home')
+  const joints = Array.isArray(h?.joints) ? h.joints : null
+  const tcp    = Array.isArray(h?.tcp)    ? h.tcp    : null
+  const step = { action: 'move_home', label }
+  if (joints) {
+    step.taught = true
+    step.taught_joints = joints
+    step.joints = joints
+    step.position_role = 'home'
+  }
+  if (tcp) {
+    step.taught_tcp = tcp
+    step.position   = tcp.slice(0, 3)
+  }
+  return step
+}
+
 // Emit the wizard-side step list for a pallet program. Per-cycle motion
 // uses move_to_pallet which the executor expands into the actual slot
 // XYZ at runtime; pick / place taught TCPs (and their lift/approach
@@ -3936,7 +3974,7 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
     effectorReady({ effector: gripType }, _vocabOpts)
 
   const steps = []
-  steps.push({ action: 'move_home', label: 'Move to home position' })
+  steps.push(_homeStepFromAnswers(answers, 'Move to home position'))
   // 2026-10-15: waypoints between HOME and the first pick-side motion.
   // Injected BEFORE readySteps() + loopStart so they run ONCE at program
   // start (not every pallet cycle). Empty when no waypoints taught, so
@@ -4067,6 +4105,11 @@ function buildPalletizeSteps(answers, cellEoat = null, synapsePortmap = null) {
   // Injected AFTER the loop marker so they run ONCE at program end
   // (post-pallet-exhaustion), not every cycle.
   steps.push(...waypointStepsForJunction(answers, 'place_to_home', spd))
+  // Second move_home is left bare — the pending-pose gate's sibling-scan
+  // rule (program_ops.py:1545-1570) and the editor's isTeachable mirror
+  // both rescue a trailing move_home when the FIRST move_home is taught.
+  // Matches the pre-fix behaviour for the return-to-home step while the
+  // start-of-program home now carries the pose explicitly.
   steps.push({ action: 'move_home', label: 'Return to home' })
   return steps.map((s, i) => ({ ...s, step: i + 1 }))
 }
@@ -4156,7 +4199,7 @@ function buildSteps(answers, portmap = null,
   const gripF = answers.grip_force || 50
   const op = answers.operation
 
-  steps.push({ action: 'move_home', label: 'Move to home position' })
+  steps.push(_homeStepFromAnswers(answers, 'Move to home position'))
 
   // 2026-10-15: waypoints between HOME and the pick side. Injected
   // AFTER the start-home move so the arm leaves home, flies through
