@@ -161,6 +161,62 @@ def test_codegen_share_home_emits_second_home_movJ():
         f'steps; got {len(movJ_home_lines)}: {movJ_home_lines!r}')
 
 
+def test_verify_input_is_non_motion_in_pending_pose_check():
+    """2026-10-20 field regression — the palletize wizard emits
+    `verify_input` ("Confirm part grabbed") between the pick and the
+    retreat. Before the fix, `_NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK`
+    was the ONE non-motion whitelist in program_ops that didn't
+    include verify_input (every other scan — ~1872/2073/2516/2638
+    /2674/3871 — already did). The gate flagged verify_input as a
+    pending motion step, teach-session save fired HTTP 400
+    pending_poses, the operator saw "teach session promote refused"
+    and read it as "home + palletize positions didn't transfer."
+    The pin: verify_input must be treated as non-motion by the
+    pending-pose gate.
+    """
+    from estun_driver.program_ops import (
+        _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK,
+        check_program_pending_poses,
+    )
+    assert 'verify_input' in _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK, (
+        'verify_input missing from the pending-pose non-motion '
+        'whitelist — wizard-emitted "Confirm part grabbed" steps '
+        'will trigger spurious pending_poses refusals on save.')
+
+    # Verbatim shape of the field-report draft merge (palletize
+    # wizard, operator taught home + pick + waypoint, computed
+    # pallet). Pre-fix produced ONE finding on step 7.
+    prog = {
+        'name': 'Palletize',
+        'config': {},
+        'steps': [
+            {'id': 1,  'action': 'move_home',    'taught': True,
+             'taught_joints': _HOME_JOINTS},
+            {'id': 2,  'action': 'set_io'},
+            {'id': 3,  'action': 'move_linear',  'derived_from': 'pick',
+             'offset_z_mm': 100},
+            {'id': 4,  'action': 'move_linear',  'position_role': 'pick',
+             'taught': True, 'taught_joints': _PICK_JOINTS},
+            {'id': 5,  'action': 'set_io'},
+            {'id': 6,  'action': 'wait'},
+            {'id': 7,  'action': 'verify_input', 'io_id': 'IN04',
+             'on_fail': 'stop'},
+            {'id': 8,  'action': 'move_linear',  'derived_from': 'pick',
+             'offset_z_mm': 200},
+            {'id': 9,  'action': 'waypoint',     'taught': True,
+             'taught_joints': [41.85, 30.65, 114.63, 54.82, 89.63, 73.8]},
+            {'id': 10, 'action': 'move_to_pallet'},
+            {'id': 11, 'action': 'loop'},
+            {'id': 12, 'action': 'move_home'},
+        ],
+    }
+    findings = check_program_pending_poses(prog)
+    assert findings == [], (
+        'Wizard-generated palletize program must not raise any '
+        'pending-pose findings when home + pick + waypoint are '
+        f'taught and pallet is computed. Got: {findings!r}')
+
+
 def test_non_home_derived_steps_unaffected():
     """The auto-share rule fires ONLY on move_home. A move_linear
     with position_role='place' still requires its own resolution."""

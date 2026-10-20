@@ -1463,7 +1463,19 @@ def _lookahead_next_motion_target_tcp(steps: list, i: int,
 
 
 _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK = frozenset({
-    'set_io', 'wait', 'wait_input', 'loop',
+    'set_io', 'wait', 'wait_input',
+    # 2026-10-20 field report (palletize wizard): operator saved after
+    # teaching home → "teach session promote refused." The gate flagged
+    # step 7 `verify_input` ("Confirm part grabbed") as pending, because
+    # verify_input was never added to this whitelist when it became a
+    # wizard step. Every other non-motion scan in this file (lines ~1872
+    # /2073/2516/2638/2674/3871) already includes verify_input — this
+    # one was the outlier. The operator-facing cascade ("home + pallet
+    # positions didn't transfer") is the symptom chain: the refusal
+    # keeps the draft intact, so the UI keeps rendering those slots
+    # untaught against the still-stale disk program.
+    'verify_input',
+    'loop',
     # 2026-10-08 field report: the wizard emits finger-gripper steps
     # with action='close_gripper'/'open_gripper' (effectorVocab.js
     # emits that token end-to-end — the executor's
