@@ -120,6 +120,28 @@ def plan_absorb(steps: list, cfg: dict) -> AbsorbPlan:
             st = steps[j]
             act = str(st.get('action') or '').lower()
             derived = st.get('derived_from')
+            # 2026-10-20 field codegen bug: the 2026-10-15 "waypoint
+            # offer" wizard change (ProgramWizard.jsx:3997) inserts a
+            # `waypoint` step BETWEEN the pick retreat (step N-1) and
+            # the `move_to_pallet` (step N) for the pick_to_place
+            # junction — so the operator can route through a via-point
+            # on each pallet cycle. Pre-fix, the walker started at
+            # j = i-1 (the waypoint), the switch had no `waypoint`
+            # case, fell through to the terminal `break`, and
+            # absorbed_retreat_step stayed None. Codegen then refused
+            # the entire move_to_pallet with
+            #   -- REFUSED 'move_to_pallet': no absorbed approach step …
+            # even though config.pallet_place.corner{1,2,3,part}_tcp
+            # were all taught. The waypoint is a per-cycle authored
+            # transit — it MUST NOT be absorbed (it fires once per
+            # cycle at the via-point; absorbing would drop that
+            # emission), but the walker must step PAST it to find the
+            # absorbed retreat/approach behind it. Transit without
+            # absorbing: no absorb_step_ids add, no
+            # absorbed_*_step touched, just j -= 1 and continue.
+            if act == 'waypoint':
+                j -= 1
+                continue
             # (a) approach/retreat above pick → absorb.
             #     First encounter walking backward = RETREAT (post-pick).
             if act == 'move_linear' and derived == 'pick':
@@ -131,8 +153,15 @@ def plan_absorb(steps: list, cfg: dict) -> AbsorbPlan:
             # (b) engage: set_io / wait / gripper helpers → absorb,
             # and infer vac port + seal wait for legacy programs
             # whose move_to_pallet lacks these fields.
+            # 2026-10-20: `verify_input` is the "Confirm part grabbed"
+            # step the wizard emits between `wait seal` and the retreat
+            # for a vacuum tool with per_pick verification (dd4798a
+            # whitelist + ProgramWizard.jsx:3753/3766). It fires once
+            # per pick cycle — same engage-sequence category as the
+            # wait + set_io. Absorb so the backward walker reaches
+            # the pick_contact and the pre-pick approach behind it.
             if act in ('wait', 'set_io', 'close_gripper',
-                       'open_gripper', 'gripper'):
+                       'open_gripper', 'gripper', 'verify_input'):
                 plan.absorb_step_ids.add(id(st))
                 if act == 'set_io' and int(st.get('value') or 0) == 1:
                     iid = str(st.get('io_id') or '')
